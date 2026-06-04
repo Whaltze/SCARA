@@ -94,11 +94,12 @@ class ScaraSerialMixin:
                     # "通讯接收内容"模式：从ACK回传的line中提取坐标更新绘图
                     if self.plot_mode_combo.currentText() == "通讯接收内容":
                         # 从 ack.rx_line 中提取 X 和 Y 坐标
+                        # 注意：接收的是下位机坐标，需要转换回上位机坐标系（加回75）
                         if ack.rx_line:
                             x_match = re.search(r'X([-?\d.]+)', ack.rx_line)
                             y_match = re.search(r'Y([-?\d.]+)', ack.rx_line)
                             if x_match and y_match:
-                                rx = float(x_match.group(1))
+                                rx = float(x_match.group(1)) + 75.0  # 转换回上位机坐标系
                                 ry = float(y_match.group(1))
                                 self.cur_x, self.cur_y = rx, ry
                                 self.history_x.append(rx)
@@ -201,6 +202,9 @@ class ScaraSerialMixin:
         tx, ty, feed_rate, slt = self.point_queue.pop(0)
         self.last_sent_motion = (tx, ty, feed_rate, slt)
         self.sent_point_id += 1
+        # 坐标系转换：上位机原点(0,0)在电机1位置，下位机原点(0,0)在两电机正中间
+        # base_distance=150mm，所以偏移-75使坐标匹配
+        tx = tx - 75.0
         gcode_raw = build_g1_line(tx, ty, feed_rate, self.sent_point_id, limit_checked=True)
         gcode_line = gcode_raw + "\n"
         self.last_sent_cs = self.calculate_checksum(gcode_raw)

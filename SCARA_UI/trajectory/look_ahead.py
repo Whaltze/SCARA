@@ -36,7 +36,7 @@ class PlannerBlock:
 class LookAheadPlanner:
     """小型 look-ahead 规划器，输出带速度 F 的 G1 点流。"""
 
-    def __init__(self, accel_mm_s2: float = 10.0, junction_deviation: float = 0.02, sample_dt: float = 0.04):
+    def __init__(self, accel_mm_s2: float = 100.0, junction_deviation: float = 0.02, sample_dt: float = 0.04):
         self.accel_mm_s2 = max(1.0, accel_mm_s2)
         self.junction_deviation = max(0.001, junction_deviation)
         self.sample_dt = max(0.005, sample_dt)
@@ -145,7 +145,7 @@ class LookAheadPlanner:
             ratio = distance / block.length
             x = block.start[0] + (block.end[0] - block.start[0]) * ratio
             y = block.start[1] + (block.end[1] - block.start[1]) * ratio
-            path.append(PlannerPoint(x=x, y=y, feed_mm_min=max(1.0, speed * 60.0), silent=silent))
+            path.append(PlannerPoint(x=x, y=y, feed_mm_min=max(1.0, speed * 1000.0), silent=silent))
             if step <= 0.002 and len(path) > 20000:
                 break
         return path
