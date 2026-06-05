@@ -684,20 +684,18 @@ class ScaraMotionMixin:
     
     def motor_jog(self, motor_id, direction):
         """
-        单独控制电机轴实现正向/逆向旋转5°
-        :param motor_id: 电机编号 (1 或 2)
-        :param direction: 方向 (1: 正向, -1: 逆向)
+        ???????????/????????????
+        :param motor_id: ???? (1 ? 2)
+        :param direction: ?? (1: ??, -1: ??)
         """
         try:
-            # 获取当前角度
             current_angles = self.inverse_kinematics(self.cur_x, self.cur_y)
             if current_angles[0] is None or current_angles[1] is None:
-                self.log_error("无法获取当前关节角度")
+                self.log_error("??????????")
                 return
             
             q1, q2 = current_angles
             
-            # 单次旋转角度 = 3度
             half_turn = 3.0
             new_q1, new_q2 = q1, q2
             
@@ -706,53 +704,53 @@ class ScaraMotionMixin:
             elif motor_id == 2:
                 new_q2 = q2 + direction * half_turn
             else:
-                self.log_error(f"无效电机编号: {motor_id}")
+                self.log_error(f"??????: {motor_id}")
                 return
             
-            # 使用正向运动学计算新的末端位置
             new_x, new_y = self.kinematics.forward(new_q1, new_q2)
             if new_x is None or new_y is None:
-                self.log_error(f"电机{motor_id}旋转半圈后位置不可达")
+                self.log_error(f"??{motor_id}????????")
                 return
 
-            # 检查新位置是否安全
             if not self.check_workspace_safety(new_x, new_y):
-                self.log_error(f"电机{motor_id}旋转后超出工作空间: X={new_x:.1f}, Y={new_y:.1f}")
+                self.log_error(f"??{motor_id}?????????: X={new_x:.1f}, Y={new_y:.1f}")
                 return
 
-            # ===== 关节空间轨迹：只插值目标电机角度，另一电机保持恒定 =====
             v_max = float(self.jog_speed_input.text())
-            num_steps = max(8, int(abs(half_turn) / 0.15))  # 角度分辨率约 0.15°
-            path = []
-            prev_x, prev_y = self.cur_x, self.cur_y
-            for i in range(1, num_steps + 1):
-                alpha = i / num_steps
+            num_steps = 20  # ??????????
+
+            # ---- ???????????????????? ----
+            joint_points = []
+            for i in range(num_steps + 1):
+                t = i / num_steps
                 if motor_id == 1:
-                    qi1 = q1 + direction * half_turn * alpha
-                    qi2 = q2
+                    jq1 = q1 + t * direction * half_turn
+                    jq2 = q2
                 else:
-                    qi1 = q1
-                    qi2 = q2 + direction * half_turn * alpha
-                px, py = self.kinematics.forward(qi1, qi2)
+                    jq1 = q1
+                    jq2 = q2 + t * direction * half_turn
+                px, py = self.kinematics.forward(jq1, jq2)
                 if px is None or py is None:
-                    continue
-                feed = v_max * 60.0
-                path.append((px, py, feed, False))
-                prev_x, prev_y = px, py
+                    self.log_error(f"??{motor_id}???{i}???")
+                    return
+                joint_points.append((px, py))
+
+            # ---- ?????TCP ????? ----
+            path = []
+            for i in range(1, len(joint_points)):
+                x0, y0 = joint_points[i - 1]
+                x1, y1 = joint_points[i]
+                path.append((x1, y1, v_max, False))
 
             if not path:
-                self.log_error("关节空间轨迹生成失败")
+                self.log_error("??????????????")
                 return
 
-            if not self.validate_trajectory_points(path, f"电机{motor_id}关节轨迹"):
-                return
-
-            self.preview_planned_path(path, f"电机{motor_id}点动")
-            # 单电机测试：监控器仅显示对应电机的速度
+            self.preview_planned_path(path, f"??{motor_id}??")
             self.load_motion_queue(path, append=True)
             self.log_display.append(
-                f"<font color='cyan'>电机{motor_id} {'正向' if direction > 0 else '逆向'}旋转{half_turn}° (关节空间): ({self.cur_x:.1f},{self.cur_y:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
+                f"<font color='cyan'>??{motor_id} {'??' if direction > 0 else '??'}????????: ({self.cur_x:.1f},{self.cur_y:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
             )
 
         except Exception as e:
-            self.log_error(f"电机控制错误: {e}")
+            self.log_error(f"??????: {e}")

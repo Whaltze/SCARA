@@ -214,6 +214,8 @@ class ScaraSerialMixin:
                             )
                         if hasattr(self, "append_feedback_point"):
                             self.append_feedback_point(rx, ry)
+                        if getattr(self, "velocity_monitor", None) is not None:
+                            self.velocity_monitor.process_new_data(f"X{rx:.3f} Y{ry:.3f}")
                         if self.plot_mode_combo.currentText() == "通讯接收内容":
                             self.cur_x, self.cur_y = rx, ry
                             ik = self.inverse_kinematics(rx, ry)
@@ -288,8 +290,6 @@ class ScaraSerialMixin:
              self.point_queue = []
              return
         tx, ty, feed_rate, slt = self.point_queue.pop(0)
-        if getattr(self,"velocity_monitor",None) is not None:
-            self.velocity_monitor.process_new_data(f"X{tx:.3f} Y{ty:.3f} F{feed_rate:.1f}")
         self.last_sent_motion = (tx, ty, feed_rate, slt)
         self.sent_point_id += 1
         mcu_tx, mcu_ty = self.ui_to_mcu_xy(tx, ty)
@@ -312,4 +312,27 @@ class ScaraSerialMixin:
             self.waiting_for_ack = True  
             self.timeout_timer.start(1000) 
         else:
+            # ---- ??????????? / ???????? dt ----
+            prev_x, prev_y = self.cur_x, self.cur_y
+            self.cur_x, self.cur_y = tx, ty
+            if slt:
+                self.history_x, self.history_y = [tx], [ty]
+            else:
+                self.history_x.append(tx)
+                self.history_y.append(ty)
+
+            import math as _math
+            dx = tx - prev_x
+            dy = ty - prev_y
+            dist = _math.hypot(dx, dy)
+            feed_mm_s = feed_rate / 60.0
+            dt = dist / feed_mm_s if feed_mm_s > 0.001 else self.dt
+
+            monitor = getattr(self, "velocity_monitor", None)
+            if monitor is not None and hasattr(monitor, "process_tcp_point"):
+                monitor.process_tcp_point(tx, ty, dt)
+
+            ik = self.inverse_kinematics(tx, ty)
+            if ik and ik[0] is not None:
+                self.update_plot(ik[0], ik[1])
             QTimer.singleShot(10, self.process_queue)

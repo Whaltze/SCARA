@@ -12,11 +12,11 @@ except ImportError:
     from matplotlib.figure import Figure
 
 
-_FEEDBACK_RE = re.compile(r'X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)(?:\s+F([-+]?\d*\.?\d+))?')
+_FEEDBACK_RE = re.compile(r"X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)")
 
 
 class MonitorWindow(QMainWindow):
-    def __init__(self, kinematics_engine, sample_dt=0.02):
+    def __init__(self, kinematics_engine):
         super().__init__()
         self.setWindowTitle("\u7535\u673a\u52a8\u529b\u5b66\u5b9e\u65f6\u76d1\u63a7 (\u771f\u5b9e\u53cd\u9988\u89e3\u7b97)")
         self.resize(1000, 800)
@@ -33,9 +33,7 @@ class MonitorWindow(QMainWindow):
         self.last_theta = None
         self.last_velocity = None
         self.last_time = None
-        self.last_sent_xy = None
-        self.dt = sample_dt  # Fixed planned sampling interval
-        self.virtual_time = 0.0  # Accumulated planned time
+        self.start_timestamp = time.perf_counter()
 
         self.init_ui()
 
@@ -100,37 +98,23 @@ class MonitorWindow(QMainWindow):
         self.a1_data.clear()
         self.a2_data.clear()
         self.last_pos = None
-        # 同时清空曲线显示
-        if pg is not None:
-            self.cv1.setData([], [])
-            self.cv2.setData([], [])
-            self.ca1.setData([], [])
-            self.ca2.setData([], [])
-        else:
-            self.cv1.set_data([], [])
-            self.cv2.set_data([], [])
-            self.ca1.set_data([], [])
-            self.ca2.set_data([], [])
         self.last_theta = None
         self.last_velocity = None
         self.last_time = None
-        self.last_sent_xy = None
-        self.virtual_time = 0.0
+        self.start_timestamp = time.perf_counter()
         self.update_plots()
 
-    @Slot(str)
-    @Slot(str)
-    def process_new_data(self, raw_str):
+    def process_tcp_point(self, x, y, dt):
+        """??/???????????? dt ?? TCP ???????????
+
+        ? process_new_data??????????????
+        ???????????? dt??? ? ??????????
+        ?????????????????????
+        """
         if not self.is_running:
             return
 
-        match = _FEEDBACK_RE.search(raw_str)
-        if not match:
-            return
-
-        curr_x = float(match.group(1))
-        curr_y = float(match.group(2))
-        feed_rate = float(match.group(3)) if match.group(3) else None
+        curr_x, curr_y = x, y
         if self.last_pos == (curr_x, curr_y):
             return
 
@@ -138,28 +122,14 @@ class MonitorWindow(QMainWindow):
         if theta[0] is None:
             return
 
-        if self.last_theta is not None:
-            # dt = distance / speed
-            if self.last_sent_xy is not None and feed_rate and feed_rate > 0:
-                dx = curr_x - self.last_sent_xy[0]
-                dy = curr_y - self.last_sent_xy[1]
-                dist = (dx * dx + dy * dy) ** 0.5
-                if dist > 0.001:
-                    dt = dist / (feed_rate / 60.0)
-                else:
-                    dt = self.dt
-            else:
-                dt = self.dt
-            if dt <= 0.0:
-                return
-
+        if self.last_theta is not None and dt > 1e-9:
             v1 = (theta[0] - self.last_theta[0]) / dt
             v2 = (theta[1] - self.last_theta[1]) / dt
 
             if self.last_velocity is not None:
                 a1 = (v1 - self.last_velocity[0]) / dt
                 a2 = (v2 - self.last_velocity[1]) / dt
-                t_rel = self.virtual_time
+                t_rel = self.time_history[-1] + dt if self.time_history else 0.0
                 self.time_history.append(t_rel)
                 self.v1_data.append(v1)
                 self.v2_data.append(v2)
@@ -169,11 +139,54 @@ class MonitorWindow(QMainWindow):
                 self.update_plots()
 
             self.last_velocity = (v1, v2)
-            self.virtual_time += dt
 
         self.last_pos = (curr_x, curr_y)
         self.last_theta = (theta[0], theta[1])
-        self.last_sent_xy = (curr_x, curr_y)
+
+    @Slot(str)
+    def process_new_data(self, raw_str):
+        if not self.is_running:
+            return
+
+        match = _FEEDBACK_RE.search(raw_str)
+        if not match:
+            return
+
+        curr_x, curr_y = float(match.group(1)), float(match.group(2))
+        if self.last_pos == (curr_x, curr_y):
+            return
+
+        theta = self.kin.inverse(curr_x, curr_y)
+        if theta[0] is None:
+            return
+
+        now = time.perf_counter()
+        if self.last_theta is not None and self.last_time is not None:
+            dt = now - self.last_time
+            if dt <= 0.0:
+                return
+
+            v1 = (theta[0] - self.last_theta[0]) / dt
+            v2 = (theta[1] - self.last_theta[1]) / dt
+
+            if self.last_velocity is not None:
+                a1 = (v1 - self.last_velocity[0]) / dt
+                a2 = (v2 - self.last_velocity[1]) / dt
+                t_rel = now - self.start_timestamp
+                self.time_history.append(t_rel)
+                self.v1_data.append(v1)
+                self.v2_data.append(v2)
+                self.a1_data.append(a1)
+                self.a2_data.append(a2)
+                self._trim_window(t_rel)
+                self.update_plots()
+
+            self.last_velocity = (v1, v2)
+
+        self.last_pos = (curr_x, curr_y)
+        self.last_theta = (theta[0], theta[1])
+        self.last_time = now
+
     def _trim_window(self, latest_time):
         min_time = max(0.0, latest_time - self.window_seconds)
         while self.time_history and self.time_history[0] < min_time:

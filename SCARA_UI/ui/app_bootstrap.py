@@ -17,7 +17,7 @@ def run_app() -> int:
     window = FiveBarSerialGUI()
     window.show()
 
-    monitor = MonitorWindow(window.kinematics, sample_dt=window.dt)
+    monitor = MonitorWindow(window.kinematics)
     monitor.show()
     window.velocity_monitor = monitor
 
