@@ -32,11 +32,11 @@ class FiveBarSerialGUI(
         self.ser = None
         self.L0, self.L1, self.L2 = 150.0, 160.0, 200.0
         self.A, self.B = np.array([0, 0]), np.array([self.L0, 0])
-        self.HOME_X, self.HOME_Y = 75.0, 345.4
+        self.HOME_X, self.HOME_Y = 75.0, 220.0
 
         self.accel = 100.0
         self.junction_dev = 0.02
-        self.dt = 0.04
+        self.dt = 0.02
 
         self.kinematics = FiveBarKinematics(
             FiveBarConfig(
@@ -49,6 +49,8 @@ class FiveBarSerialGUI(
             accel_mm_s2=self.accel,
             junction_deviation=self.junction_dev,
             sample_dt=self.dt,
+            max_segment_mm=0.35,
+            min_segment_mm=0.02,
         )
 
         self.cam_proc = CameraProcessor()
@@ -57,11 +59,18 @@ class FiveBarSerialGUI(
         self.cur_x, self.cur_y = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
         self.HOME_X, self.HOME_Y = self.cur_x, self.cur_y
         self.history_x, self.history_y = [self.cur_x], [self.cur_y]
+        self.feedback_x, self.feedback_y = [], []
+        self.preview_x, self.preview_y = [], []
+        self.preview_label = ""
+        self._plot_user_view = False
+        self.velocity_monitor = None
         self.is_silent_move = False
         self.is_recording = False
         self.teach_data = []
         self.teach_points = []
         self.point_queue = []
+        self.current_ppr = 1600
+        self.microstep_dirty = True
 
         self.waiting_for_ack = False
         self.last_sent_package = ""
@@ -75,6 +84,7 @@ class FiveBarSerialGUI(
         self.ack_timeout_count = 0
         self.mcu_planner_free = 32
         self.stream_waiting_buffer = False
+        self.motion_preamble_needed = True
 
         self.board_only_debug = True
         self.is_homed = self.board_only_debug

@@ -31,6 +31,13 @@ def build_g1_line(x: float, y: float, feed_mm_min: float, point_id: int, limit_c
     return f"G1 X{x:.3f} Y{y:.3f} F{feed_mm_min:.0f} ;ID={point_id} LIM={lim}"
 
 
+def build_ppr_line(ppr1: int, ppr2: int = None) -> str:
+    """Build the firmware command that matches the UI pulses/rev selection."""
+    ppr1 = int(ppr1)
+    ppr2 = ppr1 if ppr2 is None else int(ppr2)
+    return f"PPR {ppr1} {ppr2}"
+
+
 def parse_ok_ack(raw: str, expected_line: str) -> AckResult:
     """解析下位机 ok 回显，并检查 cs 和 line 是否和上位机最近发送一致。"""
     cs_match = re.search(r"cs=([0-9A-F]{2})", raw)

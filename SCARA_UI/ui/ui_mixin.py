@@ -16,7 +16,76 @@ from PySide6.QtWidgets import (
     QSlider,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
+
+
+class HandwritingPad(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._strokes = []
+        self._drawing = False
+        self.setMinimumHeight(150)
+        self.setStyleSheet("background: #fafafa; border: 1px solid #888;")
+
+    def normalized_strokes(self):
+        return [[point for point in stroke] for stroke in self._strokes if len(stroke) >= 2]
+
+    def clear(self):
+        self._strokes = []
+        self._drawing = False
+        self.update()
+
+    def _event_point(self, event):
+        pos = event.position()
+        w = max(1, self.width())
+        h = max(1, self.height())
+        x = min(1.0, max(0.0, pos.x() / w))
+        y = min(1.0, max(0.0, pos.y() / h))
+        return (x, y)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        self._drawing = True
+        self._strokes.append([self._event_point(event)])
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if not self._drawing or not self._strokes:
+            return
+        point = self._event_point(event)
+        last = self._strokes[-1][-1]
+        if abs(point[0] - last[0]) + abs(point[1] - last[1]) >= 0.004:
+            self._strokes[-1].append(point)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drawing = False
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#fafafa"))
+        grid_pen = QPen(QColor("#dddddd"), 1)
+        painter.setPen(grid_pen)
+        for i in range(1, 4):
+            x = int(self.width() * i / 4)
+            y = int(self.height() * i / 4)
+            painter.drawLine(x, 0, x, self.height())
+            painter.drawLine(0, y, self.width(), y)
+        painter.setPen(QPen(QColor("#222222"), 2))
+        for stroke in self._strokes:
+            for p0, p1 in zip(stroke, stroke[1:]):
+                painter.drawLine(
+                    int(p0[0] * self.width()),
+                    int(p0[1] * self.height()),
+                    int(p1[0] * self.width()),
+                    int(p1[1] * self.height()),
+                )
+        painter.setPen(QPen(QColor("#888888"), 1))
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
 
 
 class ScaraUiMixin:
@@ -54,13 +123,14 @@ class ScaraUiMixin:
         hw_group = QGroupBox("硬件控制")
         hw_layout = QGridLayout()
         box_w, box_h = 150, 28
-        hw_layout.addWidget(QLabel("细分选择:"), 0, 0)
+        hw_layout.addWidget(QLabel("脉冲/圈(需与驱动拨码一致):"), 0, 0)
         self.microstep_combo = QComboBox()
         self.microstep_combo.addItems(["400", "1600", "3200", "6400"])
         self.microstep_combo.setCurrentText("1600")
         self.microstep_combo.setFixedSize(box_w, box_h)
+        self.microstep_combo.currentTextChanged.connect(self.on_microstep_changed)
         hw_layout.addWidget(self.microstep_combo, 0, 1, Qt.AlignLeft)
-        hw_layout.addWidget(QLabel("运行速度:"), 1, 0)
+        hw_layout.addWidget(QLabel("运行速度(mm/s):"), 1, 0)
         self.hw_speed_input = QLineEdit("20.0")
         self.hw_speed_input.setFixedSize(box_w, box_h)
         hw_layout.addWidget(self.hw_speed_input, 1, 1, Qt.AlignLeft)
@@ -119,7 +189,7 @@ class ScaraUiMixin:
         i_grid = QGridLayout()
         i_grid.addWidget(QLabel("模式:"), 0, 0)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["G1 直线", "G2 顺圆"])
+        self.mode_combo.addItems(["G1 直线", "G2 顺圆", "G3 逆圆"])
         self.mode_combo.setFixedSize(box_w, box_h)
         i_grid.addWidget(self.mode_combo, 0, 1)
         i_grid.addWidget(QLabel("目标X:"), 1, 0)
@@ -153,18 +223,46 @@ class ScaraUiMixin:
         self.car_start_y.setFixedSize(box_w, box_h)
         ft_grid.addWidget(self.car_start_y, 1, 1)
         
-        btn_car = QPushButton("🚗 启动小车轨迹")
+        btn_car = QPushButton("小车1")
         btn_car.setStyleSheet("background-color: #3498db; color: white; font-weight: bold;")
         btn_car.clicked.connect(self.plan_car_path)
-        ft_grid.addWidget(btn_car, 2, 0, 1, 2)
+        ft_grid.addWidget(btn_car, 2, 0)
         
-        btn_car2 = QPushButton("🚗 启动小车2轨迹")
+        btn_car2 = QPushButton("小车2")
         btn_car2.setStyleSheet("background-color: #3498db; color: white; font-weight: bold;")
         btn_car2.clicked.connect(self.plan_car2_path)
-        ft_grid.addWidget(btn_car2, 3, 0, 1, 2)
+        ft_grid.addWidget(btn_car2, 2, 1)
+
+        btn_text_fdu = QPushButton("福州大学")
+        btn_text_fdu.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
+        btn_text_fdu.clicked.connect(lambda: self.plan_fixed_text_path("福州大学"))
+        ft_grid.addWidget(btn_text_fdu, 3, 0)
+
+        btn_text_fzu = QPushButton("FZU")
+        btn_text_fzu.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
+        btn_text_fzu.clicked.connect(lambda: self.plan_fixed_text_path("FZU"))
+        ft_grid.addWidget(btn_text_fzu, 3, 1)
         
         ft_group.setLayout(ft_grid)
         left_panel.addWidget(ft_group)
+
+        handwriting_group = QGroupBox("手写板")
+        handwriting_lay = QVBoxLayout()
+        self.handwriting_pad = HandwritingPad()
+        handwriting_lay.addWidget(self.handwriting_pad)
+        handwriting_btns = QHBoxLayout()
+        self.btn_hand_clear = QPushButton("清空")
+        self.btn_hand_preview = QPushButton("预览")
+        self.btn_hand_run = QPushButton("运行手写")
+        handwriting_btns.addWidget(self.btn_hand_clear)
+        handwriting_btns.addWidget(self.btn_hand_preview)
+        handwriting_btns.addWidget(self.btn_hand_run)
+        handwriting_lay.addLayout(handwriting_btns)
+        handwriting_group.setLayout(handwriting_lay)
+        left_panel.addWidget(handwriting_group)
+        self.btn_hand_clear.clicked.connect(self.clear_handwriting)
+        self.btn_hand_preview.clicked.connect(self.plan_handwriting_preview)
+        self.btn_hand_run.clicked.connect(self.plan_handwriting_path)
         left_panel.addStretch()
 
         # --- 中间面板 (3/10) ---
@@ -173,10 +271,17 @@ class ScaraUiMixin:
         
         coord_group = QGroupBox("实时坐标")
         c_lay = QVBoxLayout()
-        self.status_label = QLabel("坐标: X=75.0, Y=345.4")
+        self.status_label = QLabel("坐标: X=75.0, Y=220.0")
         self.status_label.setFont(QFont("Arial", 11, QFont.Bold))
         self.status_label.setAlignment(Qt.AlignCenter)
         c_lay.addWidget(self.status_label)
+        self.feedback_pose_label = QLabel("回传末端: X=--, Y=--")
+        self.feedback_joint_label = QLabel("回传角度: M1=-- deg, M2=-- deg")
+        self.feedback_pulse_label = QLabel("脉冲/PPS: P=--,--  A1=--/--  A2=--/--")
+        for label in (self.feedback_pose_label, self.feedback_joint_label, self.feedback_pulse_label):
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("color: #cccccc;")
+            c_lay.addWidget(label)
         coord_group.setLayout(c_lay)
         mid_panel.addWidget(coord_group)
 
@@ -295,21 +400,30 @@ class ScaraUiMixin:
         task_lay.setContentsMargins(10, 5, 10, 5) 
         self.btn_reset_home = QPushButton("系统一键复位 (回0点)")
         self.btn_emergency_stop = QPushButton("🛑 紧急停止")
+        self.btn_emergency_stop.setText("\u6025\u505c (\u4fdd\u7559\u961f\u5217)")
+        self.btn_stop_motion = QPushButton("\u505c\u6b62 (\u6e05\u9664\u961f\u5217)")
+        self.btn_stop_motion.setFixedHeight(38)
         self.btn_emergency_stop.setFixedHeight(45)
+        self.btn_stop_motion.setStyleSheet("background-color: #f39c12; color: white; font-weight: bold;")
         self.btn_emergency_stop.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
         task_lay.addWidget(self.btn_reset_home)
+        task_lay.addWidget(self.btn_stop_motion)
         task_lay.addWidget(self.btn_emergency_stop)
         task_group.setLayout(task_lay)
         mid_panel.addWidget(task_group)
         mid_panel.addStretch()
         self.btn_reset_home.clicked.connect(self.system_reset)
+        self.btn_stop_motion.clicked.connect(self.stop_motion)
         self.btn_emergency_stop.clicked.connect(self.emergency_stop)
 
         # 右侧面板
         right_panel = QVBoxLayout()
+        right_panel.setContentsMargins(0, 0, 0, 0)
+        right_panel.setSpacing(4)
         main_layout.addLayout(right_panel, 4)
         self.fig = Figure(figsize=(8, 5))
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_panel.addWidget(self.canvas, 6)
         self.ax = self.fig.add_subplot(111)
         

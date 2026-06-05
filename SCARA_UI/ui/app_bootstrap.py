@@ -4,6 +4,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 from .main_window import FiveBarSerialGUI
+from ..V_monitor import MonitorWindow
 
 
 def run_app() -> int:
@@ -15,4 +16,9 @@ def run_app() -> int:
 
     window = FiveBarSerialGUI()
     window.show()
+
+    monitor = MonitorWindow(window.kinematics, sample_dt=window.dt)
+    monitor.show()
+    window.velocity_monitor = monitor
+
     return app.exec()

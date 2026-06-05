@@ -1,3 +1,3 @@
-from .look_ahead import LookAheadPlanner, PlannerBlock, PlannerPoint
+from .look_ahead import GeometrySegment, LookAheadPlanner, PlannerPoint
 
-__all__ = ["LookAheadPlanner", "PlannerBlock", "PlannerPoint"]
+__all__ = ["GeometrySegment", "LookAheadPlanner", "PlannerPoint"]

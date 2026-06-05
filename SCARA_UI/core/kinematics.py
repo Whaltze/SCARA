@@ -107,8 +107,12 @@ class FiveBarKinematics:
         h = math.sqrt(max(0.0, c.passive_link**2 - (d * 0.5) ** 2))
         ux = -dy / d
         uy = dx / d
-        # 竖直放置时通常取上方交点，后期按实机结构可切换另一支解。
-        return mid_x + ux * h, mid_y + uy * h
+        ix1 = mid_x + ux * h
+        iy1 = mid_y + uy * h
+        ix2 = mid_x - ux * h
+        iy2 = mid_y - uy * h
+        # 与下位机保持一致：五连杆末端取两个圆交点中 Y 更高的一支。
+        return (ix1, iy1) if iy1 >= iy2 else (ix2, iy2)
 
     def is_reachable(self, x: float, y: float, margin: float = 5.0) -> bool:
         """带安全边界的工作空间判断。"""
