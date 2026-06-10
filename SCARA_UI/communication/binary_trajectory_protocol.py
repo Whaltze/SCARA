@@ -10,8 +10,7 @@ Trajectory point payload entries are:
 from dataclasses import dataclass
 import math
 import struct
-from typing import Iterable, List, Sequence, Tuple
-
+from typing import Iterable, List, Tuple, Sequence, Any
 
 SOF = b"\xA5\x5A"
 VERSION = 1
@@ -120,7 +119,7 @@ def joint_deg_to_pulse(theta1_deg: float, theta2_deg: float, ppr: int, zero_rad=
 
 
 def path_to_joint_points(
-    path: Iterable[Tuple[float, float, float, bool]],
+    path: Iterable[Any],  # 放宽类型检查，兼容 Tuple 和 PlannerPoint 对象
     kinematics,
     ppr: int,
     start_xy: Tuple[float, float] = None,
@@ -129,17 +128,18 @@ def path_to_joint_points(
 ) -> List[BinaryJointPoint]:
     """Convert UI path points to MCU binary joint trajectory points.
 
-    ``path`` entries are the existing UI tuples: x_mm, y_mm, feed_mm_min, silent.
-    ``kinematics`` must provide the current ``inverse(x, y) -> q1_deg, q2_deg`` method.
-
-    调节说明：
-    - min_pps：最低主导轴速度，太低会导致很短线段启动拖沓。
-    - max_pps：最高主导轴速度，必须不超过固件和驱动器可稳定输出的 PPS。
-    - feed_mm_min：来自 UI 轨迹速度，函数会根据相邻关键点距离换算为主导轴 PPS。
+    支持接收传统的 UI 轨迹元组，或者由 LookAheadPlanner 输出的带真实 dt 时间的 PlannerPoint 对象。
+    此函数将强制启用下位机的时间片同步模式 (HOST_TIMED)，从而实现 0 延迟、完全平滑的轨迹执行。
+    
+    参数调节：
+    - ppr：驱动器细分后的每圈脉冲数。
+    - start_xy：上下文起点，用于计算第一段插补的增量。
     """
     result: List[BinaryJointPoint] = []
     prev_pulse = None
     prev_xy = None
+    
+    # 1. 建立初始坐标上下文
     if start_xy is not None:
         sx, sy = float(start_xy[0]), float(start_xy[1])
         q1, q2 = kinematics.inverse(sx, sy)
@@ -147,16 +147,33 @@ def path_to_joint_points(
             raise ValueError(f"unreachable start point: X={sx:.3f}, Y={sy:.3f}")
         prev_pulse = joint_deg_to_pulse(q1, q2, ppr)
         prev_xy = (sx, sy)
+        
     for point in path:
-        x, y, feed_mm_min = point[0], point[1], point[2]
-        flags = int(point[4]) if len(point) > 4 else 0
-        x = float(x)
-        y = float(y)
-        feed_mm_min = float(feed_mm_min)
-        q1, q2 = kinematics.inverse(float(x), float(y))
+        # 2. 兼容对象的智能解包 (修复了原来重复解包覆盖的 Bug)
+        if hasattr(point, 'x'):
+            # 输入是 PlannerPoint 对象
+            x = float(point.x)
+            y = float(point.y)
+            feed_mm_min = float(point.feed_mm_min)
+            flags = getattr(point, 'flags', 0)
+            dt = getattr(point, 'dt', 0.02)  # 获取上位机前瞻算好的真实耗时
+        else:
+            # 输入是旧版元组 (Tuple)
+            x = float(point[0])
+            y = float(point[1])
+            feed_mm_min = float(point[2])
+            flags = int(point[4]) if len(point) > 4 else 0
+            dt = float(point[5]) if len(point) > 5 else 0.02
+            
+        # 3. 计算逆向运动学得到关节角度
+        q1, q2 = kinematics.inverse(x, y)
         if q1 is None or q2 is None:
             raise ValueError(f"unreachable path point: X={x:.3f}, Y={y:.3f}")
+            
+        # 4. 转为绝对脉冲 (全程浮点运算，仅在此处做四舍五入，消除累积误差)
         p1, p2 = joint_deg_to_pulse(q1, q2, ppr)
+        
+        # 5. 笛卡尔直线模式 (交由下位机做逆解)，保持不变
         if flags & FLAG_CARTESIAN_LINE:
             base = float(getattr(getattr(kinematics, "config", None), "base_distance", 0.0))
             x_um = int(round((x - base * 0.5) * 1000.0))
@@ -165,27 +182,41 @@ def path_to_joint_points(
             prev_pulse = (p1, p2)
             prev_xy = (x, y)
             continue
+            
+        # =======================================================
+        # 6. 核心优化：强制启用 HOST_TIMED 时间片模式，屏蔽下位机加减速
+        # =======================================================
+        flags |= FLAG_HOST_TIMED 
+        
         if prev_pulse is None:
-            v_dom = max(min_pps, min(max_pps, int(feed_mm_min / 60.0 * 30.0)))
+            # 如果是第一点且没有起点的上下文，假设用 20ms 完成 (10kHz * 0.02s)
+            duration_ticks = int(0.02 * 10000)
         else:
             dp1 = abs(p1 - prev_pulse[0])
             dp2 = abs(p2 - prev_pulse[1])
-            dom = max(dp1, dp2)
-            if dom == 0:
+            # 如果目标脉冲和上一个点一模一样，直接忽略该点，避免产生 0 距离微小段
+            if max(dp1, dp2) == 0:
                 prev_xy = (x, y)
                 continue
-            if prev_xy is not None:
+                
+            if dt > 0.0001:
+                # 核心机制：将 LookAheadPlanner 给定的秒数 dt，直接映射为 10000Hz 下的 Timer Ticks
+                duration_ticks = int(round(dt * 10000.0)) 
+            else:
+                # 容错：如果没获取到 dt，根据两点距离和设定速度反推耗时
                 distance = math.hypot(x - prev_xy[0], y - prev_xy[1])
                 feed_mm_s = max(0.1, feed_mm_min / 60.0)
-                if distance > 1e-6:
-                    duration = distance / feed_mm_s
-                    v_dom = int(math.ceil(dom / max(duration, 1e-6)))
-                else:
-                    v_dom = int(feed_mm_s * 30.0)
-            else:
-                v_dom = int(max(dom, 1) * 20)
-            v_dom = max(min_pps, min(max_pps, v_dom))
-        result.append(BinaryJointPoint(p1, p2, v_dom, flags=flags))
+                duration_ticks = int(round((distance / feed_mm_s) * 10000.0))
+                
+        # 限制时间范围：最低 1 拍，最高 65535 拍 (大约 6.55 秒，受限于协议 uint16)
+        duration_ticks = max(1, min(65535, duration_ticks))
+        
+        # 将算好的 duration_ticks 填入第三个参数。
+        # 在 HOST_TIMED 模式下，下位机会将该参数解释为 duration_ticks 而不是 v_dom_pps
+        result.append(BinaryJointPoint(p1, p2, duration_ticks, flags=flags))
+        
+        # 更新上一刻状态
         prev_pulse = (p1, p2)
         prev_xy = (x, y)
+        
     return result

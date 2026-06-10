@@ -689,6 +689,8 @@ class ScaraSerialMixin:
         if self.send_ascii_line(line, "PPR"):
             self.current_ppr = ppr
             self.microstep_dirty = False
+            if hasattr(self, "_reset_jog_anchor"):
+                self._reset_jog_anchor()
             if hasattr(self, "update_jog_pps_preview"):
                 self.update_jog_pps_preview()
             self.send_ascii_line("$$", "PARAMS")
@@ -847,6 +849,15 @@ class ScaraSerialMixin:
                     if pulse_match:
                         self.feedback_p1 = int(pulse_match.group(1))
                         self.feedback_p2 = int(pulse_match.group(2))
+                        if hasattr(self, "_feedback_xy_from_pulses"):
+                            try:
+                                self.cur_x, self.cur_y = self._feedback_xy_from_pulses(
+                                    (self.feedback_p1, self.feedback_p2)
+                                )
+                            except Exception as exc:
+                                self.log_error(f"P: 脉冲正解失败: {exc}")
+                        if hasattr(self, "_check_jog_completion_from_feedback"):
+                            self._check_jog_completion_from_feedback()
                     if a1_match:
                         self.feedback_a1_pps = (int(a1_match.group(3)), int(a1_match.group(4)))
                     if a2_match:
@@ -887,13 +898,7 @@ class ScaraSerialMixin:
                             self.append_feedback_point(rx, ry)
                         if getattr(self, "velocity_monitor", None) is not None:
                             self.velocity_monitor.process_new_data(f"X{rx:.3f} Y{ry:.3f}")
-                        if self.plot_mode_combo.currentText() == "通讯接收内容":
-                            self.cur_x, self.cur_y = rx, ry
-                            ik = self.inverse_kinematics(rx, ry)
-                            if ik and ik[0] is not None:
-                                self.update_plot(ik[0], ik[1])
-                        else:
-                            self.update_plot()
+                        self.update_plot()
                     return
 
                 # 4. 处理错误报警

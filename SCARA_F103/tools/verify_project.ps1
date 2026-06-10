@@ -128,6 +128,8 @@ Require-Text $timer "htim2\.Init\.Period = 99;" "TIM2 period is 99 for 10 kHz co
 
 $binaryTraj = Join-Path $projectRoot "UserApp\binary_traj.c"
 Require-Text $binaryTraj "(?s)void BinaryTraj_Loop\(void\)\s*\{.*service_motion\(\);" "binary trajectory preparation and dispatch run in the main loop"
+Require-Text $binaryTraj "ScaraKinematics_InverseUmToPulse" "binary Cartesian targets use direct high-precision inverse kinematics"
+Require-Text $binaryTraj "ScaraKinematics_PulseToPose" "binary Cartesian feedback uses direct pulse-to-pose kinematics"
 Require-Text $binaryTraj "(?s)void BinaryTraj_Tick10kHz\(void\)\s*\{.*update_stream_underrun_10khz\(\);" "binary trajectory 10 kHz tick only updates runtime diagnostics"
 Require-Text $binaryTraj "(?s)void BinaryTraj_Tick10kHz\(void\)\s*\{(?!.*Stepper_MoveAbs)" "binary trajectory 10 kHz tick does not start stepper moves"
 Require-Text $binaryTraj "Stepper_IsBusy\(\) \|\| s_run_requested \|\| s_state == BINARY_TRAJ_STATE_RUNNING" "binary trajectory rejects BEGIN while running between segments"
@@ -148,6 +150,8 @@ Require-Text $binaryTraj "s_max_dispatch_gap_ticks = 1u" "binary dispatch gap re
 Require-Text $binaryTraj "(?s)s_frame_type == BT_TYPE_ABORT.*BinaryTraj_Stop\(\).*MotionPlanner_Stop\(\)" "binary abort stops active and prefetched step segments"
 
 $gcodeStream = Join-Path $projectRoot "UserApp\gcode_stream.c"
+Require-Text $gcodeStream "ScaraKinematics_InverseUmToPulse" "G-code targets use direct high-precision inverse kinematics"
+Require-Text $gcodeStream "ScaraKinematics_PulseToPose" "status feedback uses direct pulse-to-pose kinematics"
 Require-Text $gcodeStream "JU:%lu,%lu,%u,%lu" "ASCII status reports binary trajectory underrun diagnostics"
 Require-Text $gcodeStream "Sq:%u,%u" "ASCII status reports step segment queue occupancy"
 Require-Text $gcodeStream "IC:%lu" "ASCII status reports maximum control ISR cycles"
@@ -164,6 +168,7 @@ Require-Text $serialDma "static bool enqueue_realtime\(char ch\)" "serial parser
 Require-Text $serialDma "bool SerialDma_ReadRealtime\(char \*out\)" "main loop can drain realtime characters separately"
 
 $stepper = Join-Path $projectRoot "UserApp\stepper_driver.c"
+Require-Text $stepper "(?s)bool Stepper_MoveAbsBlend.*s_move\.counter\[0\] = events >> 1;.*s_move\.event_accum = 0;" "ordinary DDA resets old segment phase before a new move"
 Require-Text $stepper "DWT->CTRL \|= DWT_CTRL_CYCCNTENA_Msk" "step timing enables the Cortex-M3 DWT cycle counter"
 Require-Text $stepper "DWT->CYCCNT - start" "step timing uses cycle-counted microsecond delays"
 Require-Text $stepper "delay_us\(APP_STEPPER_PULSE_LOW_US\)" "step pulse includes bounded low-level recovery"
@@ -238,6 +243,9 @@ Require-Text $senders "class BufferedBinarySender" "UI defines buffered binary s
 Require-Text $senders "class HostTimedSegmentSender" "UI defines host timed sender strategy"
 $uiMixin = Join-Path $projectRoot "..\SCARA_UI\ui\ui_mixin.py"
 Require-Text $uiMixin "lbl_sender_mode" "UI displays active sender mode and statistics"
+$senderStrategy = Join-Path $projectRoot "..\SCARA_UI\tests\sender_strategy_check.py"
+Require-Text $senderStrategy "check_cartesian_jog_roundtrip" "UI regression suite verifies Cartesian jog pulse closure"
+Require-Text $senderStrategy "check_feedback_mode_does_not_change_motion_state" "UI regression suite verifies plot mode cannot change motion state"
 
 $binaryStress = Join-Path $projectRoot "tools\binary_joint_traj_stress.ps1"
 Require-Text $binaryStress "BINARY_JOINT_DIAG" "binary trajectory stress reports underrun diagnostics"

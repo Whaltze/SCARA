@@ -266,13 +266,9 @@ static void enqueue_block(const GcodeBlock *block)
 static bool current_xy_from_stepper(int32_t *x_um, int32_t *y_um)
 {
     StepperState state;
-    ScaraJoint joint;
     ScaraPose pose;
     Stepper_GetStateSnapshot(&state);
-    if (!ScaraKinematics_PulseToJoint(state.axis[0].position_pulse, state.axis[1].position_pulse, &joint)) {
-        return false;
-    }
-    if (!ScaraKinematics_Forward(&joint, &pose)) {
+    if (!ScaraKinematics_PulseToPose(state.axis[0].position_pulse, state.axis[1].position_pulse, &pose)) {
         return false;
     }
     *x_um = pose.x_um;
@@ -292,11 +288,9 @@ static void sync_position_from_stepper(void)
 static bool build_motion_block(int32_t target_x_um, int32_t target_y_um, uint8_t rapid, GcodeBlock *out)
 {
     /* 逆解和脉冲换算在主循环中完成，TIM 中断不做浮点/三角计算。 */
-    ScaraJoint joint;
     int64_t p1 = 0;
     int64_t p2 = 0;
-    if (!ScaraKinematics_InverseUm(target_x_um, target_y_um, &joint) ||
-        !ScaraKinematics_JointToPulse(joint.theta1_mrad, joint.theta2_mrad, &p1, &p2) ||
+    if (!ScaraKinematics_InverseUmToPulse(target_x_um, target_y_um, &p1, &p2) ||
         !Stepper_TargetsAllowed(p1, p2)) {
         return false;
     }

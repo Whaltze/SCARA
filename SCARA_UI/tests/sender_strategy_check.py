@@ -69,6 +69,14 @@ class DummyLog:
         self.items.append(str(item))
 
 
+class DummyText:
+    def __init__(self, value):
+        self.value = str(value)
+
+    def currentText(self):
+        return self.value
+
+
 class SenderWindowDummy(ScaraSerialMixin):
     def __init__(self):
         self.ser = DummySerial()
@@ -140,9 +148,44 @@ class TimedPathDummy(TimedUploadDummy):
         self.path_planner = LookAheadPlanner(accel_mm_s2=100.0)
         self.current_ppr = 3200
         self.cur_x, self.cur_y = self.kinematics.forward(90.0, 90.0)
+        self.feedback_p1, self.feedback_p2 = self._joint_deg_to_pulse(
+            *self.inverse_kinematics(self.cur_x, self.cur_y)
+        )
+        self.binary_motion_active = False
+        self.jog_target_xy = None
+        self.jog_target_pulses = None
+        self.jog_pending_start_pulses = None
+        self.jog_pending_target_pulses = None
+        self.jog_roundtrip_origin_pulses = None
 
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
+
+
+class FeedbackStateDummy(ScaraSerialMixin, ScaraMotionMixin):
+    def __init__(self, plot_mode):
+        from SCARA_UI.core.kinematics import FiveBarKinematics
+
+        self.ser = DummySerial()
+        self.kinematics = FiveBarKinematics()
+        self.current_ppr = 3200
+        self.L0 = self.kinematics.config.base_distance
+        self.cur_x = 0.0
+        self.cur_y = 0.0
+        self.plot_mode_combo = DummyText(plot_mode)
+        self.velocity_monitor = None
+        self.board_only_debug = True
+        self.binary_motion_active = False
+        self.jog_pending_target_pulses = None
+        self.log_display = DummyLog()
+        self.plot_updates = 0
+
+    def update_plot(self, *args, **kwargs):
+        self.plot_updates += 1
+
+    def log_error(self, message):
+        raise AssertionError(message)
+
 
 def assert_true(value, message):
     if not value:
@@ -305,6 +348,144 @@ def check_timed_path_segmentation():
     )
 
 
+def segment_line_error(owner, start_pulses, segments, line_start, line_end):
+    max_error = 0.0
+    previous = tuple(int(value) for value in start_pulses)
+    for segment in segments:
+        target = (int(segment.p1_abs), int(segment.p2_abs))
+        dp1 = target[0] - previous[0]
+        dp2 = target[1] - previous[1]
+        events = max(abs(dp1), abs(dp2), 1)
+        for event in range(1, events + 1):
+            pulses = (
+                int(round(previous[0] + dp1 * event / events)),
+                int(round(previous[1] + dp2 * event / events)),
+            )
+            xy = owner._binary_xy_from_pulse(pulses[0], pulses[1], owner.current_ppr)
+            max_error = max(max_error, owner._point_to_line_error(xy, line_start, line_end))
+        previous = target
+    return max_error
+
+
+def check_cartesian_jog_roundtrip():
+    owner = TimedPathDummy()
+    points = ((75.0, 220.0), (90.0, 145.0), (50.0, 170.0), (75.0, 135.0))
+    deltas = ((-10.0, 0.0), (10.0, 0.0), (0.0, -10.0), (0.0, 10.0))
+    max_line_error = 0.0
+
+    for point in points:
+        origin = owner._binary_pulse_from_xy(point, owner.current_ppr)
+        assert_true(origin is not None, f"test point has no pulse solution: {point}")
+        for delta in deltas:
+            owner.feedback_p1, owner.feedback_p2 = origin
+            owner._reset_jog_anchor()
+            start_xy, start_pulses = owner._ensure_jog_anchor()
+            target_xy = (start_xy[0] + delta[0], start_xy[1] + delta[1])
+            assert_true(owner.check_workspace_safety(*target_xy), f"jog target is unsafe: {target_xy}")
+
+            outbound = owner._build_cartesian_host_segments(
+                start_xy,
+                target_xy,
+                20.0,
+                100.0,
+                start_pulses=start_pulses,
+            )
+            assert_true(outbound, f"outbound jog generated no segments: point={point} delta={delta}")
+            target_pulses = (int(outbound[-1].p1_abs), int(outbound[-1].p2_abs))
+            max_line_error = max(
+                max_line_error,
+                segment_line_error(owner, start_pulses, outbound, start_xy, target_xy),
+            )
+
+            owner._commit_jog_target(target_xy, target_pulses, start_pulses)
+            owner.feedback_p1, owner.feedback_p2 = target_pulses
+            owner._check_jog_completion_from_feedback()
+            assert_true(owner.jog_pending_target_pulses is None, "jog completion did not clear pending target")
+            anchored_xy, anchored_pulses = owner._ensure_jog_anchor()
+            assert_true(anchored_xy == target_xy, "feedback refresh replaced the commanded jog anchor")
+            assert_true(anchored_pulses == target_pulses, "feedback refresh replaced the target pulses")
+
+            return_xy = (anchored_xy[0] - delta[0], anchored_xy[1] - delta[1])
+            inbound = owner._build_cartesian_host_segments(
+                anchored_xy,
+                return_xy,
+                20.0,
+                100.0,
+                start_pulses=anchored_pulses,
+            )
+            assert_true(inbound, f"return jog generated no segments: point={point} delta={delta}")
+            return_pulses = (int(inbound[-1].p1_abs), int(inbound[-1].p2_abs))
+            max_line_error = max(
+                max_line_error,
+                segment_line_error(owner, anchored_pulses, inbound, anchored_xy, return_xy),
+            )
+            owner._commit_jog_target(return_xy, return_pulses, anchored_pulses)
+            owner.feedback_p1, owner.feedback_p2 = return_pulses
+            owner._check_jog_completion_from_feedback()
+            assert_true(
+                return_pulses == origin,
+                f"jog roundtrip did not close: point={point} delta={delta} "
+                f"origin={origin} return={return_pulses}",
+            )
+            assert_true(
+                any("JOG_ROUNDTRIP_CLOSED" in item for item in owner.log_display.items),
+                "jog roundtrip closure was not logged",
+            )
+
+    # At the lower workspace edge, a single 3200-PPR pulse can move the tool
+    # more than 0.3 mm. Keep the current configuration bounded, then verify
+    # that the requested 0.3 mm tolerance is achievable at a supported PPR.
+    assert_true(
+        max_line_error <= 0.8,
+        f"Cartesian jog cross-track error exceeds the 3200-PPR quantization bound: {max_line_error:.6f}mm",
+    )
+
+    owner = TimedPathDummy()
+    owner.current_ppr = 12800
+    high_resolution_error = 0.0
+    for point in points:
+        origin = owner._binary_pulse_from_xy(point, owner.current_ppr)
+        owner.feedback_p1, owner.feedback_p2 = origin
+        owner._reset_jog_anchor()
+        start_xy, start_pulses = owner._ensure_jog_anchor()
+        for delta in deltas:
+            target_xy = (start_xy[0] + delta[0], start_xy[1] + delta[1])
+            segments = owner._build_cartesian_host_segments(
+                start_xy,
+                target_xy,
+                20.0,
+                100.0,
+                start_pulses=start_pulses,
+            )
+            high_resolution_error = max(
+                high_resolution_error,
+                segment_line_error(owner, start_pulses, segments, start_xy, target_xy),
+            )
+    assert_true(
+        high_resolution_error <= 0.3,
+        f"Cartesian jog cross-track error exceeds 0.3mm at 12800 PPR: {high_resolution_error:.6f}mm",
+    )
+
+
+def check_feedback_mode_does_not_change_motion_state():
+    feedback_pulses = (97, -97)
+    states = []
+    for mode in ("通讯发送内容", "通讯接收内容"):
+        owner = FeedbackStateDummy(mode)
+        owner.ser.rx_lines.append(
+            f"<P:{feedback_pulses[0]},{feedback_pulses[1]}|M:999.000,999.000>\n"
+        )
+        owner.check_serial_feedback()
+        expected = owner._feedback_xy_from_pulses(feedback_pulses)
+        assert_true(
+            math.hypot(owner.cur_x - expected[0], owner.cur_y - expected[1]) < 1e-9,
+            f"plot mode {mode} allowed M: display data to override P: motion state",
+        )
+        assert_true(owner.plot_updates == 1, f"plot mode {mode} did not refresh the plot")
+        states.append((owner.cur_x, owner.cur_y))
+    assert_true(states[0] == states[1], "plot mode changed the authoritative motion state")
+
+
 def check_single_rounding_pulse_conversion():
     ppr = 32000
     zero_deg = 2.251 * 180.0 / 3.141592653589793
@@ -371,6 +552,8 @@ def main():
     check_ack_window_progress()
     check_timed_jog_transport()
     check_timed_path_segmentation()
+    check_cartesian_jog_roundtrip()
+    check_feedback_mode_does_not_change_motion_state()
     check_single_rounding_pulse_conversion()
     check_stop_clears_all_sender_layers()
     check_capability_handshake()

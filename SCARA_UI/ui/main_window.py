@@ -107,6 +107,11 @@ class FiveBarSerialGUI(
         self.emergency_resume_path = []
         self.active_binary_send_path = []
         self.active_preview_path = []
+        self.jog_target_xy = None
+        self.jog_target_pulses = None
+        self.jog_pending_start_pulses = None
+        self.jog_pending_target_pulses = None
+        self.jog_roundtrip_origin_pulses = None
 
         # 如果接了真实电机和 HOME 开关，应该改成：
         self.board_only_debug = False

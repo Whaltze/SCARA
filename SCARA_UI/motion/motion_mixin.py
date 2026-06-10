@@ -54,6 +54,7 @@ class ScaraMotionMixin:
     HOST_DDA_HZ = 10000
     HOST_DDA_MAX_PPS = 10000
     HOST_TRAJECTORY_SLICE_TICKS = 100
+    JOG_CARTESIAN_SAMPLE_MM = 0.20
     HOST_MIN_SMOOTH_PPS = 50.0
     HOST_DEFAULT_ACCEL_MM_S2 = 100.0
 
@@ -1090,6 +1091,7 @@ class ScaraMotionMixin:
         self.last_sent_motion = None
         self.stream_waiting_buffer = False
         self.timeout_timer.stop()
+        self._reset_jog_anchor()
 
         # 清空反馈轨迹，让这次显示只包含 HOME_SIM 回传轨迹。
         self.feedback_x, self.feedback_y = [], []
@@ -1132,6 +1134,7 @@ class ScaraMotionMixin:
         self.last_sent_motion = None
         self.stream_waiting_buffer = False
         self.timeout_timer.stop()
+        self._reset_jog_anchor()
 
         self.feedback_x, self.feedback_y = [], []
         self.preview_x, self.preview_y = [], []
@@ -1204,6 +1207,8 @@ class ScaraMotionMixin:
         self.active_binary_send_path = []
         self.active_preview_path = []
         self.emergency_paused = False
+        if hasattr(self, "_reset_jog_anchor"):
+            self._reset_jog_anchor()
         if hasattr(self, "_set_emergency_button_paused"):
             self._set_emergency_button_paused(False)
         self.motion_preamble_needed = True
@@ -1230,6 +1235,8 @@ class ScaraMotionMixin:
         self.binary_motion_active = False
         self.waiting_for_ack = False
         self.stream_waiting_buffer = False
+        if hasattr(self, "_reset_jog_anchor"):
+            self._reset_jog_anchor()
         self.motion_preamble_needed = True
         self.timeout_timer.stop()
         self.emergency_paused = True
@@ -1311,6 +1318,66 @@ class ScaraMotionMixin:
         if q1 is None or q2 is None:
             raise ValueError("Current pose has no valid IK; cannot plan host segments.")
         return self._joint_deg_to_pulse(q1, q2)
+
+    def _feedback_xy_from_pulses(self, pulses=None):
+        p1, p2 = pulses if pulses is not None else self._current_feedback_pulses()
+        ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+        xy = self._binary_xy_from_pulse(int(p1), int(p2), ppr)
+        if xy[0] is None or xy[1] is None:
+            raise ValueError(f"Feedback pulses have no valid FK: P={int(p1)},{int(p2)}")
+        return float(xy[0]), float(xy[1])
+
+    def _reset_jog_anchor(self):
+        self.jog_target_xy = None
+        self.jog_target_pulses = None
+        self.jog_pending_start_pulses = None
+        self.jog_pending_target_pulses = None
+        self.jog_roundtrip_origin_pulses = None
+
+    def _ensure_jog_anchor(self):
+        feedback_pulses = tuple(int(value) for value in self._current_feedback_pulses())
+        target_pulses = getattr(self, "jog_target_pulses", None)
+        if target_pulses is None or tuple(target_pulses) != feedback_pulses:
+            self.jog_target_pulses = feedback_pulses
+            self.jog_target_xy = self._feedback_xy_from_pulses(feedback_pulses)
+            self.jog_roundtrip_origin_pulses = feedback_pulses
+        return tuple(self.jog_target_xy), tuple(self.jog_target_pulses)
+
+    def _commit_jog_target(self, target_xy, target_pulses, start_pulses):
+        self.jog_target_xy = (float(target_xy[0]), float(target_xy[1]))
+        self.jog_target_pulses = (int(target_pulses[0]), int(target_pulses[1]))
+        self.jog_pending_start_pulses = (int(start_pulses[0]), int(start_pulses[1]))
+        self.jog_pending_target_pulses = self.jog_target_pulses
+        if getattr(self, "jog_roundtrip_origin_pulses", None) is None:
+            self.jog_roundtrip_origin_pulses = self.jog_pending_start_pulses
+
+    def _check_jog_completion_from_feedback(self):
+        target = getattr(self, "jog_pending_target_pulses", None)
+        if target is None or getattr(self, "binary_motion_active", False):
+            return
+        actual = tuple(int(value) for value in self._current_feedback_pulses())
+        target = tuple(int(value) for value in target)
+        start = tuple(int(value) for value in getattr(self, "jog_pending_start_pulses", actual))
+        if actual == target:
+            color = "#00ff99"
+            result = "CLOSED"
+        else:
+            color = "orange"
+            result = f"MISMATCH dP={actual[0] - target[0]},{actual[1] - target[1]}"
+            self.jog_target_xy = self._feedback_xy_from_pulses(actual)
+            self.jog_target_pulses = actual
+        self.log_display.append(
+            f"<font color='{color}'>JOG_DONE startP={start[0]},{start[1]} "
+            f"targetP={target[0]},{target[1]} actualP={actual[0]},{actual[1]} {result}</font>"
+        )
+        origin = getattr(self, "jog_roundtrip_origin_pulses", None)
+        if origin is not None and actual == tuple(origin) and start != actual:
+            self.log_display.append(
+                f"<font color='#00ff99'>JOG_ROUNDTRIP_CLOSED P={actual[0]},{actual[1]}</font>"
+            )
+            self.jog_roundtrip_origin_pulses = actual
+        self.jog_pending_start_pulses = None
+        self.jog_pending_target_pulses = None
 
     def _trapezoid_distance_at(self, distance, vmax, accel, t):
         distance = max(0.0, float(distance))
@@ -1518,7 +1585,16 @@ class ScaraMotionMixin:
             last_tick = tick
         return segments
 
-    def _build_cartesian_host_segments(self, start_xy, end_xy, speed_mm_s, accel_mm_s2=None, sample_ticks=None):
+    def _build_cartesian_host_segments(
+        self,
+        start_xy,
+        end_xy,
+        speed_mm_s,
+        accel_mm_s2=None,
+        sample_ticks=None,
+        start_pulses=None,
+    ):
+        """Plan timed joint targets sampled from the requested Cartesian line."""
         sx, sy = float(start_xy[0]), float(start_xy[1])
         ex, ey = float(end_xy[0]), float(end_xy[1])
         dx, dy = ex - sx, ey - sy
@@ -1529,19 +1605,67 @@ class ScaraMotionMixin:
         speed_mm_s = float(speed_mm_s)
         accel_mm_s2 = float(accel_mm_s2 or self.HOST_DEFAULT_ACCEL_MM_S2)
         if speed_mm_s <= 0.0 or accel_mm_s2 <= 0.0:
-            raise ValueError("点动速度和加速度必须大于 0")
-        start_pulses = self._current_feedback_pulses()
-        q1, q2 = self.inverse_kinematics(ex, ey)
-        if q1 is None or q2 is None:
-            raise ValueError(f"Host segment IK failed at X={ex:.3f}, Y={ey:.3f}")
-        end1, end2 = self._joint_deg_to_pulse(q1, q2)
-        dom = max(abs(end1 - start_pulses[0]), abs(end2 - start_pulses[1]))
-        if dom == 0:
-            return []
-        pulses_per_mm = dom / distance
-        vmax_pps = speed_mm_s * pulses_per_mm
-        accel_pps2 = accel_mm_s2 * pulses_per_mm
-        return self._build_joint_host_segments(start_pulses, (end1, end2), vmax_pps, accel_pps2)
+            raise ValueError("Jog speed and acceleration must be greater than zero.")
+        start_pulses = tuple(int(value) for value in (start_pulses or self._current_feedback_pulses()))
+        profile = self._trapezoid_profile(distance, speed_mm_s, accel_mm_s2)
+        total_ticks = max(1, int(round(profile["total_time"] * self.HOST_DDA_HZ)))
+        if sample_ticks is None:
+            spacing_ticks = int(
+                math.floor(self.JOG_CARTESIAN_SAMPLE_MM * self.HOST_DDA_HZ / max(speed_mm_s, 1e-6))
+            )
+            sample_ticks = min(self.HOST_TRAJECTORY_SLICE_TICKS, max(1, spacing_ticks))
+        else:
+            sample_ticks = max(1, int(sample_ticks))
+
+        BinaryHostSegment = self._binary_host_segment_class()
+        segments = []
+        last_tick = 0
+        last_pulses = start_pulses
+        tick = sample_ticks
+        peak_pps = 0.0
+        while True:
+            is_final = tick >= total_ticks
+            target_tick = total_ticks if is_final else tick
+            scalar, _ = self._trapezoid_distance_at(
+                distance,
+                speed_mm_s,
+                accel_mm_s2,
+                target_tick / self.HOST_DDA_HZ,
+            )
+            ratio = max(0.0, min(1.0, scalar / distance))
+            x = ex if is_final else sx + dx * ratio
+            y = ey if is_final else sy + dy * ratio
+            q1, q2 = self.inverse_kinematics(x, y)
+            if q1 is None or q2 is None:
+                raise ValueError(f"Cartesian jog IK failed at X={x:.3f}, Y={y:.3f}")
+            target = self._joint_deg_to_pulse(q1, q2)
+            duration = target_tick - last_tick
+            dominant = max(abs(target[0] - last_pulses[0]), abs(target[1] - last_pulses[1]))
+            if dominant > duration:
+                requested_pps = dominant * self.HOST_DDA_HZ / max(1, duration)
+                raise ValueError(
+                    f"Cartesian jog requests {requested_pps:.1f}pps; reduce speed or increase PPR."
+                )
+            if target != last_pulses:
+                flags = self.BINARY_FLAG_EXACT_STOP if is_final else 0
+                segments.append(BinaryHostSegment(target[0], target[1], duration, flags=flags))
+                peak_pps = max(peak_pps, dominant * self.HOST_DDA_HZ / max(1, duration))
+                last_pulses = target
+                last_tick = target_tick
+            if is_final:
+                break
+            tick += sample_ticks
+
+        if segments and (segments[-1].flags & self.BINARY_FLAG_EXACT_STOP) == 0:
+            segments[-1].flags |= self.BINARY_FLAG_EXACT_STOP
+        self._set_host_motion_status(
+            {
+                "target_pps": peak_pps,
+                "peak_pps": peak_pps,
+                "limited": profile["limited"],
+            }
+        )
+        return segments
 
     def build_host_segments_from_path(self, path, start_xy=None, label="host trajectory"):
         """Convert a planned UI XY path into smoothed timed joint DDA segments."""
@@ -1766,54 +1890,61 @@ class ScaraMotionMixin:
             self.log_error(f"点动步长错误: {e}")
 
     def add_jog(self, dx, dy):
-        """方向点动：空闲时走二进制关节插补，运动队列中才退回 ASCII 追加。
-
-        调节入口：
-        - 点动距离来自 UI 按钮绑定的 dx/dy。
-        - 点动速度来自 hw_speed_input，单位 mm/s。
-        - 直线平滑度由 BINARY_LINE_TOLERANCE_MM 和当前 PPR 决定。
-        """
+        """Plan an exact-stop Cartesian jog from the authoritative pulse anchor."""
         try:
             v_max = self._read_run_speed_mm_s()
-            if getattr(self, "binary_stream_active", False):
-                self.log_error("二进制轨迹续传中，暂不追加点动；请等待当前轨迹完成或先停止")
+            busy = bool(
+                getattr(self, "binary_stream_active", False)
+                or getattr(self, "binary_motion_active", False)
+                or self.waiting_for_ack
+                or self.point_queue
+            )
+            if busy:
+                self.log_error("当前运动尚未完全停止，点动命令未发送")
                 return
-            sx, sy = (self.point_queue[-1][0], self.point_queue[-1][1]) if self.point_queue else (self.cur_x, self.cur_y)
+
+            (sx, sy), start_pulses = self._ensure_jog_anchor()
             if not self.check_workspace_safety(sx, sy):
-                sx, sy = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
-                self.cur_x, self.cur_y = sx, sy
-                self.history_x, self.history_y = [sx], [sy]
-                self.log_display.append(
-                    f"<font color='yellow'>当前位置不可达，已校正到安全点 X={sx:.1f}, Y={sy:.1f}</font>"
+                self._reset_jog_anchor()
+                self.log_error(
+                    f"当前 P: 脉冲对应位置不可达，点动命令未发送: X={sx:.3f}, Y={sy:.3f}"
                 )
-                self.update_plot()
-            tx, ty = sx + dx, sy + dy
-            if self.check_workspace_safety(tx, ty):
-                moving = bool(self.waiting_for_ack or self.point_queue)
-                if not moving:
-                    path = self.generate_linear_path(sx, sy, tx, ty, v_max)
-                    if not path:
-                        self.log_error("点动距离过短，未生成轨迹")
-                        return
-                    self.preview_planned_path(path, "点动")
-                    accel = self._read_run_accel_mm_s2()
-                    segments = self._build_cartesian_host_segments((sx, sy), (tx, ty), v_max, accel)
-                    if self._upload_host_segments(segments, "host cartesian jog"):
-                        stats = getattr(self, "_last_host_plan_stats", {})
-                        self.log_display.append(
-                            f"<font color='#ffffff'>HOST_JOG XY dx={dx:g} dy={dy:g} segments={len(segments)} peak={float(stats.get('peak_pps', 0.0)):.1f}pps</font>"
-                        )
-                    return
-                blend_speed = v_max * 0.35
-                path = self.generate_linear_path(sx, sy, tx, ty, v_max, v_start=blend_speed, v_end=blend_speed)
-                if not path:
-                    self.log_error("点动距离过短，未生成轨迹")
-                    return
-                self.preview_planned_path(path, "点动")
-                send_path = None
-                self.load_motion_queue(path, append=moving, send_path=send_path)
-            else: self.log_error(f"不可达区域: X={tx:.1f}, Y={ty:.1f}")
-        except Exception as e: self.log_error(f"点动错误: {e}")
+                return
+
+            tx, ty = sx + float(dx), sy + float(dy)
+            if not self.check_workspace_safety(tx, ty):
+                self.log_error(f"不可达区域: X={tx:.3f}, Y={ty:.3f}")
+                return
+
+            path = self.generate_linear_path(sx, sy, tx, ty, v_max)
+            if not path:
+                self.log_error("点动距离过短，未生成轨迹")
+                return
+            self.preview_planned_path(path, "点动")
+            accel = self._read_run_accel_mm_s2()
+            segments = self._build_cartesian_host_segments(
+                (sx, sy),
+                (tx, ty),
+                v_max,
+                accel,
+                start_pulses=start_pulses,
+            )
+            if not segments:
+                self.log_error("点动未产生脉冲变化")
+                return
+
+            target_pulses = (int(segments[-1].p1_abs), int(segments[-1].p2_abs))
+            if self._upload_host_segments(segments, "host cartesian jog"):
+                self._commit_jog_target((tx, ty), target_pulses, start_pulses)
+                stats = getattr(self, "_last_host_plan_stats", {})
+                self.log_display.append(
+                    f"<font color='#ffffff'>HOST_JOG XY dx={dx:g} dy={dy:g} "
+                    f"startP={start_pulses[0]},{start_pulses[1]} "
+                    f"targetP={target_pulses[0]},{target_pulses[1]} "
+                    f"segments={len(segments)} peak={float(stats.get('peak_pps', 0.0)):.1f}pps</font>"
+                )
+        except Exception as e:
+            self.log_error(f"点动错误: {e}")
     
     def motor_jog(self, motor_id, direction):
         """单电机点动。

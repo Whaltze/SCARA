@@ -343,11 +343,9 @@ static bool decode_point(const uint8_t *payload, BinaryTrajPoint *point)
 static bool point_allowed(const BinaryTrajPoint *point)
 {
     if ((point->flags & BT_POINT_FLAG_CARTESIAN_LINE) != 0u) {
-        ScaraJoint joint;
         int64_t p1 = 0;
         int64_t p2 = 0;
-        return ScaraKinematics_InverseUm(point->p1_abs, point->p2_abs, &joint) &&
-               ScaraKinematics_JointToPulse(joint.theta1_mrad, joint.theta2_mrad, &p1, &p2) &&
+        return ScaraKinematics_InverseUmToPulse(point->p1_abs, point->p2_abs, &p1, &p2) &&
                Stepper_TargetsAllowed(p1, p2);
     }
     return Stepper_TargetsAllowed(point->p1_abs, point->p2_abs);
@@ -452,13 +450,11 @@ void BinaryTraj_Stop(void)
 static bool current_xy_um(int32_t *x_um, int32_t *y_um)
 {
     StepperState snapshot;
-    ScaraJoint joint;
     ScaraPose pose;
     Stepper_GetStateSnapshot(&snapshot);
-    if (!ScaraKinematics_PulseToJoint(snapshot.axis[0].position_pulse,
-                                      snapshot.axis[1].position_pulse,
-                                      &joint) ||
-        !ScaraKinematics_Forward(&joint, &pose)) {
+    if (!ScaraKinematics_PulseToPose(snapshot.axis[0].position_pulse,
+                                     snapshot.axis[1].position_pulse,
+                                     &pose)) {
         return false;
     }
     *x_um = pose.x_um;
@@ -468,9 +464,7 @@ static bool current_xy_um(int32_t *x_um, int32_t *y_um)
 
 static bool xy_to_pulse(int32_t x_um, int32_t y_um, int64_t *p1, int64_t *p2)
 {
-    ScaraJoint joint;
-    return ScaraKinematics_InverseUm(x_um, y_um, &joint) &&
-           ScaraKinematics_JointToPulse(joint.theta1_mrad, joint.theta2_mrad, p1, p2);
+    return ScaraKinematics_InverseUmToPulse(x_um, y_um, p1, p2);
 }
 
 static void discard_current_point(void)
@@ -569,7 +563,9 @@ static bool service_cartesian_line_10khz(BinaryTrajPoint *point)
         return true;
     }
 
-    int32_t step_um = 500;
+// step_um 从 500 减小到 100 或 200，使曲线逼近更平滑
+    int32_t step_um = 200;
+
     int32_t next_um = s_cart_line.target_um + step_um;
     if (next_um > s_cart_line.total_um) {
         next_um = s_cart_line.total_um;

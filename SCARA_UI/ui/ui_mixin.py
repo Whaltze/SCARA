@@ -148,7 +148,7 @@ class ScaraUiMixin:
         box_w, box_h = 120, 24
         hw_layout.addWidget(QLabel("脉冲/圈(需与驱动拨码一致):"), 0, 0)
         self.microstep_combo = QComboBox()
-        self.microstep_combo.addItems(["400", "1600", "3200", "6400"])
+        self.microstep_combo.addItems(["400", "1600", "3200", "6400", "12800"])
         self.microstep_combo.setEditable(True)
         # 默认 3200PPR：用于降低脉冲量化误差。若驱动器拨码不是 3200，必须同步修改。
         self.microstep_combo.setCurrentText("3200")

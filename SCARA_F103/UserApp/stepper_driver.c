@@ -263,7 +263,7 @@ void Stepper_Init(void)
     cycle_delay_init();
     timed_queue_clear();
     for (uint32_t i = 0; i < 2u; ++i) {
-        // 上电直接使能
+        // 上电直接使能 (保持原有逻辑)
         s_state.axis[i].enabled = APP_STEPPER_ENABLE_ON_BOOT != 0u;
         s_state.axis[i].running = false;
         s_state.axis[i].dir = 1;
@@ -281,25 +281,35 @@ void Stepper_Init(void)
         s_hw[i].pulse_accum = 0;
         s_hw[i].accel_accum = 0;
         s_hw[i].applied_pps = 0;
+
+        // =======================================================
+        // 【核心修复：消除上电 GPIO 电平毛刺 (Glitch-Free Init)】
+        // 必须在 HAL_GPIO_Init 变为输出前，提前设定 ODR 寄存器的目标电平
+        // =======================================================
+
+        // 1. DIR（方向）引脚：提前设定方向电平
+        HAL_GPIO_WritePin(s_hw[i].dir_port, s_hw[i].dir_pin, dir_pin_state(i, s_state.axis[i].dir));
         gpio.Pin = s_hw[i].dir_pin;
         gpio.Mode = GPIO_MODE_OUTPUT_OD;
         gpio.Pull = GPIO_NOPULL;
         gpio.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(s_hw[i].dir_port, &gpio);
-        HAL_GPIO_WritePin(s_hw[i].dir_port, s_hw[i].dir_pin, dir_pin_state(i, s_state.axis[i].dir));
-        s_hw[i].step_port->BSRR = s_hw[i].step_pin;
+
+        // 2. STEP（脉冲）引脚：废除硬编码拉高，使用函数写入动态配置的【空闲无效电平】
+        write_step_pin(i, false);
         gpio.Pin = s_hw[i].step_pin;
         gpio.Mode = GPIO_MODE_OUTPUT_OD;
         gpio.Pull = GPIO_NOPULL;
         gpio.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(s_hw[i].step_port, &gpio);
+
+        // 3. ENA（使能）引脚：提前写入使能状态电平，消除默认0输出导致的电机剧烈跳动
+        HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin, ena_pin_state(s_state.axis[i].enabled));
         gpio.Pin = s_hw[i].ena_pin;
         gpio.Mode = GPIO_MODE_OUTPUT_OD;
         gpio.Pull = GPIO_NOPULL;
         gpio.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(s_hw[i].ena_port, &gpio);
-        HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin,
-                          ena_pin_state(s_state.axis[i].enabled));
     }
     memset(&s_move, 0, sizeof(s_move));
 }
@@ -507,6 +517,11 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
     s_move.remaining_events = events;
     s_move.steps[0] = (uint32_t)d1;
     s_move.steps[1] = (uint32_t)d2;
+    /*
+     * Stepper_CanAcceptMove only admits this path after the previous move is
+     * complete. Reset all phase state so a later direction reversal cannot
+     * inherit Bresenham or acceleration residue from an old segment.
+     */
     s_move.counter[0] = events >> 1;
     s_move.counter[1] = events >> 1;
     s_move.dir[0] = pos1 >= cur1 ? 1 : -1;

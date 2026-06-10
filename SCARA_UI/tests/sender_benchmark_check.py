@@ -24,8 +24,15 @@ class SelectorOwner:
 
 def build_cases(ui):
     start = (75.0, 220.0)
+    start_pulses = ui._binary_pulse_from_xy(start, ui.current_ppr)
     jog_preview = ui.generate_linear_path(*start, 75.0, 230.0, 20.0)
-    jog_send = ui._build_cartesian_host_segments(start, (75.0, 230.0), 20.0, 100.0)
+    jog_send = ui._build_cartesian_host_segments(
+        start,
+        (75.0, 230.0),
+        20.0,
+        100.0,
+        start_pulses=start_pulses,
+    )
 
     line_preview = ui.generate_linear_path(*start, 175.0, 220.0, 20.0)
     line_send = ui.generate_binary_line_targets(start, (175.0, 220.0), 20.0)

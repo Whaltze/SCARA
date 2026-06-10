@@ -20,6 +20,7 @@ class PlannerPoint:
     y: float
     feed_mm_min: float
     silent: bool = False
+    dt: float = 0.02  # <--- 新增：记录该微小线段的实际耗时(秒)
 
 
 @dataclass
@@ -357,6 +358,9 @@ class LookAheadPlanner:
             )
             if dot > 0.999:
                 junction_speed = feed
+            elif dot < -0.95:  # <--- 新增核心修复：如果是大于约160度的急转弯或完全掉头
+                junction_speed = 0.0 # <--- 强行要求速度降到 0，必须完全停稳再反转
+
             else:
                 sin_theta_half = math.sqrt(max(0.0, 0.5 * (1.0 - dot)))
                 junction_speed = math.sqrt(
@@ -395,13 +399,19 @@ class LookAheadPlanner:
             step = min(self.max_segment_mm, max(self.min_segment_mm, current_speed * self.sample_dt))
             next_distance = min(segment.length, distance + step)
             speed = self._speed_at_distance(segment, next_distance)
+            
+            # --- 新增：计算这段距离真实的平均耗时 ---
+            avg_speed = (current_speed + speed) / 2.0
+            actual_dt = (next_distance - distance) / avg_speed if avg_speed > 0.001 else self.sample_dt
+            
             x, y = segment.point_at(next_distance)
-            points.append(PlannerPoint(x=x, y=y, feed_mm_min=max(1.0, speed * 60.0), silent=silent))
+            # --- 修改：将 actual_dt 存入数据类 ---
+            points.append(PlannerPoint(x=x, y=y, feed_mm_min=max(1.0, speed * 60.0), silent=silent, dt=actual_dt))
             distance = next_distance
             if len(points) > 50000:
                 break
         return points
-
+    
     def _speed_at_distance(self, segment: GeometrySegment, distance: float) -> float:
         distance = max(0.0, min(segment.length, distance))
         accel_speed = math.sqrt(max(0.0, segment.entry_speed**2 + 2.0 * self.accel_mm_s2 * distance))
