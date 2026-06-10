@@ -28,8 +28,8 @@ TYPE_ACK = 0x80
 TYPE_NACK = 0x81
 TYPE_STATUS_RSP = 0x82
 
-MRAD_PER_REV = 6283
-DEFAULT_ZERO_MRAD = (2251, 890)
+RAD_PER_REV = 2.0 * math.pi
+DEFAULT_ZERO_RAD = (2.251, 0.890)
 FLAG_EXACT_STOP = 0x0001
 FLAG_CARTESIAN_LINE = 0x0002
 FLAG_HOST_TIMED = 0x0004
@@ -103,20 +103,19 @@ def build_chunk_payload(points: Sequence[BinaryJointPoint]) -> bytes:
     return bytes(out)
 
 
-def joint_deg_to_pulse(theta1_deg: float, theta2_deg: float, ppr: int, zero_mrad=DEFAULT_ZERO_MRAD) -> Tuple[int, int]:
+def joint_deg_to_pulse(theta1_deg: float, theta2_deg: float, ppr: int, zero_rad=DEFAULT_ZERO_RAD) -> Tuple[int, int]:
     """关节角度转绝对脉冲。
 
     参数调节：
     - ppr：驱动器细分后的每圈脉冲数。PPR 越高，末端量化误差越小，但同样速度下 PPS 越高。
       当前 UI 默认 3200，是为了让小车/直线轨迹离线误差稳定压到 0.5mm 内。
-    - zero_mrad：电机软件零点，必须和固件里的零点保持一致，否则轨迹会整体偏移。
+    - zero_rad：电机软件零点弧度值，必须和固件里的零点保持一致，否则轨迹会整体偏移。
 
-    这里使用四舍五入而不是截断，避免所有关键点系统性偏向同一侧。
+    全程保留浮点精度，只在生成最终绝对脉冲时舍入一次。
     """
-    theta1_mrad = int(round(math.radians(theta1_deg) * 1000.0))
-    theta2_mrad = int(round(math.radians(theta2_deg) * 1000.0))
-    p1 = int(round(((theta1_mrad - int(zero_mrad[0])) * int(ppr)) / MRAD_PER_REV))
-    p2 = int(round(((theta2_mrad - int(zero_mrad[1])) * int(ppr)) / MRAD_PER_REV))
+    scale = float(int(ppr)) / RAD_PER_REV
+    p1 = int(round((math.radians(float(theta1_deg)) - float(zero_rad[0])) * scale))
+    p2 = int(round((math.radians(float(theta2_deg)) - float(zero_rad[1])) * scale))
     return p1, p2
 
 

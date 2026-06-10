@@ -19,6 +19,10 @@ static char s_line_queue[APP_SERIAL_LINE_QUEUE_DEPTH][APP_SERIAL_LINE_SIZE];
 static volatile uint8_t s_line_head;
 static volatile uint8_t s_line_tail;
 static volatile uint8_t s_line_count;
+static char s_realtime_queue[APP_SERIAL_REALTIME_QUEUE_DEPTH];
+static volatile uint8_t s_realtime_head;
+static volatile uint8_t s_realtime_tail;
+static volatile uint8_t s_realtime_count;
 static volatile uint32_t s_rx_overflow_count;
 static char s_tx_queue[APP_SERIAL_TX_QUEUE_DEPTH][APP_SERIAL_TX_SIZE];
 static uint16_t s_tx_len[APP_SERIAL_TX_QUEUE_DEPTH];
@@ -69,6 +73,24 @@ static bool enqueue_rx_line(const char *line, uint16_t len)
     return queued;
 }
 
+static bool enqueue_realtime(char ch)
+{
+    bool queued = false;
+    uint32_t primask = irq_save();
+
+    if (s_realtime_count < APP_SERIAL_REALTIME_QUEUE_DEPTH) {
+        s_realtime_queue[s_realtime_head] = ch;
+        s_realtime_head = queue_next(s_realtime_head, APP_SERIAL_REALTIME_QUEUE_DEPTH);
+        s_realtime_count++;
+        queued = true;
+    } else {
+        s_rx_overflow_count++;
+    }
+
+    irq_restore(primask);
+    return queued;
+}
+
 static bool tx_start_next_locked(void)
 {
     if (s_tx_busy || s_tx_count == 0u) {
@@ -95,6 +117,9 @@ void SerialDma_Init(void)
     s_line_head = 0;
     s_line_tail = 0;
     s_line_count = 0;
+    s_realtime_head = 0;
+    s_realtime_tail = 0;
+    s_realtime_count = 0;
     s_rx_overflow_count = 0;
     s_tx_head = 0;
     s_tx_tail = 0;
@@ -112,10 +137,7 @@ static void feed_char(char ch)
 
     /* 实时字符 ?/!/~/Ctrl-X 单独成行；普通命令以换行结束。 */
     if (ch == '?' || ch == '!' || ch == '~' || (uint8_t)ch == 0x18u) {
-        char rt[2];
-        rt[0] = ch;
-        rt[1] = '\0';
-        (void)enqueue_rx_line(rt, 1u);
+        (void)enqueue_realtime(ch);
         return;
     }
 
@@ -152,6 +174,25 @@ void SerialDma_Poll(void)
             s_rx_old_pos = 0;
         }
     }
+}
+
+bool SerialDma_ReadRealtime(char *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    uint32_t primask = irq_save();
+    if (s_realtime_count == 0u) {
+        irq_restore(primask);
+        return false;
+    }
+
+    *out = s_realtime_queue[s_realtime_tail];
+    s_realtime_tail = queue_next(s_realtime_tail, APP_SERIAL_REALTIME_QUEUE_DEPTH);
+    s_realtime_count--;
+    irq_restore(primask);
+    return true;
 }
 
 bool SerialDma_ReadLine(char *out, size_t out_size)

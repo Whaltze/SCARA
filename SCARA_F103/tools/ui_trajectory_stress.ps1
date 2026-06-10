@@ -32,7 +32,7 @@ function Resolve-SerialPortName {
     if ($Requested -and $Requested.ToUpperInvariant() -ne "AUTO") {
         return $Requested
     }
-    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
     if ($ports.Count -eq 1) {
         Write-Host ("AUTO port selected: {0}" -f $ports[0])
         return $ports[0]

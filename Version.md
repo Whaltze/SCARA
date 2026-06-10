@@ -1,5 +1,30 @@
 # SCARA_F103 Version Log
 
+## 2026-06-10 v0.26.3 GRBL-style execution split and realtime command bypass
+
+- Removed integer-milliradian double rounding from host joint-to-pulse conversion. Motion targets now retain floating-point radians and use exact `2*pi` until the final absolute-pulse rounding.
+- Unified host-timed motion generation, binary geometry checks and pulse-to-XY checks on the same high-precision conversion.
+- Confirmed the GRBL-style ownership boundary: host performs look-ahead and time resampling; the MCU 10 kHz ISR only dispatches prefetched timed DDA segments.
+- Binary `RUN` now requires `min(total_points, APP_BINARY_TRAJ_MIN_PREFILL)` queued points before execution starts.
+- Split cumulative underrun diagnostics from the active consecutive-underrun timeout so an old recovered underrun cannot trigger a later false timeout.
+- Replaced compiler-dependent volatile NOP pulse delays with Cortex-M3 DWT cycle-counted microsecond delays. The configured dual-axis worst-case blocking delay is now 24 us inside the 100 us control tick, guarded by a compile-time half-period budget.
+- Added `IC`/`ic` status telemetry for the maximum observed 10 kHz control ISR cycles; the no-motion capability check rejects firmware reaching the 7200-cycle budget at 72 MHz.
+- Changed DDA output to collect per-event axis step bits before emitting one grouped pulse, following GRBL's simultaneous step-port approach. Dual-axis pulse skew is reduced from one full 6 us pulse cycle to only the back-to-back GPIO write latency, and the configured worst blocking delay drops to 18 us.
+- Updated binary trajectory stress tooling to accept the current `hz=10000` capability field and build feedback expectations from the controller-reported `ppr1/ppr2` values instead of a stale hard-coded 1600 PPR.
+- Moved binary trajectory point preparation and stepper dispatch out of `BinaryTraj_Tick10kHz()` into `BinaryTraj_Loop()`, matching GRBL's prepare-in-main-loop/execute-in-ISR split. The 10 kHz binary tick now only maintains lightweight underrun timing diagnostics.
+- Tightened active binary stress validation: feedback polling no longer starves refill, the refill loop runs at 5 ms, and the test now fails on any stream underrun, empty low-water mark, dispatch gap over one tick, or active-motion ISR peak at/above 7200 cycles.
+- Corrected binary `min_buffer` semantics so the expected final drain after all points have been accepted does not masquerade as a streaming low-water event.
+- Added `-HostTimed` active stress mode so the normal UI timed-segment FIFO and ISR handoff path is covered by the same underrun, endpoint, and ISR-cycle gates.
+- Fixed the stress harness to wait for controller `Done` rather than merely an empty binary input queue before disabling axes; it now hard-fails if final software pulse position differs from the final uploaded target.
+- Flash verification now defaults to automatic ST-Link/CMSIS-DAP probing, and binary stress supports `-Port AUTO`, matching the documented validation flow.
+- Fixed shared PowerShell AUTO-port selection so a single `COMx` result remains an array element instead of being indexed as the first character `C`.
+- Hardware-verified on COM12 with motor power disconnected: idle `IC=682`; 3000-point velocity stress reached `IC=2308`; final v0.26.3 1000-point HOST_TIMED stress reached `IC=3907`, with `underrun=0`, `max_gap=1`, `min_buffer=92`, and exact endpoint `(0,800)`.
+- Added a GRBL-style atomic binary-trajectory diagnostic snapshot, marked ISR-shared run/state flags `volatile`, and removed the unused raw pointer getter that exposed mutable stepper state.
+- Added a separate realtime-character queue so `?`, `!`, `~` and Ctrl-X bypass normal command backlog; the main loop now handles realtime input first and limits ordinary parsing to one line per pass so motion preparation remains responsive.
+- Extended the no-motion burst check to require a realtime `?` status response before acknowledgements for ordinary commands received in the same UART burst.
+- Added regressions for one-pulse conversion resolution, exact revolution scaling, timed-path duration fidelity, HOST flags, final pulse target and adjacent slice speed jumps.
+- Verified Debug firmware build, project structure checks, 3000-segment interpolation simulation and UI planner/sender tests.
+
 ## 2026-06-09 v0.26.0 Buffered streaming and deterministic timed handoff
 
 - Restored buffered binary trajectories as the normal UI transport.

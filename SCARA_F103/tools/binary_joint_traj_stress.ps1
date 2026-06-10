@@ -11,7 +11,9 @@ param(
     [string]$CsvPath = "",
     [switch]$ZeroBeforeRun,
     [switch]$EnableMotion,
-    [switch]$KeepEnabled
+    [switch]$KeepEnabled,
+    [switch]$HostTimed,
+    [int]$TimedTicks = 100
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,7 +31,8 @@ $TYPE_STATUS = 0x15
 $TYPE_ACK = 0x80
 $TYPE_NACK = 0x81
 $TYPE_STATUS_RSP = 0x82
-$PPR = 1600.0
+$PPR1 = 3200.0
+$PPR2 = 3200.0
 $ZERO1_MRAD = 2251.0
 $ZERO2_MRAD = 890.0
 $BASE_MM = 150.0
@@ -37,6 +40,18 @@ $ACTIVE_MM = 160.0
 $PASSIVE_MM = 200.0
 $expected = New-Object System.Collections.Generic.List[object]
 $samples = New-Object System.Collections.Generic.List[object]
+
+function Resolve-Port {
+    param([string]$Requested)
+    if ($Requested -and $Requested.ToUpperInvariant() -ne "AUTO") {
+        return $Requested
+    }
+    $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
+    if ($ports.Count -ne 1) {
+        throw "AUTO requires exactly one serial port; found: $($ports -join ', ')"
+    }
+    return $ports[0]
+}
 
 function Update-Crc16 {
     param([int]$Crc, [int]$Byte)
@@ -91,8 +106,8 @@ function Get-TestPulsePoint {
 
 function Convert-PulseToXY {
     param([int]$P1, [int]$P2)
-    $theta1Mrad = [int]([Math]::Truncate(($P1 * 6283.0) / $PPR)) + [int]$ZERO1_MRAD
-    $theta2Mrad = [int]([Math]::Truncate(($P2 * 6283.0) / $PPR)) + [int]$ZERO2_MRAD
+    $theta1Mrad = [int]([Math]::Truncate(($P1 * 6283.0) / $PPR1)) + [int]$ZERO1_MRAD
+    $theta2Mrad = [int]([Math]::Truncate(($P2 * 6283.0) / $PPR2)) + [int]$ZERO2_MRAD
     $t1 = $theta1Mrad / 1000.0
     $t2 = $theta2Mrad / 1000.0
     $halfBase = $BASE_MM * 0.5
@@ -140,6 +155,19 @@ function Add-ExpectedPulseSegment {
         $p1 = [int][Math]::Round($FromP1 + ($d1 * [double]$i / [double]$steps))
         $p2 = [int][Math]::Round($FromP2 + ($d2 * [double]$i / [double]$steps))
         Add-ExpectedPulsePoint -P1 $p1 -P2 $p2
+    }
+}
+
+function Build-ExpectedTrajectory {
+    $script:expected.Clear()
+    $prevP1 = $StartP1
+    $prevP2 = $StartP2
+    Add-ExpectedPulsePoint -P1 $prevP1 -P2 $prevP2
+    for ($i = 0; $i -lt $Count; $i++) {
+        $point = Get-TestPulsePoint -Index $i -Total $Count
+        Add-ExpectedPulseSegment -FromP1 $prevP1 -FromP2 $prevP2 -ToP1 $point.P1 -ToP2 $point.P2
+        $prevP1 = $point.P1
+        $prevP2 = $point.P2
     }
 }
 
@@ -203,18 +231,24 @@ function Parse-AsciiStatus {
 
 function Poll-AsciiStatus {
     param([System.IO.Ports.SerialPort]$Serial)
+    $oldReadTimeout = $Serial.ReadTimeout
+    $Serial.ReadTimeout = 20
     $Serial.Write("?")
-    $deadline = (Get-Date).AddMilliseconds(250)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $line = $Serial.ReadLine().Trim()
-        } catch [TimeoutException] {
-            return
+    try {
+        $deadline = (Get-Date).AddMilliseconds(20)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $line = $Serial.ReadLine().Trim()
+            } catch [TimeoutException] {
+                return
+            }
+            if ($line.StartsWith("<")) {
+                Parse-AsciiStatus -Line $line
+                return
+            }
         }
-        if ($line.StartsWith("<")) {
-            Parse-AsciiStatus -Line $line
-            return
-        }
+    } finally {
+        $Serial.ReadTimeout = $oldReadTimeout
     }
 }
 
@@ -352,10 +386,25 @@ function New-PointPayload {
         $point = Get-TestPulsePoint -Index $index -Total $Total
         $p1 = $point.P1
         $p2 = $point.P2
+        $value = $Pps
+        $flags = 0
+        if ($HostTimed) {
+            if ($index -eq 0) {
+                $prevP1 = $StartP1
+                $prevP2 = $StartP2
+            } else {
+                $previous = Get-TestPulsePoint -Index ($index - 1) -Total $Total
+                $prevP1 = $previous.P1
+                $prevP2 = $previous.P2
+            }
+            $events = [Math]::Max([Math]::Abs($p1 - $prevP1), [Math]::Abs($p2 - $prevP2))
+            $value = [Math]::Max($TimedTicks, $events)
+            $flags = 0x0004
+        }
         Write-I32 -Bytes $bytes -Value $p1
         Write-I32 -Bytes $bytes -Value $p2
-        Write-U16 -Bytes $bytes -Value $Pps
-        Write-U16 -Bytes $bytes -Value 0
+        Write-U16 -Bytes $bytes -Value $value
+        Write-U16 -Bytes $bytes -Value $flags
     }
     return $bytes.ToArray()
 }
@@ -376,6 +425,7 @@ function Send-Ascii {
     throw "Timeout waiting ASCII response for $Line"
 }
 
+$Port = Resolve-Port -Requested $Port
 $serial = [System.IO.Ports.SerialPort]::new($Port, $Baud, [System.IO.Ports.Parity]::None, 8, [System.IO.Ports.StopBits]::One)
 $serial.NewLine = "`n"
 $serial.ReadTimeout = $TimeoutMs
@@ -383,28 +433,25 @@ $serial.WriteTimeout = $TimeoutMs
 $seq = 1
 $sent = 0
 
-$prevP1 = $StartP1
-$prevP2 = $StartP2
-Add-ExpectedPulsePoint -P1 $prevP1 -P2 $prevP2
-for ($i = 0; $i -lt $Count; $i++) {
-    $point = Get-TestPulsePoint -Index $i -Total $Count
-    Add-ExpectedPulseSegment -FromP1 $prevP1 -FromP2 $prevP2 -ToP1 $point.P1 -ToP2 $point.P2
-    $prevP1 = $point.P1
-    $prevP2 = $point.P2
-}
-
 try {
     Write-Host "Opening $Port at $Baud 8N1 ..."
-    Write-Host ("Binary joint trajectory stress: points={0} chunk={1} feed_pps={2} max_error={3:F3}mm csv={4}" -f $Count, $ChunkPoints, $FeedPps, $MaxErrorMm, $(if ($CsvPath) { $CsvPath } else { "-" }))
+    Write-Host ("Binary joint trajectory stress: points={0} chunk={1} mode={2} value={3} max_error={4:F3}mm csv={5}" -f $Count, $ChunkPoints, $(if ($HostTimed) { "host_timed" } else { "velocity" }), $(if ($HostTimed) { $TimedTicks } else { $FeedPps }), $MaxErrorMm, $(if ($CsvPath) { $CsvPath } else { "-" }))
     $serial.Open()
     Start-Sleep -Milliseconds 300
     $serial.DiscardInBuffer()
 
     Send-Ascii -Serial $serial -Line "VERSION" -Prefixes @("OK VERSION") | Out-Null
     $hostcap = Send-Ascii -Serial $serial -Line "HOSTCAP" -Prefixes @("OK HOSTCAP")
-    if ($hostcap -notmatch "binary_traj=1" -or $hostcap -notmatch "control_hz=10000") {
-        throw "Controller does not report binary_traj=1 and control_hz=10000"
+    if ($hostcap -notmatch "binary_traj=1" -or $hostcap -notmatch "(?:control_hz|hz)=10000") {
+        throw "Controller does not report binary_traj=1 and a 10 kHz control tick"
     }
+    if ($hostcap -notmatch "ppr1=(\d+) ppr2=(\d+)") {
+        throw "Controller does not report both axis PPR values"
+    }
+    $PPR1 = [double]$Matches[1]
+    $PPR2 = [double]$Matches[2]
+    Build-ExpectedTrajectory
+    Write-Host ("Using controller PPR: ppr1={0} ppr2={1}" -f $PPR1, $PPR2)
     Send-Ascii -Serial $serial -Line "CLEAR_ERROR" -Prefixes @("OK CLEAR_ERROR") | Out-Null
     if ($ZeroBeforeRun) {
         Send-Ascii -Serial $serial -Line "ZERO" -Prefixes @("OK ZERO") | Out-Null
@@ -439,7 +486,9 @@ try {
     $maxDispatchGap = 0
     $minBuffer = 0
     $lastProgressExecuted = -1
+    $loopCount = 0
     while ($true) {
+        $loopCount++
         $status = Send-Frame -Serial $serial -Type $TYPE_STATUS -Seq $seq
         $seq++
         $payload = $status.Payload
@@ -465,20 +514,33 @@ try {
             $free -= $take
         }
 
-        Poll-AsciiStatus -Serial $serial
+        if (($loopCount % 20) -eq 0) {
+            Poll-AsciiStatus -Serial $serial
+        }
         $summary = Get-ErrorSummary
         $elapsed = ((Get-Date) - $started).TotalSeconds
         if ($executed -ge ($lastProgressExecuted + 100) -or $executed -ge $Count) {
             $lastProgressExecuted = $executed
             Write-Host ("PROGRESS sent={0}/{1} accepted={2} executed={3} queued={4} underrun={5} max_gap={6} min_buf={7} samples={8} max={9:F4}mm rms={10:F4}mm elapsed={11:F1}s" -f $sent, $Count, $accepted, $executed, $queued, $underrunTicks, $maxDispatchGap, $minBuffer, $summary.Count, $summary.MaxE, $summary.RmsE, $elapsed)
         }
-        if ($executed -ge $Count -and ($state -eq 4 -or $queued -eq 0)) { break }
-        Start-Sleep -Milliseconds 50
+        if ($executed -ge $Count -and $state -eq 4) { break }
+        Start-Sleep -Milliseconds 5
     }
 
     if (-not $KeepEnabled) {
         Send-Ascii -Serial $serial -Line "ENABLE 0" -Prefixes @("OK ENABLE 0") | Out-Null
     }
+    $finalStatus = Send-Ascii -Serial $serial -Line "STATUS" -Prefixes @("STAT ")
+    if ($finalStatus -notmatch "ic=(\d+)") {
+        throw "Final status is missing ISR cycle telemetry"
+    }
+    $maxTickCycles = [int]$Matches[1]
+    if ($finalStatus -notmatch "p=(-?\d+),(-?\d+)") {
+        throw "Final status is missing pulse position"
+    }
+    $finalP1 = [int]$Matches[1]
+    $finalP2 = [int]$Matches[2]
+    $expectedFinal = Get-TestPulsePoint -Index ($Count - 1) -Total $Count
     $finalSummary = Get-ErrorSummary
     Write-Host ("BINARY_FEEDBACK_ERROR samples={0} max_x={1:F4} max_y={2:F4} rms_x={3:F4} rms_y={4:F4} max_norm={5:F4} rms_norm={6:F4}" -f $finalSummary.Count, $finalSummary.MaxX, $finalSummary.MaxY, $finalSummary.RmsX, $finalSummary.RmsY, $finalSummary.MaxE, $finalSummary.RmsE)
     Write-Host ("BINARY_JOINT_DIAG underrun_ticks={0} max_dispatch_gap_ticks={1} min_buffer={2}" -f $underrunTicks, $maxDispatchGap, $minBuffer)
@@ -489,6 +551,20 @@ try {
     if ($finalSummary.MaxE -gt $MaxErrorMm) {
         throw ("Binary feedback error exceeded limit: max={0:F4}mm limit={1:F4}mm" -f $finalSummary.MaxE, $MaxErrorMm)
     }
+    if ($underrunTicks -ne 0 -or $minBuffer -lt 1) {
+        throw "Binary stream underrun detected: ticks=$underrunTicks min_buffer=$minBuffer"
+    }
+    if ($maxDispatchGap -gt 1) {
+        throw "Binary dispatch gap exceeded one control tick: max_gap=$maxDispatchGap"
+    }
+    if ($maxTickCycles -ge 7200) {
+        throw "Control ISR exceeded 10 kHz budget during motion: max_cycles=$maxTickCycles budget=7200"
+    }
+    if ($finalP1 -ne $expectedFinal.P1 -or $finalP2 -ne $expectedFinal.P2) {
+        throw "Final pulse mismatch: actual=$finalP1,$finalP2 expected=$($expectedFinal.P1),$($expectedFinal.P2)"
+    }
+    Write-Host "BINARY_ENDPOINT actual=$finalP1,$finalP2 expected=$($expectedFinal.P1),$($expectedFinal.P2)"
+    Write-Host "BINARY_ISR_BUDGET max_cycles=$maxTickCycles budget=7200"
     Write-Host "BINARY_TRAJ_STRESS PASS total=$Count"
     exit 0
 } catch {

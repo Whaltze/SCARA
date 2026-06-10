@@ -12,7 +12,7 @@ function Resolve-Port {
     if ($Requested -and $Requested.ToUpperInvariant() -ne "AUTO") {
         return $Requested
     }
-    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
     if ($ports.Count -ne 1) {
         throw "AUTO requires exactly one serial port; found: $($ports -join ', ')"
     }
@@ -98,11 +98,19 @@ try {
     if ($status -notmatch "\|Hz:10000\|") {
         throw "Controller is not reporting the required 10 kHz control tick"
     }
+    if ($status -notmatch "\|IC:(\d+)\|") {
+        throw "Status is missing maximum control ISR cycle telemetry IC"
+    }
+    $maxTickCycles = [int]$Matches[1]
+    if ($maxTickCycles -ge 7200) {
+        throw "Control ISR exceeded the 10 kHz cycle budget: max_cycles=$maxTickCycles budget=7200"
+    }
 
     Write-Host "PASS version: $version"
     Write-Host "PASS host capabilities: binary trajectory, binary timed segments and G1 A/B/T"
     Write-Host "PASS three-layer status: Bf/Q/Sq/JU"
     Write-Host "PASS RX byte capacity: $rxFreeBytes"
+    Write-Host "PASS control ISR cycle budget: $maxTickCycles < 7200"
     Write-Host "BUFFERED STREAM CAPABILITY CHECK PASS"
     exit 0
 } catch {

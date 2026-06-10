@@ -1,0 +1,55 @@
+SCARA_F103 v0.26.3 recommended validation flow
+
+Safety:
+1. Keep the mechanism clear.
+2. Disconnect motor-driver power before flashing. The firmware enables ENA on boot.
+3. Do not treat MCU P:/M: status as physical position feedback. It is derived from
+   commanded software pulse counts and cannot detect lost steps.
+
+Stage 1 - offline checks:
+  cmake --build --preset Debug
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_project.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\simulate_binary_interpolator.ps1 -Count 3000
+
+Stage 2 - flash with motor-driver power disconnected:
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\flash_and_verify_buffered.ps1 -Port AUTO -ConfirmMotorPowerOff
+
+Confirm that VERSION reports 0.26.3 before motion testing.
+
+Stage 3 - no-motion communication checks:
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\serial_link_check.ps1 -Port AUTO -Repeat 2
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\buffered_stream_capability_check.ps1 -Port AUTO
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\gcode_burst_no_motion_check.ps1 -Port AUTO -BurstLines 6
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools\binary_joint_traj_stress.ps1 -Port AUTO -Count 1000 -HostTimed -TimedTicks 100 -ZeroBeforeRun -EnableMotion
+
+Expected idle status:
+  E:0
+  Q:0
+  Sq:0,4
+  Hz:10000
+  IC:<7200
+
+Recorded v0.26.3 disconnected-motor baseline on COM12:
+  idle IC=682
+  1000-point HOST_TIMED IC=3907, underrun=0, max_gap=1, min_buffer=92
+  final software pulse endpoint=(0,800)
+
+Stage 4 - low-speed motion:
+1. Restore motor-driver power and verify the mechanism is near its known home pose.
+2. Run homing and confirm both switches behave correctly.
+3. Start with a short line or jog at low speed.
+4. Confirm binary diagnostics remain:
+   underrun_ticks=0
+   max_dispatch_gap_ticks<=1
+   min_buffer>=4
+   IC<7200
+
+Stage 5 - repeat-position measurement:
+1. Attach a dial indicator, camera fiducial, or external encoder at the test pose.
+2. Run at least 30 A-B-A round trips at low speed, then repeat at normal speed.
+3. Record the physical A-position error after every return.
+4. Compare max, mean, and RMS physical error before and after v0.26.3.
+
+Only physical measurement can prove repeat-position improvement. MCU software
+position returning to the same pulse count proves command consistency, not that
+the mechanism followed every pulse.

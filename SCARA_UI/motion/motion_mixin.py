@@ -34,6 +34,9 @@ class ScaraMotionMixin:
     BINARY_LINE_TOLERANCE_MM = 0.45
     BINARY_LINE_MAX_SEGMENT_MM = 10.0
     BINARY_PATH_SIMPLIFY_TOLERANCE_MM = 0.08
+    BINARY_RAD_PER_REV = 2.0 * math.pi
+    BINARY_ZERO_RAD = (2.251, 0.890)
+    # Retained for firmware/status compatibility; motion targets use radians above.
     BINARY_MRAD_PER_REV = 6283
     BINARY_ZERO_MRAD = (2251, 890)
     DEFAULT_CORNER_RADIUS_MM = 0.0
@@ -477,15 +480,14 @@ class ScaraMotionMixin:
         q1, q2 = self.inverse_kinematics(float(point[0]), float(point[1]))
         if q1 is None or q2 is None:
             return None
-        theta1_mrad = int(round(math.radians(q1) * 1000.0))
-        theta2_mrad = int(round(math.radians(q2) * 1000.0))
-        p1 = int(round(((theta1_mrad - self.BINARY_ZERO_MRAD[0]) * int(ppr)) / self.BINARY_MRAD_PER_REV))
-        p2 = int(round(((theta2_mrad - self.BINARY_ZERO_MRAD[1]) * int(ppr)) / self.BINARY_MRAD_PER_REV))
-        return p1, p2
+        scale = float(int(ppr)) / self.BINARY_RAD_PER_REV
+        p1 = (math.radians(float(q1)) - self.BINARY_ZERO_RAD[0]) * scale
+        p2 = (math.radians(float(q2)) - self.BINARY_ZERO_RAD[1]) * scale
+        return int(round(p1)), int(round(p2))
 
     def _binary_xy_from_pulse(self, p1, p2, ppr):
-        q1 = math.degrees(((float(p1) * self.BINARY_MRAD_PER_REV / float(ppr)) + self.BINARY_ZERO_MRAD[0]) / 1000.0)
-        q2 = math.degrees(((float(p2) * self.BINARY_MRAD_PER_REV / float(ppr)) + self.BINARY_ZERO_MRAD[1]) / 1000.0)
+        q1 = math.degrees(float(p1) * self.BINARY_RAD_PER_REV / float(ppr) + self.BINARY_ZERO_RAD[0])
+        q2 = math.degrees(float(p2) * self.BINARY_RAD_PER_REV / float(ppr) + self.BINARY_ZERO_RAD[1])
         return self.kinematics.forward(q1, q2)
 
     def _point_to_line_error(self, point, start, end):
@@ -1295,10 +1297,9 @@ class ScaraMotionMixin:
 
     def _joint_deg_to_pulse_float(self, q1, q2):
         ppr = float(int(getattr(self, "current_ppr", 3200) or 3200))
-        theta1_mrad = math.radians(float(q1)) * 1000.0
-        theta2_mrad = math.radians(float(q2)) * 1000.0
-        p1 = ((theta1_mrad - float(self.BINARY_ZERO_MRAD[0])) * ppr) / float(self.BINARY_MRAD_PER_REV)
-        p2 = ((theta2_mrad - float(self.BINARY_ZERO_MRAD[1])) * ppr) / float(self.BINARY_MRAD_PER_REV)
+        scale = ppr / self.BINARY_RAD_PER_REV
+        p1 = (math.radians(float(q1)) - self.BINARY_ZERO_RAD[0]) * scale
+        p2 = (math.radians(float(q2)) - self.BINARY_ZERO_RAD[1]) * scale
         return p1, p2
 
     def _current_feedback_pulses(self):

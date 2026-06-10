@@ -36,7 +36,10 @@ class FiveBarSerialGUI(
         self.HOME_X, self.HOME_Y = 75.0, 220.0
 
         self.accel = 10.0
-        self.junction_dev = 0.02
+
+        # self.junction_dev = 0.02
+        self.junction_dev = 0.1
+        
         self.dt = 0.02
 
         self.kinematics = FiveBarKinematics(

@@ -3,6 +3,7 @@
 /* 调试/安全文本协议：处理 VERSION、STATUS、HOSTCAP、ENABLE、STOP 等非 G-code 命令。 */
 
 #include "app_config.h"
+#include "app_main.h"
 #include "app_params.h"
 #include "binary_traj.h"
 #include "gcode_stream.h"
@@ -50,13 +51,15 @@ void Protocol_SendStatus(void)
     /* STATUS 是人工调试用长状态；自动 UI 状态主要由 gcode_stream.c 的 <...> 推送提供。 */
     StepperState s;
     HomeSensorState home;
+    BinaryTrajSnapshot traj;
     Stepper_GetStateSnapshot(&s);
     HomeSensor_GetState(&home);
+    BinaryTraj_GetSnapshot(&traj);
 
     SerialDma_SendFormat("STAT t=%lu m=%s e=%lu p=%ld,%ld "
                          "r=%u,%u en=%u,%u pps=%ld,%ld tgt=%ld,%ld wd=%u idle=%lu "
                          "rxov=%lu txd=%lu txq=%lu h=%u,%u hs=%s he=%u "
-                         "bf=%u,%u q=%u sq=%u,%u jt=%s,%lu,%lu,%u,%u hz=%lu\r\n",
+                         "bf=%u,%u q=%u sq=%u,%u jt=%s,%lu,%lu,%u,%u hz=%lu ic=%lu\r\n",
                          (unsigned long)s.tick_ms,
                          Stepper_ModeName(s.axis[0].mode != STEPPER_MODE_IDLE ? s.axis[0].mode : s.axis[1].mode),
                          (unsigned long)(s.axis[0].error | s.axis[1].error),
@@ -84,12 +87,13 @@ void Protocol_SendStatus(void)
                          (unsigned int)GcodeStream_PlannerCount(),
                          (unsigned int)Stepper_TimedSegmentCount(),
                          (unsigned int)Stepper_TimedSegmentFree(),
-                         BinaryTraj_StateName(BinaryTraj_GetState()),
-                         (unsigned long)BinaryTraj_AcceptedCount(),
-                         (unsigned long)BinaryTraj_ExecutedCount(),
-                         (unsigned int)BinaryTraj_BufferCount(),
-                         (unsigned int)BinaryTraj_BufferFree(),
-                         (unsigned long)APP_CONTROL_HZ);
+                         BinaryTraj_StateName(traj.state),
+                         (unsigned long)traj.accepted_count,
+                         (unsigned long)traj.executed_count,
+                         (unsigned int)traj.buffer_count,
+                         (unsigned int)traj.buffer_free,
+                         (unsigned long)APP_CONTROL_HZ,
+                         (unsigned long)App_MaxTickCycles());
 }
 
 static void send_errors(void)

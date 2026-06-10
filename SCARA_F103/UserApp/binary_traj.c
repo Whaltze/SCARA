@@ -60,10 +60,11 @@ static uint16_t s_count;
 static uint32_t s_total_expected;
 static uint32_t s_accepted_count;
 static uint32_t s_executed_count;
-static BinaryTrajState s_state;
-static bool s_run_requested;
+static volatile BinaryTrajState s_state;
+static volatile bool s_run_requested;
 static uint32_t s_max_dispatch_gap_ticks;
 static uint32_t s_stream_underrun_ticks;
+static uint32_t s_stream_underrun_active_ticks;
 static uint32_t s_stream_underrun_count;
 static bool s_stream_underrun_active;
 static uint16_t s_min_buffer_count;
@@ -234,6 +235,7 @@ static void reset_runtime_stats(void)
 {
     s_max_dispatch_gap_ticks = 0;
     s_stream_underrun_ticks = 0;
+    s_stream_underrun_active_ticks = 0;
     s_stream_underrun_count = 0;
     s_stream_underrun_active = false;
     s_min_buffer_count = APP_BINARY_TRAJ_POINTS;
@@ -278,20 +280,22 @@ static void send_frame(uint8_t type, uint16_t seq, const uint8_t *payload, uint1
 
 static void send_status_frame(uint16_t seq, uint8_t type)
 {
+    BinaryTrajSnapshot snapshot;
     uint8_t payload[32];
+    BinaryTraj_GetSnapshot(&snapshot);
     payload[0] = type;
     payload[1] = BT_ERR_OK;
-    wr_u16(&payload[2], s_count);
-    wr_u16(&payload[4], buffer_free());
-    wr_u32(&payload[6], s_accepted_count);
-    wr_u32(&payload[10], s_executed_count);
-    wr_u32(&payload[14], s_total_expected);
-    payload[18] = (uint8_t)s_state;
+    wr_u16(&payload[2], snapshot.buffer_count);
+    wr_u16(&payload[4], snapshot.buffer_free);
+    wr_u32(&payload[6], snapshot.accepted_count);
+    wr_u32(&payload[10], snapshot.executed_count);
+    wr_u32(&payload[14], snapshot.total_expected);
+    payload[18] = (uint8_t)snapshot.state;
     payload[19] = APP_CONTROL_HZ == 10000u ? 10u : 0u;
-    wr_u32(&payload[20], s_stream_underrun_ticks);
-    wr_u32(&payload[24], s_max_dispatch_gap_ticks);
-    wr_u16(&payload[28], s_min_buffer_count == APP_BINARY_TRAJ_POINTS ? s_count : s_min_buffer_count);
-    wr_u16(&payload[30], s_stream_underrun_count > 65535u ? 65535u : (uint16_t)s_stream_underrun_count);
+    wr_u32(&payload[20], snapshot.stream_underrun_ticks);
+    wr_u32(&payload[24], snapshot.max_dispatch_gap_ticks);
+    wr_u16(&payload[28], snapshot.min_buffer_count);
+    wr_u16(&payload[30], snapshot.stream_underrun_count > 65535u ? 65535u : (uint16_t)snapshot.stream_underrun_count);
     send_frame(BT_TYPE_STATUS_RSP, seq, payload, sizeof(payload));
 }
 
@@ -404,7 +408,10 @@ static void process_frame(void)
             send_ack(s_frame_seq, s_frame_type, BT_ERR_OK);
         }
     } else if (s_frame_type == BT_TYPE_RUN) {
-        if (s_count == 0u) {
+        uint32_t required_prefill = s_total_expected < APP_BINARY_TRAJ_MIN_PREFILL
+                                        ? s_total_expected
+                                        : APP_BINARY_TRAJ_MIN_PREFILL;
+        if (s_count == 0u || s_count < required_prefill) {
             send_ack(s_frame_seq, s_frame_type, BT_ERR_BAD_STATE);
         } else {
             s_run_requested = true;
@@ -581,10 +588,11 @@ static bool service_cartesian_line_10khz(BinaryTrajPoint *point)
     return true;
 }
 
-static void service_motion_10khz(void)
+static void update_stream_underrun_10khz(void)
 {
     if (s_run_requested && s_state == BINARY_TRAJ_STATE_RUNNING) {
-        if (s_count < s_min_buffer_count) {
+        /* Final drain after all points are accepted is expected, not a stream low-water event. */
+        if (s_accepted_count < s_total_expected && s_count < s_min_buffer_count) {
             s_min_buffer_count = s_count;
         }
         if (s_count == 0u && s_accepted_count < s_total_expected) {
@@ -593,15 +601,20 @@ static void service_motion_10khz(void)
                 s_stream_underrun_count++;
             }
             s_stream_underrun_ticks++;
-            if (!Stepper_IsBusy() && s_stream_underrun_ticks > APP_CONTROL_HZ) {
+            s_stream_underrun_active_ticks++;
+            if (!Stepper_IsBusy() && s_stream_underrun_active_ticks > APP_CONTROL_HZ) {
                 s_run_requested = false;
                 s_state = BINARY_TRAJ_STATE_ERROR;
             }
         } else {
             s_stream_underrun_active = false;
+            s_stream_underrun_active_ticks = 0u;
         }
     }
+}
 
+static void service_motion(void)
+{
     BinaryTrajPoint *point = s_count > 0u ? &s_points[s_tail] : NULL;
     bool can_dispatch = point != NULL &&
                         (((point->flags & BT_POINT_FLAG_HOST_TIMED) != 0u)
@@ -699,11 +712,13 @@ static void service_motion_10khz(void)
 
 void BinaryTraj_Loop(void)
 {
+    /* GRBL-style split: prepare/dispatch segments in the main loop, never in the 10 kHz ISR. */
+    service_motion();
 }
 
 void BinaryTraj_Tick10kHz(void)
 {
-    service_motion_10khz();
+    update_stream_underrun_10khz();
 }
 
 bool BinaryTraj_FeedByte(uint8_t byte)
@@ -809,6 +824,27 @@ uint16_t BinaryTraj_MinBufferCount(void)
 BinaryTrajState BinaryTraj_GetState(void)
 {
     return s_state;
+}
+
+void BinaryTraj_GetSnapshot(BinaryTrajSnapshot *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    uint32_t primask = irq_save();
+    out->buffer_count = s_count;
+    out->buffer_free = (uint16_t)(APP_BINARY_TRAJ_POINTS - s_count);
+    out->min_buffer_count = s_min_buffer_count == APP_BINARY_TRAJ_POINTS ? s_count : s_min_buffer_count;
+    out->total_expected = s_total_expected;
+    out->accepted_count = s_accepted_count;
+    out->executed_count = s_executed_count;
+    out->stream_underrun_ticks = s_stream_underrun_ticks;
+    out->stream_underrun_count = s_stream_underrun_count;
+    out->max_dispatch_gap_ticks = s_max_dispatch_gap_ticks;
+    out->state = s_state;
+    out->run_requested = s_run_requested;
+    irq_restore(primask);
 }
 
 const char *BinaryTraj_StateName(BinaryTrajState state)

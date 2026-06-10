@@ -68,7 +68,6 @@ bool Stepper_CanQueueTimedSegment(void);
 uint8_t Stepper_TimedSegmentCount(void);
 uint8_t Stepper_TimedSegmentFree(void);
 bool Stepper_TargetsAllowed(int64_t pos1, int64_t pos2);
-const StepperState *Stepper_GetState(void);
 void Stepper_GetStateSnapshot(StepperState *out);
 const char *Stepper_ModeName(StepperMode mode);
 

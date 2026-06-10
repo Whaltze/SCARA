@@ -13,7 +13,7 @@ function Resolve-Port {
     if ($Requested -and $Requested.ToUpperInvariant() -ne "AUTO") {
         return $Requested
     }
-    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
     if ($ports.Count -ne 1) {
         throw "AUTO requires exactly one serial port; found: $($ports -join ', ')"
     }
@@ -48,20 +48,29 @@ try {
     $serial.DiscardInBuffer()
 
     $expected = @{}
+    $burst = [System.Text.StringBuilder]::new()
+    Write-Host "TX ? (realtime priority probe)"
+    [void]$burst.Append("?")
     for ($i = 1; $i -le $BurstLines; $i++) {
         $mode = if (($i % 2) -eq 0) { "G21" } else { "G90" }
         $line = "$mode ;BURST=$i"
         $expected[$line] = Get-Checksum -Line $line
         Write-Host "TX $line"
-        $serial.WriteLine($line)
+        [void]$burst.Append($line).Append("`n")
     }
+    $serial.Write($burst.ToString())
 
     $received = @{}
+    $firstProtocolResponse = $null
     $deadline = (Get-Date).AddMilliseconds([Math]::Max(3000, $TimeoutMs * ($BurstLines + 2)))
     while ((Get-Date) -lt $deadline -and $received.Count -lt $BurstLines) {
         try {
             $rx = $serial.ReadLine().Trim()
             Write-Host "RX $rx"
+            if ($null -eq $firstProtocolResponse -and
+                ($rx.StartsWith("<") -or $rx.Contains("|Bf:") -or $rx -match "^ok seq=")) {
+                $firstProtocolResponse = $rx
+            }
             if ($rx -match "^ok seq=\d+ cs=([0-9A-F]{2}) line=(.*)$") {
                 $cs = $Matches[1]
                 $line = $Matches[2]
@@ -78,6 +87,10 @@ try {
     }
     if ($received.Count -ne $BurstLines) {
         throw "Received $($received.Count)/$BurstLines matching ACKs"
+    }
+    if ($null -eq $firstProtocolResponse -or
+        (-not $firstProtocolResponse.StartsWith("<") -and -not $firstProtocolResponse.Contains("|Bf:"))) {
+        throw "Realtime status did not bypass normal burst ACKs; first response: $firstProtocolResponse"
     }
 
     $serial.DiscardInBuffer()
@@ -103,7 +116,7 @@ try {
         throw "Controller reported RX overflow or TX drop"
     }
 
-    Write-Host "PASS burst ACKs=$($received.Count) rxov=0 txd=0"
+    Write-Host "PASS realtime status bypassed burst ACKs; burst ACKs=$($received.Count) rxov=0 txd=0"
     Write-Host "GCODE BURST NO-MOTION CHECK PASS"
     exit 0
 } catch {

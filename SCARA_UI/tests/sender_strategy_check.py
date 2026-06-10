@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import sys
 
 
@@ -16,6 +17,7 @@ from SCARA_UI.communication.binary_trajectory_protocol import (
     TYPE_ACK,
     TYPE_BEGIN,
     build_frame,
+    joint_deg_to_pulse,
 )
 from SCARA_UI.communication.serial_mixin import ScaraSerialMixin
 from SCARA_UI.communication.serial_protocol import checksum
@@ -142,12 +144,6 @@ class TimedPathDummy(TimedUploadDummy):
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
 
-    def _joint_deg_to_pulse_float(self, q1, q2):
-        p1 = ((q1 * 3.141592653589793 / 180.0 * 1000.0 - self.BINARY_ZERO_MRAD[0]) * self.current_ppr) / self.BINARY_MRAD_PER_REV
-        p2 = ((q2 * 3.141592653589793 / 180.0 * 1000.0 - self.BINARY_ZERO_MRAD[1]) * self.current_ppr) / self.BINARY_MRAD_PER_REV
-        return p1, p2
-
-
 def assert_true(value, message):
     if not value:
         raise AssertionError(message)
@@ -268,7 +264,64 @@ def check_timed_path_segmentation():
     segments = owner.build_host_segments_from_path(path, start_xy=(sx, sy), label="test")
     assert_true(segments, "timed path generated no segments")
     assert_true(len(segments) < 300, "timed path regressed to one binary point per motor pulse")
+    assert_true(
+        all((segment.flags & owner.BINARY_FLAG_HOST_SEGMENT) != 0 for segment in segments),
+        "timed path contains a segment without the host-timed flag",
+    )
     assert_true((segments[-1].flags & owner.BINARY_FLAG_EXACT_STOP) != 0, "timed path does not stop at final point")
+
+    expected_time = 0.0
+    previous_xy = (sx, sy)
+    previous_speed = 0.0
+    for point in path:
+        speed = max(0.0, float(point[2]) / 60.0)
+        distance = math.hypot(float(point[0]) - previous_xy[0], float(point[1]) - previous_xy[1])
+        average_speed = 0.5 * (previous_speed + speed)
+        if distance > 1e-6:
+            expected_time += distance / max(0.1, average_speed)
+        previous_xy = (float(point[0]), float(point[1]))
+        previous_speed = speed
+    actual_time = sum(int(segment.duration_ticks) for segment in segments) / owner.HOST_DDA_HZ
+    assert_true(
+        abs(actual_time - expected_time) <= 0.02,
+        f"timed path duration drifted: actual={actual_time:.6f}s expected={expected_time:.6f}s",
+    )
+
+    q1, q2 = owner.inverse_kinematics(float(path[-1][0]), float(path[-1][1]))
+    expected_target = owner._joint_deg_to_pulse(q1, q2)
+    actual_target = (int(segments[-1].p1_abs), int(segments[-1].p2_abs))
+    assert_true(actual_target == expected_target, "timed path final pulse target drifted")
+
+    last = owner._joint_deg_to_pulse(*owner.inverse_kinematics(sx, sy))
+    speeds = []
+    for segment in segments:
+        dominant = max(abs(int(segment.p1_abs) - last[0]), abs(int(segment.p2_abs) - last[1]))
+        assert_true(dominant <= int(segment.duration_ticks), "timed path requests more than one DDA event per tick")
+        speeds.append(dominant * owner.HOST_DDA_HZ / int(segment.duration_ticks))
+        last = (int(segment.p1_abs), int(segment.p2_abs))
+    assert_true(
+        max(abs(current - previous) for previous, current in zip(speeds, speeds[1:])) <= 250.0,
+        "timed path contains a large adjacent slice speed jump",
+    )
+
+
+def check_single_rounding_pulse_conversion():
+    ppr = 32000
+    zero_deg = 2.251 * 180.0 / 3.141592653589793
+    one_pulse_deg = 360.0 / ppr
+    p0, _ = joint_deg_to_pulse(zero_deg, zero_deg, ppr)
+    p1, _ = joint_deg_to_pulse(zero_deg + one_pulse_deg, zero_deg, ppr)
+    previous = p0
+    jumps = []
+    for index in range(1, 40):
+        current, _ = joint_deg_to_pulse(zero_deg + index * one_pulse_deg, zero_deg, ppr)
+        jumps.append(current - previous)
+        previous = current
+    full_rev, _ = joint_deg_to_pulse(zero_deg + 360.0, zero_deg, ppr)
+
+    assert_true(p0 == 0 and p1 == 1, "joint conversion cannot resolve one-pulse angle increments")
+    assert_true(all(jump == 1 for jump in jumps), "joint conversion still contains multi-pulse mrad quantization")
+    assert_true(full_rev == ppr, "joint conversion uses an approximate revolution constant")
 
 
 def check_stop_clears_all_sender_layers():
@@ -318,6 +371,7 @@ def main():
     check_ack_window_progress()
     check_timed_jog_transport()
     check_timed_path_segmentation()
+    check_single_rounding_pulse_conversion()
     check_stop_clears_all_sender_layers()
     check_capability_handshake()
     check_binary_ack_statistics()

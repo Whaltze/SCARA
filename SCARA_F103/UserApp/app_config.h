@@ -10,7 +10,7 @@
 
 /* Firmware identity shown by VERSION. */
 #define APP_FW_NAME "SCARA_F103"
-#define APP_FW_VERSION "0.26.0"
+#define APP_FW_VERSION "0.26.3"
 
 /* Current controller drives two stepper axes. */
 #define APP_AXIS_COUNT 2u
@@ -25,15 +25,25 @@
 #define APP_STEPPER_M1_DIR_POSITIVE_LEVEL 1u
 #define APP_STEPPER_M2_DIR_POSITIVE_LEVEL 0u
 /* DM556 requires PUL high/low >= 2.5us and DIR setup >= 6us.
- * These NOP loops are intentionally conservative; verify with a scope.
+ * Delays use the Cortex-M3 DWT cycle counter, so these values are independent
+ * of compiler optimization and remain bounded inside the 100us control tick.
  */
-#define APP_STEPPER_PULSE_WIDTH_NOP 240u
-#define APP_STEPPER_DIR_SETUP_NOP 480u
+#define APP_STEPPER_PULSE_HIGH_US 3u
+#define APP_STEPPER_PULSE_LOW_US 3u
+#define APP_STEPPER_DIR_SETUP_US 6u
 
 /* PWM 脉冲定时器基准频率，当前 1MHz 表示 1us 计数精度。 */
 #define APP_STEPPER_TIMER_HZ 1000000u
 /* 实时插补/速度更新频率。10000Hz 表示每 100us 执行一次运动内核。 */
 #define APP_CONTROL_HZ 10000u
+#define APP_CONTROL_PERIOD_US (1000000u / APP_CONTROL_HZ)
+#define APP_STEPPER_ISR_DELAY_BUDGET_US (APP_CONTROL_PERIOD_US / 2u)
+#define APP_STEPPER_WORST_BLOCKING_DELAY_US \
+    ((APP_AXIS_COUNT * APP_STEPPER_DIR_SETUP_US) + APP_STEPPER_PULSE_HIGH_US + APP_STEPPER_PULSE_LOW_US)
+
+#if APP_STEPPER_WORST_BLOCKING_DELAY_US > APP_STEPPER_ISR_DELAY_BUDGET_US
+#error "Configured step pulse delays exceed half of the control ISR period"
+#endif
 
 /* 最低有效 PPS，低于该值按停止处理，防止很慢的抖动脉冲。 */
 #define APP_MIN_EFFECTIVE_PPS 16
@@ -109,6 +119,8 @@
 #define APP_SERIAL_TX_SIZE 280u
 /* Number of parsed RX lines that can wait in queue. */
 #define APP_SERIAL_LINE_QUEUE_DEPTH 16u
+/* Realtime characters bypass the normal line queue. */
+#define APP_SERIAL_REALTIME_QUEUE_DEPTH 8u
 /* Number of pending TX messages that can wait in queue. */
 #define APP_SERIAL_TX_QUEUE_DEPTH 8u
 /* UART baudrate. Must match the upper computer. */

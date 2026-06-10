@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 if ($Port.ToUpperInvariant() -eq "AUTO") {
-    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
     if ($ports.Count -ne 1) {
         throw "AUTO requires exactly one serial port; found: $($ports -join ', ')"
     }

@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Show-Ports {
-    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
     if ($ports.Count -eq 0) {
         Write-Host "No serial ports found."
     } else {

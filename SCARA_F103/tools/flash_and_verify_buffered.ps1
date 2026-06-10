@@ -1,7 +1,7 @@
 param(
     [string]$Port = "AUTO",
-    [ValidateSet("stlink", "cmsis-dap")]
-    [string]$Probe = "stlink",
+    [ValidateSet("auto", "stlink", "cmsis-dap")]
+    [string]$Probe = "auto",
     [switch]$ConfirmMotorPowerOff
 )
 
@@ -20,14 +20,28 @@ if (-not (Test-Path -LiteralPath $elf)) {
     throw "Firmware ELF does not exist: $elf"
 }
 
-$interface = if ($Probe -eq "stlink") { "interface/stlink.cfg" } else { "interface/cmsis-dap.cfg" }
+$interfaces = if ($Probe -eq "auto") {
+    @("interface/stlink.cfg", "interface/cmsis-dap.cfg")
+} elseif ($Probe -eq "stlink") {
+    @("interface/stlink.cfg")
+} else {
+    @("interface/cmsis-dap.cfg")
+}
 
 Push-Location $projectRoot
 try {
-    Write-Host "Flashing v0.26.0 with $Probe; motor-driver power confirmed off."
-    & openocd -f $interface -f target/stm32f1x.cfg -c "program build/Debug/SCARA_F103.elf verify reset exit"
-    if ($LASTEXITCODE -ne 0) {
-        throw "OpenOCD flash/verify failed exit=$LASTEXITCODE"
+    $flashed = $false
+    foreach ($interface in $interfaces) {
+        Write-Host "Flashing v0.26.3 with $interface; motor-driver power confirmed off."
+        & openocd -f $interface -f target/stm32f1x.cfg -c "program build/Debug/SCARA_F103.elf verify reset exit"
+        if ($LASTEXITCODE -eq 0) {
+            $flashed = $true
+            break
+        }
+        Write-Host "Probe attempt failed: $interface"
+    }
+    if (-not $flashed) {
+        throw "OpenOCD flash/verify failed for all requested probe interfaces"
     }
 
     Start-Sleep -Seconds 2

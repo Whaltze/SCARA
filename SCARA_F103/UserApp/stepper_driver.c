@@ -115,7 +115,7 @@ static GPIO_PinState ena_pin_state(bool enable)
 #endif
 }
 
-static GPIO_PinState step_pin_state(bool active)
+static inline __attribute__((always_inline)) GPIO_PinState step_pin_state(bool active)
 {
 #if APP_STEPPER_PUL_ACTIVE_LEVEL
     return active ? GPIO_PIN_SET : GPIO_PIN_RESET;
@@ -133,16 +133,19 @@ static GPIO_PinState dir_pin_state(uint32_t index, int8_t dir)
     return positive == positive_level ? GPIO_PIN_SET : GPIO_PIN_RESET;
 }
 
-static void pulse_width_delay(void)
+static void cycle_delay_init(void)
 {
-    for (volatile uint32_t i = 0; i < APP_STEPPER_PULSE_WIDTH_NOP; ++i) {
-        __NOP();
-    }
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0u;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
-static void dir_setup_delay(void)
+static void delay_us(uint32_t duration_us)
 {
-    for (volatile uint32_t i = 0; i < APP_STEPPER_DIR_SETUP_NOP; ++i) {
+    uint32_t cycles_per_us = SystemCoreClock / 1000000u;
+    uint32_t delay_cycles = duration_us * cycles_per_us;
+    uint32_t start = DWT->CYCCNT;
+    while ((uint32_t)(DWT->CYCCNT - start) < delay_cycles) {
         __NOP();
     }
 }
@@ -182,11 +185,28 @@ static void pwm_apply(uint32_t index, int32_t pps)
     s_state.axis[index].running = true;
 }
 
-static void emit_step(uint32_t index)
+static inline __attribute__((always_inline)) void write_step_pin(uint32_t index, bool active)
 {
-    HAL_GPIO_WritePin(s_hw[index].step_port, s_hw[index].step_pin, step_pin_state(true));
-    pulse_width_delay();
-    HAL_GPIO_WritePin(s_hw[index].step_port, s_hw[index].step_pin, step_pin_state(false));
+    bool set_high = step_pin_state(active) == GPIO_PIN_SET;
+    s_hw[index].step_port->BSRR = set_high ? s_hw[index].step_pin : ((uint32_t)s_hw[index].step_pin << 16u);
+}
+
+static void __attribute__((optimize("Os"))) emit_step_mask(uint8_t step_mask)
+{
+    if ((step_mask & (1u << 0)) != 0u) {
+        write_step_pin(0u, true);
+    }
+    if ((step_mask & (1u << 1)) != 0u) {
+        write_step_pin(1u, true);
+    }
+    delay_us(APP_STEPPER_PULSE_HIGH_US);
+    if ((step_mask & (1u << 0)) != 0u) {
+        write_step_pin(0u, false);
+    }
+    if ((step_mask & (1u << 1)) != 0u) {
+        write_step_pin(1u, false);
+    }
+    delay_us(APP_STEPPER_PULSE_LOW_US);
 }
 
 static void set_dir_index(uint32_t index, int8_t dir)
@@ -199,7 +219,7 @@ static void set_dir_index(uint32_t index, int8_t dir)
     GPIO_PinState new_state = dir_pin_state(index, s_state.axis[index].dir);
     HAL_GPIO_WritePin(s_hw[index].dir_port, s_hw[index].dir_pin, new_state);
     if (old_state != new_state) {
-        dir_setup_delay();
+        delay_us(APP_STEPPER_DIR_SETUP_US);
     }
 }
 
@@ -240,6 +260,7 @@ static int32_t blended_move_accel_pps_s(const StepperState *snapshot)
 void Stepper_Init(void)
 {
     GPIO_InitTypeDef gpio = {0};
+    cycle_delay_init();
     timed_queue_clear();
     for (uint32_t i = 0; i < 2u; ++i) {
         // 上电直接使能
@@ -808,7 +829,7 @@ static void axis_tick(uint32_t index)
     while (s_hw[index].pulse_accum >= (int32_t)APP_CONTROL_HZ) {
         s_hw[index].pulse_accum -= (int32_t)APP_CONTROL_HZ;
         int8_t step_dir = axis->current_pps >= 0 ? 1 : -1;
-        emit_step(index);
+        emit_step_mask((uint8_t)(1u << index));
         axis->position_pulse += step_dir;
         if (axis->mode == STEPPER_MODE_MOVE && axis->remaining_pulse > 0) {
             axis->remaining_pulse--;
@@ -848,6 +869,7 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
         s_move.elapsed_ticks++;
         s_move.event_accum += s_move.step_event_count;
         while (s_move.event_accum >= (int64_t)s_move.duration_ticks && s_move.remaining_events > 0u) {
+            uint8_t step_mask = 0u;
             s_move.event_accum -= (int64_t)s_move.duration_ticks;
             for (uint32_t i = 0; i < 2u; ++i) {
                 if (s_move.steps[i] == 0u) {
@@ -856,7 +878,12 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
                 s_move.counter[i] += s_move.steps[i];
                 if (s_move.counter[i] >= s_move.step_event_count) {
                     s_move.counter[i] -= s_move.step_event_count;
-                    emit_step(i);
+                    step_mask |= (uint8_t)(1u << i);
+                }
+            }
+            emit_step_mask(step_mask);
+            for (uint32_t i = 0; i < 2u; ++i) {
+                if ((step_mask & (1u << i)) != 0u) {
                     s_state.axis[i].position_pulse += s_move.dir[i];
                     if (s_state.axis[i].remaining_pulse > 0) {
                         s_state.axis[i].remaining_pulse--;
@@ -927,6 +954,7 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
 
     s_move.event_accum += s_move.current_pps;
     while (s_move.event_accum >= (int32_t)APP_CONTROL_HZ && s_move.remaining_events > 0u) {
+        uint8_t step_mask = 0u;
         s_move.event_accum -= (int32_t)APP_CONTROL_HZ;
         for (uint32_t i = 0; i < 2u; ++i) {
             if (s_move.steps[i] == 0u) {
@@ -935,7 +963,12 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
             s_move.counter[i] += s_move.steps[i];
             if (s_move.counter[i] >= s_move.step_event_count) {
                 s_move.counter[i] -= s_move.step_event_count;
-                emit_step(i);
+                step_mask |= (uint8_t)(1u << i);
+            }
+        }
+        emit_step_mask(step_mask);
+        for (uint32_t i = 0; i < 2u; ++i) {
+            if ((step_mask & (1u << i)) != 0u) {
                 s_state.axis[i].position_pulse += s_move.dir[i];
                 if (s_state.axis[i].remaining_pulse > 0) {
                     s_state.axis[i].remaining_pulse--;
@@ -1028,11 +1061,6 @@ uint8_t Stepper_TimedSegmentFree(void)
 bool Stepper_TargetsAllowed(int64_t pos1, int64_t pos2)
 {
     return target_in_range(pos1) && target_in_range(pos2);
-}
-
-const StepperState *Stepper_GetState(void)
-{
-    return &s_state;
 }
 
 void Stepper_GetStateSnapshot(StepperState *out)

@@ -13,6 +13,8 @@
 #include "serial_dma.h"
 #include "stepper_driver.h"
 
+static volatile uint32_t s_max_tick_cycles;
+
 void App_Init(void)
 {
     AppParams_Init();
@@ -27,13 +29,24 @@ void App_Init(void)
     SerialDma_Send("BOOT " APP_FW_NAME " " APP_FW_VERSION " READY\r\n");
 }
 
+uint32_t App_MaxTickCycles(void)
+{
+    return s_max_tick_cycles;
+}
+
 void App_Loop(void)
 {
     char line[APP_SERIAL_LINE_SIZE];
+    char realtime;
 
     /* 主循环只做非中断重活：串口收包、协议解析、G-code 入队、回零流程推进。 */
     SerialDma_Poll();
-    while (SerialDma_ReadLine(line, sizeof(line))) {
+    while (SerialDma_ReadRealtime(&realtime)) {
+        line[0] = realtime;
+        line[1] = '\0';
+        Protocol_ProcessLine(line);
+    }
+    if (SerialDma_ReadLine(line, sizeof(line))) {
         Protocol_ProcessLine(line);
     }
     HomeController_Loop();
@@ -45,6 +58,7 @@ void App_Loop(void)
 void App_Tick10kHz(void)
 {
     static uint8_t low_rate_divider;
+    uint32_t tick_start = DWT->CYCCNT;
 
     Stepper_Tick10kHz();
     BinaryTraj_Tick10kHz();
@@ -55,6 +69,11 @@ void App_Tick10kHz(void)
         HomeController_Tick1kHz();
         GcodeStream_Tick1kHz();
         Protocol_Tick1kHz();
+    }
+
+    uint32_t tick_cycles = (uint32_t)(DWT->CYCCNT - tick_start);
+    if (tick_cycles > s_max_tick_cycles) {
+        s_max_tick_cycles = tick_cycles;
     }
 }
 
