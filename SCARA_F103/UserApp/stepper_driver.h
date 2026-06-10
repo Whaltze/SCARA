@@ -8,6 +8,7 @@
 #define STEPPER_ERR_ESTOP 0x00000002u
 #define STEPPER_ERR_COMM_TIMEOUT 0x00000004u
 #define STEPPER_ERR_DISABLED 0x00000008u
+#define STEPPER_ERR_INVALID_ARG 0x00000010u
 
 typedef enum {
     STEPPER_AXIS_1 = 0,
@@ -52,6 +53,7 @@ void Stepper_SetAccel(StepperAxis axis, int32_t accel_pps_s);
 bool Stepper_MoveRel(int64_t delta1, int64_t delta2, int32_t v1, int32_t v2);
 bool Stepper_MoveAbs(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2);
 bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, int32_t exit1, int32_t exit2);
+bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks);
 void Stepper_Stop(StepperAxis axis);
 void Stepper_StopAll(void);
 void Stepper_EStopAll(void);
@@ -62,6 +64,9 @@ void Stepper_Zero(void);
 void Stepper_Tick10kHz(void);
 bool Stepper_IsBusy(void);
 bool Stepper_CanAcceptMove(void);
+bool Stepper_CanQueueTimedSegment(void);
+uint8_t Stepper_TimedSegmentCount(void);
+uint8_t Stepper_TimedSegmentFree(void);
 bool Stepper_TargetsAllowed(int64_t pos1, int64_t pos2);
 const StepperState *Stepper_GetState(void);
 void Stepper_GetStateSnapshot(StepperState *out);

@@ -2,7 +2,7 @@ param(
     [string]$Port = "COM13",
     [int]$Baud = 115200,
     [double]$StartX = 75.0,
-    [double]$StartY = 220.0,
+    [double]$StartY = 345.3,
     [double]$EndX = 150.0,
     [double]$EndY = 250.0,
     [double]$FeedMmS = 20.0,
@@ -22,7 +22,7 @@ $TYPE_VALIDATE = 0x12
 $TYPE_RUN = 0x13
 $TYPE_ACK = 0x80
 $TYPE_NACK = 0x81
-$PPR = 1600.0
+$PPR = 3200.0
 $FLAG_EXACT_STOP = 0x0001
 $FLAG_CARTESIAN_LINE = 0x0002
 $ZERO1_MRAD = 2251.0
@@ -317,6 +317,7 @@ try {
     while ($serial.BytesToRead -gt 0) { try { [void]$serial.ReadLine() } catch { break } }
     Send-Ascii -Serial $serial -Line "VERSION" | Out-Null
     Send-Ascii -Serial $serial -Line "HOSTCAP" | Out-Null
+    Send-Ascii -Serial $serial -Line "PPR 3200 3200" | Out-Null
     Send-Ascii -Serial $serial -Line "CLEAR_ERROR" | Out-Null
     Send-Ascii -Serial $serial -Line "ZERO" | Out-Null
     Send-Ascii -Serial $serial -Line "ENABLE 1" | Out-Null
@@ -329,7 +330,9 @@ try {
     Send-Frame -Serial $serial -Type $TYPE_VALIDATE -Seq $seq; $seq++
     Send-Frame -Serial $serial -Type $TYPE_RUN -Seq $seq; $seq++
 
-    $deadline = (Get-Date).AddSeconds(20)
+    $pathLen = [Math]::Sqrt(($EndX - $StartX) * ($EndX - $StartX) + ($EndY - $StartY) * ($EndY - $StartY))
+    $motionSeconds = $pathLen / [Math]::Max(0.1, $FeedMmS)
+    $deadline = (Get-Date).AddSeconds([Math]::Max(20.0, $motionSeconds * 1.8 + 10.0))
     $idleSeen = $false
     while ((Get-Date) -lt $deadline) {
         $serial.Write("?")

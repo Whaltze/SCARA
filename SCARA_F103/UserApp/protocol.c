@@ -56,7 +56,7 @@ void Protocol_SendStatus(void)
     SerialDma_SendFormat("STAT t=%lu m=%s e=%lu p=%ld,%ld "
                          "r=%u,%u en=%u,%u pps=%ld,%ld tgt=%ld,%ld wd=%u idle=%lu "
                          "rxov=%lu txd=%lu txq=%lu h=%u,%u hs=%s he=%u "
-                         "bf=%u,%u jt=%s,%lu,%lu,%u,%u hz=%lu\r\n",
+                         "bf=%u,%u q=%u sq=%u,%u jt=%s,%lu,%lu,%u,%u hz=%lu\r\n",
                          (unsigned long)s.tick_ms,
                          Stepper_ModeName(s.axis[0].mode != STEPPER_MODE_IDLE ? s.axis[0].mode : s.axis[1].mode),
                          (unsigned long)(s.axis[0].error | s.axis[1].error),
@@ -80,7 +80,10 @@ void Protocol_SendStatus(void)
                          HomeController_StateName(HomeController_GetState()),
                          (unsigned int)HomeController_Error(),
                          (unsigned int)GcodeStream_PlannerFree(),
+                         (unsigned int)SerialDma_RxFreeBytes(),
                          (unsigned int)GcodeStream_PlannerCount(),
+                         (unsigned int)Stepper_TimedSegmentCount(),
+                         (unsigned int)Stepper_TimedSegmentFree(),
                          BinaryTraj_StateName(BinaryTraj_GetState()),
                          (unsigned long)BinaryTraj_AcceptedCount(),
                          (unsigned long)BinaryTraj_ExecutedCount(),
@@ -134,7 +137,7 @@ void Protocol_ProcessLine(const char *line)
     } else if (strcmp(cmd, "HOSTCAP") == 0) {
         /* 告诉上位机：当前固件定位为“上位机规划、下位机执行”的脉冲控制器。 */
         const AppParams *p = AppParams_Get();
-        SerialDma_SendFormat("OK HOSTCAP role=joint_interpolator host_plan=1 host_ik=1 host_limit=1 mcu_soft_limit=0 gcode=G0G1F legacy_gcode=1 binary_traj=1 joint_interp=1 cartesian_line=1 exact_stop=1 dda_stepper=1 homing=real,sim control_hz=%lu ack=seq_cs_line comments=echo_ignored ppr1=%ld ppr2=%ld\r\n",
+        SerialDma_SendFormat("OK HOSTCAP host_plan=1 gcode_abt=1 binary_traj=1 binary_timed=1 ptest=0 jogp=0 dda=1 hz=%lu ppr1=%ld ppr2=%ld\r\n",
                              (unsigned long)APP_CONTROL_HZ,
                              (long)p->pulses_per_rev[0],
                              (long)p->pulses_per_rev[1]);
@@ -154,7 +157,7 @@ void Protocol_ProcessLine(const char *line)
         if (b <= 0) {
             b = a;
         }
-        if (a < 100 || b < 100 || a > 200000 || b > 200000) {
+        if (a <= 0 || b <= 0) {
             SerialDma_Send("ERR PPR_RANGE\r\n");
         } else if (Stepper_IsBusy() || GcodeStream_PlannerCount() > 0u) {
             SerialDma_Send("ERR PPR_BUSY\r\n");
@@ -220,11 +223,13 @@ void Protocol_ProcessLine(const char *line)
     } else if (strcmp(cmd, "STOP") == 0) {
         HomeController_Stop();
         BinaryTraj_Stop();
+        GcodeStream_Clear();
         MotionPlanner_Stop();
         SerialDma_Send("OK STOP\r\n");
     } else if (strcmp(cmd, "ESTOP") == 0) {
         HomeController_Stop();
         BinaryTraj_Stop();
+        GcodeStream_Clear();
         Stepper_EStopAll();
         SerialDma_Send("OK ESTOP\r\n");
     } else if (strcmp(cmd, "CLEAR_ERROR") == 0 || strcmp(cmd, "RESET") == 0) {
@@ -236,6 +241,8 @@ void Protocol_ProcessLine(const char *line)
         MotionPlanner_Stop();
         Stepper_Zero();
         SerialDma_Send("OK ZERO\r\n");
+    } else if (strncmp(cmd, "JOGP", 4) == 0 || strncmp(cmd, "PTEST", 5) == 0) {
+        SerialDma_Send("ERR USE_G1_ABT\r\n");
     } else if (sscanf(cmd, "ENABLE %ld", &a) == 1) {
         Stepper_EnableAll(a != 0);
         SerialDma_Send(a != 0 ? "OK ENABLE 1\r\n" : "OK ENABLE 0\r\n");

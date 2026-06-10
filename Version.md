@@ -1,5 +1,18 @@
 # SCARA_F103 Version Log
 
+## 2026-06-09 v0.26.0 Buffered streaming and deterministic timed handoff
+
+- Restored buffered binary trajectories as the normal UI transport.
+- Added GRBL-style ASCII send-window accounting and separate sender strategies.
+- Added planner, RX-byte, timed-segment FIFO, low-water and underrun diagnostics.
+- Added ISR-local timed-segment handoff so queued segments do not restore interrupts inside the 10 kHz ISR.
+- Normal UI trajectories now execute as approximately 10 ms timed joint segments instead of restarting acceleration at every geometry keypoint.
+- Buffered motion starts after a 64-segment prefill, then refills every 10 ms through the MCU 128-point ring and stepper timed-segment FIFO.
+- STOP now clears host pending/inflight data, binary refill state, active trajectory references, MCU trajectory data and prefetched step segments.
+- Done/Error/Idle binary states immediately release the active host trajectory instead of leaving the UI motion-busy.
+- UI checks `HOSTCAP` before binary upload and only sends timed segments when the controller advertises `binary_timed=1`; older firmware falls back instead of misreading duration ticks as PPS.
+- Added non-motion capability and sender-window regression checks.
+
 ## 2026-06-04 v0.24.5 上位机仿真视野锁定为鼠标控制
 
 ### 完成

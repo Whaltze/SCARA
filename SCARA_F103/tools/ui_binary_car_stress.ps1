@@ -4,17 +4,46 @@ param(
     [ValidateSet("Car1", "Car2")]
     [string]$Shape = "Car1",
     [double]$StartX = 75.0,
-    [double]$StartY = 220.0,
+    [double]$StartY = 345.3,
     [double]$CarX = 75.0,
     [double]$CarY = 200.0,
     [double]$FeedMmS = 20.0,
     [double]$SpacingMm = 0.35,
     [double]$MaxErrorMm = 1.0,
     [string]$CsvPath = "",
-    [switch]$KeepEnabled
+    [switch]$KeepEnabled,
+    [switch]$UseZero,
+    [switch]$RawProtocol
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $RawProtocol) {
+    $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+    $python = "C:\Users\22602\.conda\envs\Robot\python.exe"
+    if (-not (Test-Path -LiteralPath $python)) {
+        $python = "python"
+    }
+    $shapeArg = $Shape.ToLowerInvariant()
+    $argsList = @(
+        (Join-Path $root "SCARA_UI\tests\ui_car_click_stress.py"),
+        "--port", $Port,
+        "--shape", $shapeArg,
+        "--feed-mm-s", ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0}", $FeedMmS)),
+        "--car-x", ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0}", $CarX)),
+        "--car-y", ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0}", $CarY)),
+        "--max-error-mm", ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0}", $MaxErrorMm))
+    )
+    if (-not [string]::IsNullOrWhiteSpace($CsvPath)) {
+        $argsList += @("--csv-path", $CsvPath)
+    }
+    if ($UseZero) {
+        $argsList += "--use-zero"
+    }
+    Write-Host "UI_BINARY_CAR_STRESS mode=ui_click"
+    & $python @argsList
+    exit $LASTEXITCODE
+}
 
 $SOF0 = 0xA5
 $SOF1 = 0x5A
@@ -27,7 +56,9 @@ $TYPE_STATUS = 0x15
 $TYPE_ACK = 0x80
 $TYPE_NACK = 0x81
 $TYPE_STATUS_RSP = 0x82
-$PPR = 1600.0
+$PPR = 3200.0
+$FLAG_EXACT_STOP = 0x0001
+$FLAG_CARTESIAN_LINE = 0x0002
 $ZERO1_MRAD = 2251.0
 $ZERO2_MRAD = 890.0
 $MRAD_PER_REV = 6283.0
@@ -106,6 +137,64 @@ function Add-ArcPoints {
         $a = $arc.A0 + $arc.Delta * $t
         Add-Point -List $List -X ($arc.Center.X + $Radius * [Math]::Cos($a)) -Y ($arc.Center.Y + $Radius * [Math]::Sin($a))
     }
+}
+
+function Add-SendLine {
+    param([System.Collections.Generic.List[object]]$List, [double]$X1, [double]$Y1)
+    $List.Add([pscustomobject]@{
+        X = $X1
+        Y = $Y1
+        Flags = ($FLAG_EXACT_STOP -bor $FLAG_CARTESIAN_LINE)
+    })
+}
+
+function Add-SendArc {
+    param([System.Collections.Generic.List[object]]$List, [double]$X0, [double]$Y0, [double]$X1, [double]$Y1, [double]$Radius, [bool]$Clockwise)
+    $arc = Get-ArcSpec -X0 $X0 -Y0 $Y0 -X1 $X1 -Y1 $Y1 -Radius $Radius -Clockwise $Clockwise
+    $count = [Math]::Max(2, [int][Math]::Ceiling($arc.Length / 0.35))
+    for ($i = 1; $i -le $count; $i++) {
+        $t = [double]$i / [double]$count
+        $a = $arc.A0 + $arc.Delta * $t
+        $flags = if ($i -eq $count) { $FLAG_EXACT_STOP } else { 0 }
+        $List.Add([pscustomobject]@{
+            X = $arc.Center.X + $Radius * [Math]::Cos($a)
+            Y = $arc.Center.Y + $Radius * [Math]::Sin($a)
+            Flags = $flags
+        })
+    }
+}
+
+function New-CarSendTargets {
+    param([string]$Name, [double]$X0, [double]$Y0)
+    $pts = New-Object System.Collections.Generic.List[object]
+    Add-SendLine -List $pts -X1 $X0 -Y1 $Y0
+    if ($Name -eq "Car1") {
+        Add-SendLine -List $pts -X1 $X0 -Y1 ($Y0 + 24.0)
+        Add-SendLine -List $pts -X1 ($X0 + 72.0) -Y1 ($Y0 + 24.0)
+        Add-SendLine -List $pts -X1 ($X0 + 72.0) -Y1 ($Y0 + 48.0)
+        Add-SendLine -List $pts -X1 ($X0 + 108.0) -Y1 ($Y0 + 48.0)
+        Add-SendLine -List $pts -X1 ($X0 + 120.0) -Y1 ($Y0 + 36.0)
+        Add-SendLine -List $pts -X1 ($X0 + 120.0) -Y1 $Y0
+        Add-SendLine -List $pts -X1 ($X0 + 108.0) -Y1 $Y0
+        Add-SendArc -List $pts -X0 ($X0 + 108.0) -Y0 $Y0 -X1 ($X0 + 84.0) -Y1 $Y0 -Radius 12.0 -Clockwise $true
+        Add-SendLine -List $pts -X1 ($X0 + 48.0) -Y1 $Y0
+        Add-SendArc -List $pts -X0 ($X0 + 48.0) -Y0 $Y0 -X1 ($X0 + 24.0) -Y1 $Y0 -Radius 12.0 -Clockwise $true
+        Add-SendLine -List $pts -X1 $X0 -Y1 $Y0
+    } else {
+        Add-SendLine -List $pts -X1 $X0 -Y1 ($Y0 + 20.0)
+        Add-SendLine -List $pts -X1 ($X0 + 40.0) -Y1 ($Y0 + 20.0)
+        Add-SendLine -List $pts -X1 ($X0 + 60.0) -Y1 ($Y0 + 40.0)
+        Add-SendLine -List $pts -X1 ($X0 + 120.0) -Y1 ($Y0 + 40.0)
+        Add-SendLine -List $pts -X1 ($X0 + 140.0) -Y1 ($Y0 + 20.0)
+        Add-SendLine -List $pts -X1 ($X0 + 160.0) -Y1 ($Y0 + 20.0)
+        Add-SendLine -List $pts -X1 ($X0 + 160.0) -Y1 $Y0
+        Add-SendLine -List $pts -X1 ($X0 + 140.0) -Y1 $Y0
+        Add-SendArc -List $pts -X0 ($X0 + 140.0) -Y0 $Y0 -X1 ($X0 + 116.0) -Y1 $Y0 -Radius 12.0 -Clockwise $true
+        Add-SendLine -List $pts -X1 ($X0 + 44.0) -Y1 $Y0
+        Add-SendArc -List $pts -X0 ($X0 + 44.0) -Y0 $Y0 -X1 ($X0 + 20.0) -Y1 $Y0 -Radius 12.0 -Clockwise $true
+        Add-SendLine -List $pts -X1 $X0 -Y1 $Y0
+    }
+    return $pts
 }
 
 function New-CarTargets {
@@ -314,6 +403,19 @@ function New-PointPayload {
     $prevPulse = Convert-UiToPulse -X $prev.X -Y $prev.Y
     for ($i = $Offset; $i -lt ($Offset + $Count); $i++) {
         $target = $Targets[$i]
+        $flags = if ($target.PSObject.Properties.Name -contains "Flags") { [int]$target.Flags } else { 0 }
+        if (($flags -band $FLAG_CARTESIAN_LINE) -ne 0) {
+            $xUm = [int][Math]::Round(($target.X - $BASE_MM * 0.5) * 1000.0)
+            $yUm = [int][Math]::Round($target.Y * 1000.0)
+            $feedMmMin = [int][Math]::Round($FeedMmS * 60.0)
+            Write-I32 -Bytes $bytes -Value $xUm
+            Write-I32 -Bytes $bytes -Value $yUm
+            Write-U16 -Bytes $bytes -Value $feedMmMin
+            Write-U16 -Bytes $bytes -Value $flags
+            $prev = $target
+            $prevPulse = Convert-UiToPulse -X $target.X -Y $target.Y
+            continue
+        }
         $pulse = Convert-UiToPulse -X $target.X -Y $target.Y
         $dist = [Math]::Sqrt(($target.X - $prev.X) * ($target.X - $prev.X) + ($target.Y - $prev.Y) * ($target.Y - $prev.Y))
         $dom = [Math]::Max([Math]::Abs($pulse.P1 - $prevPulse.P1), [Math]::Abs($pulse.P2 - $prevPulse.P2))
@@ -325,7 +427,7 @@ function New-PointPayload {
         Write-I32 -Bytes $bytes -Value $pulse.P1
         Write-I32 -Bytes $bytes -Value $pulse.P2
         Write-U16 -Bytes $bytes -Value $vdom
-        Write-U16 -Bytes $bytes -Value 0
+        Write-U16 -Bytes $bytes -Value $flags
         $prev = $target
         $prevPulse = $pulse
     }
@@ -380,6 +482,17 @@ function Get-Summary {
     return [pscustomobject]@{ Count = $samples.Count; Max = $max; Rms = [Math]::Sqrt($sum2 / $samples.Count) }
 }
 
+function Get-PathLength {
+    param([object[]]$Points)
+    $length = 0.0
+    for ($i = 1; $i -lt $Points.Count; $i++) {
+        $a = $Points[$i - 1]
+        $b = $Points[$i]
+        $length += [Math]::Sqrt(($b.X - $a.X) * ($b.X - $a.X) + ($b.Y - $a.Y) * ($b.Y - $a.Y))
+    }
+    return $length
+}
+
 function Export-CsvIfNeeded {
     if ([string]::IsNullOrWhiteSpace($CsvPath)) { return }
     $dir = Split-Path -Parent $CsvPath
@@ -395,13 +508,14 @@ $serial.WriteTimeout = 1000
 try {
     $rawTargets = @(New-CarTargets -Name $Shape -X0 $CarX -Y0 $CarY -Spacing $SpacingMm)
     foreach ($p in $rawTargets) { $expected.Add($p) }
-    $targets = @(Remove-ZeroPulseTargets -Points $rawTargets)
-    Write-Host ("UI_BINARY_CAR shape={0} points={1}/{2} start=({3:F3},{4:F3}) car=({5:F3},{6:F3}) feed={7:F3}mm/s spacing={8:F3}" -f $Shape, $targets.Count, $rawTargets.Count, $StartX, $StartY, $CarX, $CarY, $FeedMmS, $SpacingMm)
+    $targets = @(Remove-ZeroPulseTargets -Points @(New-CarSendTargets -Name $Shape -X0 $CarX -Y0 $CarY))
+    Write-Host ("UI_BINARY_CAR shape={0} keypoints={1} preview={2} mode=cartesian_lines start=({3:F3},{4:F3}) car=({5:F3},{6:F3}) feed={7:F3}mm/s spacing={8:F3}" -f $Shape, $targets.Count, $rawTargets.Count, $StartX, $StartY, $CarX, $CarY, $FeedMmS, $SpacingMm)
     $serial.Open()
     Start-Sleep -Milliseconds 300
     while ($serial.BytesToRead -gt 0) { try { [void]$serial.ReadLine() } catch { break } }
     Send-Ascii -Serial $serial -Line "VERSION" | Out-Null
     Send-Ascii -Serial $serial -Line "HOSTCAP" | Out-Null
+    Send-Ascii -Serial $serial -Line "PPR 3200 3200" | Out-Null
     Send-Ascii -Serial $serial -Line "CLEAR_ERROR" | Out-Null
     Send-Ascii -Serial $serial -Line "ZERO" | Out-Null
     Send-Ascii -Serial $serial -Line "ENABLE 1" | Out-Null
@@ -427,7 +541,9 @@ try {
         $sent += $take
     }
 
-    $deadline = (Get-Date).AddSeconds(45)
+    $pathLen = Get-PathLength -Points $rawTargets
+    $motionSeconds = $pathLen / [Math]::Max(0.1, $FeedMmS)
+    $deadline = (Get-Date).AddSeconds([Math]::Max(45.0, $motionSeconds * 2.4 + 20.0))
     $idleSeen = $false
     while ((Get-Date) -lt $deadline) {
         $serial.Write("?")

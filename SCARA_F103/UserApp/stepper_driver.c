@@ -25,6 +25,7 @@ typedef struct {
 
 typedef struct {
     bool active;
+    bool host_timed;
     uint32_t step_event_count;
     uint32_t remaining_events;
     uint32_t steps[2];
@@ -35,8 +36,16 @@ typedef struct {
     int32_t exit_pps;
     int32_t accel_pps_s;
     int32_t accel_accum;
-    int32_t event_accum;
+    int64_t event_accum;
+    uint32_t duration_ticks;
+    uint32_t elapsed_ticks;
 } StepperDdaMove;
+
+typedef struct {
+    int64_t pos1;
+    int64_t pos2;
+    uint32_t duration_ticks;
+} StepperTimedSegment;
 
 static StepperState s_state;
 static StepperHw s_hw[2] = {
@@ -44,6 +53,37 @@ static StepperHw s_hw[2] = {
     {BOARD_M2_TIM, BOARD_M2_TIM_CHANNEL, BOARD_M2_STEP_PORT, BOARD_M2_STEP_PIN, BOARD_M2_DIR_PORT, BOARD_M2_DIR_PIN, BOARD_M2_ENA_PORT, BOARD_M2_ENA_PIN, 0, 0, 0},
 };
 static StepperDdaMove s_move;
+static StepperTimedSegment s_timed_segments[APP_STEPPER_TIMED_SEGMENTS];
+static uint8_t s_timed_head;
+static uint8_t s_timed_tail;
+static uint8_t s_timed_count;
+
+static bool target_in_range(int64_t target);
+static int64_t initial_pulse(uint32_t index);
+
+static uint8_t timed_next_index(uint8_t index)
+{
+    index++;
+    return index >= APP_STEPPER_TIMED_SEGMENTS ? 0u : index;
+}
+
+static void timed_queue_clear(void)
+{
+    s_timed_head = 0u;
+    s_timed_tail = 0u;
+    s_timed_count = 0u;
+}
+
+static bool timed_queue_pop(StepperTimedSegment *segment)
+{
+    if (s_timed_count == 0u || segment == NULL) {
+        return false;
+    }
+    *segment = s_timed_segments[s_timed_tail];
+    s_timed_tail = timed_next_index(s_timed_tail);
+    s_timed_count--;
+    return true;
+}
 
 static int32_t clamp_i32(int32_t value, int32_t min_value, int32_t max_value)
 {
@@ -64,6 +104,47 @@ static int64_t i64_abs(int64_t value)
 static bool axis_valid(StepperAxis axis)
 {
     return axis == STEPPER_AXIS_1 || axis == STEPPER_AXIS_2;
+}
+
+static GPIO_PinState ena_pin_state(bool enable)
+{
+#if APP_STEPPER_ENA_ACTIVE_LEVEL
+    return enable ? GPIO_PIN_SET : GPIO_PIN_RESET;
+#else
+    return enable ? GPIO_PIN_RESET : GPIO_PIN_SET;
+#endif
+}
+
+static GPIO_PinState step_pin_state(bool active)
+{
+#if APP_STEPPER_PUL_ACTIVE_LEVEL
+    return active ? GPIO_PIN_SET : GPIO_PIN_RESET;
+#else
+    return active ? GPIO_PIN_RESET : GPIO_PIN_SET;
+#endif
+}
+
+static GPIO_PinState dir_pin_state(uint32_t index, int8_t dir)
+{
+    bool positive = dir > 0;
+    bool positive_level =
+        index == 0u ? (APP_STEPPER_M1_DIR_POSITIVE_LEVEL != 0u) :
+                      (APP_STEPPER_M2_DIR_POSITIVE_LEVEL != 0u);
+    return positive == positive_level ? GPIO_PIN_SET : GPIO_PIN_RESET;
+}
+
+static void pulse_width_delay(void)
+{
+    for (volatile uint32_t i = 0; i < APP_STEPPER_PULSE_WIDTH_NOP; ++i) {
+        __NOP();
+    }
+}
+
+static void dir_setup_delay(void)
+{
+    for (volatile uint32_t i = 0; i < APP_STEPPER_DIR_SETUP_NOP; ++i) {
+        __NOP();
+    }
 }
 
 static uint32_t irq_save(void)
@@ -103,8 +184,9 @@ static void pwm_apply(uint32_t index, int32_t pps)
 
 static void emit_step(uint32_t index)
 {
-    HAL_GPIO_WritePin(s_hw[index].step_port, s_hw[index].step_pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(s_hw[index].step_port, s_hw[index].step_pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(s_hw[index].step_port, s_hw[index].step_pin, step_pin_state(true));
+    pulse_width_delay();
+    HAL_GPIO_WritePin(s_hw[index].step_port, s_hw[index].step_pin, step_pin_state(false));
 }
 
 static void set_dir_index(uint32_t index, int8_t dir)
@@ -112,9 +194,13 @@ static void set_dir_index(uint32_t index, int8_t dir)
     if (dir == 0) {
         return;
     }
+    GPIO_PinState old_state = dir_pin_state(index, s_state.axis[index].dir);
     s_state.axis[index].dir = dir > 0 ? 1 : -1;
-    HAL_GPIO_WritePin(s_hw[index].dir_port, s_hw[index].dir_pin,
-                      s_state.axis[index].dir > 0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    GPIO_PinState new_state = dir_pin_state(index, s_state.axis[index].dir);
+    HAL_GPIO_WritePin(s_hw[index].dir_port, s_hw[index].dir_pin, new_state);
+    if (old_state != new_state) {
+        dir_setup_delay();
+    }
 }
 
 static void axis_set_target_pps(uint32_t index, int32_t pps)
@@ -143,11 +229,21 @@ static void axis_stop_now(uint32_t index)
     pwm_apply(index, 0);
 }
 
+static int32_t blended_move_accel_pps_s(const StepperState *snapshot)
+{
+    int32_t accel1 = snapshot->axis[0].accel_pps_s;
+    int32_t accel2 = snapshot->axis[1].accel_pps_s;
+    int32_t accel = accel1 > accel2 ? accel1 : accel2;
+    return clamp_i32(accel, 1, APP_ACCEL_MAX);
+}
+
 void Stepper_Init(void)
 {
     GPIO_InitTypeDef gpio = {0};
+    timed_queue_clear();
     for (uint32_t i = 0; i < 2u; ++i) {
-        s_state.axis[i].enabled = false;
+        // 上电直接使能
+        s_state.axis[i].enabled = APP_STEPPER_ENABLE_ON_BOOT != 0u;
         s_state.axis[i].running = false;
         s_state.axis[i].dir = 1;
         s_state.axis[i].mode = STEPPER_MODE_IDLE;
@@ -156,20 +252,33 @@ void Stepper_Init(void)
         s_state.axis[i].exit_pps = 0;
         s_state.axis[i].accel_pps_s = APP_ACCEL_DEFAULT;
         s_state.axis[i].max_pps = APP_MAX_PPS_DEFAULT;
-        s_state.axis[i].position_pulse = 0;
-        s_state.axis[i].target_position_pulse = 0;
+        int64_t init_pulse = initial_pulse(i);
+        s_state.axis[i].position_pulse = init_pulse;
+        s_state.axis[i].target_position_pulse = init_pulse;
         s_state.axis[i].remaining_pulse = 0;
         s_state.axis[i].error = 0;
         s_hw[i].pulse_accum = 0;
         s_hw[i].accel_accum = 0;
         s_hw[i].applied_pps = 0;
+        gpio.Pin = s_hw[i].dir_pin;
+        gpio.Mode = GPIO_MODE_OUTPUT_OD;
+        gpio.Pull = GPIO_NOPULL;
+        gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(s_hw[i].dir_port, &gpio);
+        HAL_GPIO_WritePin(s_hw[i].dir_port, s_hw[i].dir_pin, dir_pin_state(i, s_state.axis[i].dir));
+        s_hw[i].step_port->BSRR = s_hw[i].step_pin;
         gpio.Pin = s_hw[i].step_pin;
         gpio.Mode = GPIO_MODE_OUTPUT_OD;
         gpio.Pull = GPIO_NOPULL;
         gpio.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(s_hw[i].step_port, &gpio);
-        HAL_GPIO_WritePin(s_hw[i].step_port, s_hw[i].step_pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin, GPIO_PIN_SET);
+        gpio.Pin = s_hw[i].ena_pin;
+        gpio.Mode = GPIO_MODE_OUTPUT_OD;
+        gpio.Pull = GPIO_NOPULL;
+        gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(s_hw[i].ena_port, &gpio);
+        HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin,
+                          ena_pin_state(s_state.axis[i].enabled));
     }
     memset(&s_move, 0, sizeof(s_move));
 }
@@ -182,9 +291,12 @@ void Stepper_Enable(StepperAxis axis, bool enable)
 
     uint32_t i = (uint32_t)axis;
     s_state.axis[i].enabled = enable;
-    HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin, enable ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin, ena_pin_state(enable));
     if (!enable) {
+        uint32_t primask = irq_save();
+        timed_queue_clear();
         axis_stop_now(i);
+        irq_restore(primask);
     }
 }
 
@@ -228,6 +340,19 @@ static bool target_in_range(int64_t target)
     const AppParams *p = AppParams_Get();
     return target >= p->motor_min_pos && target <= p->motor_max_pos;
 #endif
+}
+
+static int64_t reference_pulse(uint32_t index, int32_t theta_mrad)
+{
+    const AppParams *p = AppParams_Get();
+    int64_t scale = (int64_t)p->pulses_per_rev[index] * p->reducer_ratio[index];
+    int64_t delta = (int64_t)theta_mrad - p->motor_zero_mrad[index];
+    return (delta * p->motor_dir_sign[index] * scale) / 6283LL;
+}
+
+static int64_t initial_pulse(uint32_t index)
+{
+    return reference_pulse(index, index == 0u ? APP_HOME_AXIS1_VERTICAL_MRAD : APP_HOME_AXIS2_VERTICAL_MRAD);
 }
 
 static bool __attribute__((unused)) move_prepare(uint32_t index,
@@ -335,11 +460,11 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
         if (t_us > 0) {
             av1 = (int32_t)(((uint64_t)d1 * 1000000ull) / t_us);
             av2 = (int32_t)(((uint64_t)d2 * 1000000ull) / t_us);
-            if (av1 > 0 && av1 < APP_MIN_EFFECTIVE_PPS) {
-                av1 = APP_MIN_EFFECTIVE_PPS;
+            if (av1 > 0 && av1 < APP_INTERPOLATOR_MIN_PPS) {
+                av1 = APP_INTERPOLATOR_MIN_PPS;
             }
-            if (av2 > 0 && av2 < APP_MIN_EFFECTIVE_PPS) {
-                av2 = APP_MIN_EFFECTIVE_PPS;
+            if (av2 > 0 && av2 < APP_INTERPOLATOR_MIN_PPS) {
+                av2 = APP_INTERPOLATOR_MIN_PPS;
             }
         }
     }
@@ -352,10 +477,11 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
     if (dom_v <= 0) {
         dom_v = APP_MAX_PPS_DEFAULT;
     }
-    dom_v = clamp_i32(dom_v, APP_MIN_EFFECTIVE_PPS, APP_MAX_PPS_DEFAULT);
+    dom_v = clamp_i32(dom_v, APP_INTERPOLATOR_MIN_PPS, APP_MAX_PPS_DEFAULT);
 
     uint32_t primask = irq_save();
     s_move.active = true;
+    s_move.host_timed = false;
     s_move.step_event_count = events;
     s_move.remaining_events = events;
     s_move.steps[0] = (uint32_t)d1;
@@ -365,14 +491,14 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
     s_move.dir[0] = pos1 >= cur1 ? 1 : -1;
     s_move.dir[1] = pos2 >= cur2 ? 1 : -1;
     s_move.target_pps = dom_v;
-    if (s_move.current_pps < APP_MIN_EFFECTIVE_PPS) {
-        s_move.current_pps = APP_MIN_EFFECTIVE_PPS;
+    if (s_move.current_pps < APP_INTERPOLATOR_MIN_PPS) {
+        s_move.current_pps = APP_INTERPOLATOR_MIN_PPS;
     }
     s_move.exit_pps = abs(exit1) > abs(exit2) ? abs(exit1) : abs(exit2);
     if (s_move.exit_pps > dom_v) {
         s_move.exit_pps = dom_v;
     }
-    s_move.accel_pps_s = APP_ACCEL_DEFAULT;
+    s_move.accel_pps_s = blended_move_accel_pps_s(&snapshot);
     s_move.accel_accum = 0;
     s_move.event_accum = 0;
 
@@ -385,11 +511,146 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
         axis->target_pps = s_move.dir[i] > 0 ? av[i] : -av[i];
         axis->exit_pps = 0;
         axis->mode = axis->remaining_pulse > 0 ? STEPPER_MODE_MOVE : STEPPER_MODE_IDLE;
-        set_dir_index(i, s_move.dir[i]);
+        if (axis->remaining_pulse > 0) {
+            set_dir_index(i, s_move.dir[i]);
+        }
         pwm_apply(i, axis->target_pps);
     }
     irq_restore(primask);
     return true;
+}
+
+static bool __attribute__((optimize("Os"))) timed_move_start_locked(int64_t pos1,
+                                                                    int64_t pos2,
+                                                                    uint32_t duration_ticks)
+{
+    if (duration_ticks == 0u) {
+        return false;
+    }
+
+    int64_t cur1 = s_state.axis[0].position_pulse;
+    int64_t cur2 = s_state.axis[1].position_pulse;
+    int64_t d1 = i64_abs(pos1 - cur1);
+    int64_t d2 = i64_abs(pos2 - cur2);
+
+    if (s_state.axis[0].mode == STEPPER_MODE_ESTOP || s_state.axis[1].mode == STEPPER_MODE_ESTOP) {
+        s_state.axis[0].error |= STEPPER_ERR_ESTOP;
+        s_state.axis[1].error |= STEPPER_ERR_ESTOP;
+        return false;
+    }
+    if (!Stepper_TargetsAllowed(pos1, pos2)) {
+        s_state.axis[0].error |= STEPPER_ERR_SOFT_LIMIT;
+        s_state.axis[1].error |= STEPPER_ERR_SOFT_LIMIT;
+        return false;
+    }
+    for (uint32_t i = 0; i < 2u; ++i) {
+        if ((i == 0u ? d1 : d2) > 0 && !s_state.axis[i].enabled) {
+            s_state.axis[i].error |= STEPPER_ERR_DISABLED;
+            return false;
+        }
+    }
+
+    uint32_t events = (uint32_t)(d1 > d2 ? d1 : d2);
+    if (events == 0u) {
+        return true;
+    }
+    if (events > duration_ticks) {
+        s_state.axis[0].error |= STEPPER_ERR_INVALID_ARG;
+        s_state.axis[1].error |= STEPPER_ERR_INVALID_ARG;
+        return false;
+    }
+
+    s_move.active = true;
+    s_move.host_timed = true;
+    s_move.step_event_count = events;
+    s_move.remaining_events = events;
+    s_move.steps[0] = (uint32_t)d1;
+    s_move.steps[1] = (uint32_t)d2;
+    s_move.counter[0] = events >> 1;
+    s_move.counter[1] = events >> 1;
+    s_move.dir[0] = pos1 >= cur1 ? 1 : -1;
+    s_move.dir[1] = pos2 >= cur2 ? 1 : -1;
+    s_move.current_pps = (int32_t)(((uint64_t)events * APP_CONTROL_HZ + (duration_ticks / 2u)) / duration_ticks);
+    if (s_move.current_pps < APP_INTERPOLATOR_MIN_PPS) {
+        s_move.current_pps = APP_INTERPOLATOR_MIN_PPS;
+    }
+    s_move.target_pps = s_move.current_pps;
+    s_move.exit_pps = 0;
+    s_move.accel_pps_s = 0;
+    s_move.accel_accum = 0;
+    s_move.event_accum = 0;
+    s_move.duration_ticks = duration_ticks;
+    s_move.elapsed_ticks = 0;
+
+    int64_t targets[2] = {pos1, pos2};
+    for (uint32_t i = 0; i < 2u; ++i) {
+        StepperAxisState *axis = &s_state.axis[i];
+        axis->target_position_pulse = targets[i];
+        axis->remaining_pulse = i == 0u ? d1 : d2;
+        int32_t axis_pps = 0;
+        if (s_move.steps[i] > 0u) {
+            axis_pps = (int32_t)(((uint64_t)s_move.steps[i] * APP_CONTROL_HZ + (duration_ticks / 2u)) / duration_ticks);
+            if (axis_pps < APP_INTERPOLATOR_MIN_PPS) {
+                axis_pps = APP_INTERPOLATOR_MIN_PPS;
+            }
+        }
+        axis->target_pps = s_move.steps[i] > 0u ? (s_move.dir[i] * axis_pps) : 0;
+        axis->current_pps = axis->target_pps;
+        axis->exit_pps = 0;
+        axis->mode = axis->remaining_pulse > 0 ? STEPPER_MODE_MOVE : STEPPER_MODE_IDLE;
+        s_hw[i].pulse_accum = 0;
+        s_hw[i].accel_accum = 0;
+        if (s_move.steps[i] > 0u) {
+            set_dir_index(i, s_move.dir[i]);
+        }
+        pwm_apply(i, axis->current_pps);
+    }
+    return true;
+}
+
+bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks)
+{
+    if (duration_ticks == 0u) {
+        return false;
+    }
+
+    uint32_t primask = irq_save();
+    if (s_move.active) {
+        if (!s_move.host_timed || s_timed_count >= APP_STEPPER_TIMED_SEGMENTS) {
+            irq_restore(primask);
+            return false;
+        }
+        uint8_t last_index = s_timed_count > 0u
+                                 ? (s_timed_head == 0u ? APP_STEPPER_TIMED_SEGMENTS - 1u : s_timed_head - 1u)
+                                 : 0u;
+        int64_t base1 = s_timed_count > 0u ? s_timed_segments[last_index].pos1
+                                           : s_state.axis[0].target_position_pulse;
+        int64_t base2 = s_timed_count > 0u ? s_timed_segments[last_index].pos2
+                                           : s_state.axis[1].target_position_pulse;
+        uint64_t d1 = (uint64_t)i64_abs(pos1 - base1);
+        uint64_t d2 = (uint64_t)i64_abs(pos2 - base2);
+        uint64_t events = d1 > d2 ? d1 : d2;
+        if (events == 0u) {
+            irq_restore(primask);
+            return true;
+        }
+        if (events > duration_ticks || !target_in_range(pos1) || !target_in_range(pos2) ||
+            (d1 > 0u && !s_state.axis[0].enabled) || (d2 > 0u && !s_state.axis[1].enabled)) {
+            irq_restore(primask);
+            return false;
+        }
+        s_timed_segments[s_timed_head].pos1 = pos1;
+        s_timed_segments[s_timed_head].pos2 = pos2;
+        s_timed_segments[s_timed_head].duration_ticks = duration_ticks;
+        s_timed_head = timed_next_index(s_timed_head);
+        s_timed_count++;
+        irq_restore(primask);
+        return true;
+    }
+
+    bool started = timed_move_start_locked(pos1, pos2, duration_ticks);
+    irq_restore(primask);
+    return started;
 }
 
 void Stepper_Stop(StepperAxis axis)
@@ -406,16 +667,24 @@ void Stepper_Stop(StepperAxis axis)
 
 void Stepper_StopAll(void)
 {
+    uint32_t primask = irq_save();
+    timed_queue_clear();
+    s_move.active = false;
+    s_move.host_timed = false;
+    irq_restore(primask);
     Stepper_Stop(STEPPER_AXIS_1);
     Stepper_Stop(STEPPER_AXIS_2);
 }
 
 void Stepper_EStopAll(void)
 {
+    uint32_t primask = irq_save();
+    timed_queue_clear();
     for (uint32_t i = 0; i < 2u; ++i) {
         axis_stop_now(i);
         s_state.axis[i].mode = STEPPER_MODE_ESTOP;
     }
+    irq_restore(primask);
 }
 
 void Stepper_ClearError(void)
@@ -444,6 +713,7 @@ void Stepper_SetPosition(StepperAxis axis, int64_t position_pulse)
     uint32_t index = (uint32_t)axis;
     uint32_t primask = irq_save();
     s_move.active = false;
+    timed_queue_clear();
     s_state.axis[index].position_pulse = position_pulse;
     s_state.axis[index].target_position_pulse = position_pulse;
     s_state.axis[index].remaining_pulse = 0;
@@ -456,6 +726,7 @@ void Stepper_Zero(void)
 {
     uint32_t primask = irq_save();
     s_move.active = false;
+    timed_queue_clear();
     for (uint32_t i = 0; i < 2u; ++i) {
         s_state.axis[i].position_pulse = 0;
         s_state.axis[i].target_position_pulse = 0;
@@ -537,6 +808,7 @@ static void axis_tick(uint32_t index)
     while (s_hw[index].pulse_accum >= (int32_t)APP_CONTROL_HZ) {
         s_hw[index].pulse_accum -= (int32_t)APP_CONTROL_HZ;
         int8_t step_dir = axis->current_pps >= 0 ? 1 : -1;
+        emit_step(index);
         axis->position_pulse += step_dir;
         if (axis->mode == STEPPER_MODE_MOVE && axis->remaining_pulse > 0) {
             axis->remaining_pulse--;
@@ -556,7 +828,7 @@ static void axis_tick(uint32_t index)
     }
 }
 
-static void dda_tick(void)
+static void __attribute__((optimize("Os"))) dda_tick(void)
 {
     if (!s_move.active) {
         return;
@@ -569,6 +841,50 @@ static void dda_tick(void)
     if (!s_state.axis[1].enabled && s_move.steps[1] > 0u) {
         axis_stop_now(1);
         s_move.active = false;
+        return;
+    }
+
+    if (s_move.host_timed) {
+        s_move.elapsed_ticks++;
+        s_move.event_accum += s_move.step_event_count;
+        while (s_move.event_accum >= (int64_t)s_move.duration_ticks && s_move.remaining_events > 0u) {
+            s_move.event_accum -= (int64_t)s_move.duration_ticks;
+            for (uint32_t i = 0; i < 2u; ++i) {
+                if (s_move.steps[i] == 0u) {
+                    continue;
+                }
+                s_move.counter[i] += s_move.steps[i];
+                if (s_move.counter[i] >= s_move.step_event_count) {
+                    s_move.counter[i] -= s_move.step_event_count;
+                    emit_step(i);
+                    s_state.axis[i].position_pulse += s_move.dir[i];
+                    if (s_state.axis[i].remaining_pulse > 0) {
+                        s_state.axis[i].remaining_pulse--;
+                    }
+                }
+            }
+            s_move.remaining_events--;
+        }
+
+        if (s_move.elapsed_ticks >= s_move.duration_ticks || s_move.remaining_events == 0u) {
+            for (uint32_t i = 0; i < 2u; ++i) {
+                s_state.axis[i].position_pulse = s_state.axis[i].target_position_pulse;
+                s_state.axis[i].remaining_pulse = 0;
+                s_state.axis[i].mode = STEPPER_MODE_IDLE;
+                s_state.axis[i].target_pps = 0;
+                s_state.axis[i].current_pps = 0;
+                s_state.axis[i].exit_pps = 0;
+                pwm_apply(i, 0);
+            }
+            s_move.active = false;
+            s_move.host_timed = false;
+            s_move.current_pps = 0;
+            s_move.target_pps = 0;
+            StepperTimedSegment next;
+            if (timed_queue_pop(&next)) {
+                (void)timed_move_start_locked(next.pos1, next.pos2, next.duration_ticks);
+            }
+        }
         return;
     }
 
@@ -591,8 +907,8 @@ static void dda_tick(void)
         s_move.accel_accum = 0;
     }
 
-    if (s_move.remaining_events > 0u && s_move.current_pps < APP_MIN_EFFECTIVE_PPS) {
-        s_move.current_pps = APP_MIN_EFFECTIVE_PPS;
+    if (s_move.remaining_events > 0u && s_move.current_pps < APP_INTERPOLATOR_MIN_PPS) {
+        s_move.current_pps = APP_INTERPOLATOR_MIN_PPS;
     }
 
     int64_t stop_dist = 0;
@@ -600,8 +916,8 @@ static void dda_tick(void)
         stop_dist = (((int64_t)s_move.current_pps * s_move.current_pps) -
                      ((int64_t)s_move.exit_pps * s_move.exit_pps)) / (2 * s_move.accel_pps_s);
     }
-    if (s_move.current_pps > APP_MIN_EFFECTIVE_PPS && s_move.remaining_events <= (uint32_t)(stop_dist + 1)) {
-        s_move.target_pps = s_move.exit_pps > APP_MIN_EFFECTIVE_PPS ? s_move.exit_pps : APP_MIN_EFFECTIVE_PPS;
+    if (s_move.current_pps > APP_INTERPOLATOR_MIN_PPS && s_move.remaining_events <= (uint32_t)(stop_dist + 1)) {
+        s_move.target_pps = s_move.exit_pps > APP_INTERPOLATOR_MIN_PPS ? s_move.exit_pps : APP_INTERPOLATOR_MIN_PPS;
     }
 
     for (uint32_t i = 0; i < 2u; ++i) {
@@ -630,6 +946,7 @@ static void dda_tick(void)
     }
 
     if (s_move.remaining_events == 0u) {
+        int32_t completed_exit_pps = s_move.exit_pps;
         for (uint32_t i = 0; i < 2u; ++i) {
             s_state.axis[i].position_pulse = s_state.axis[i].target_position_pulse;
             s_state.axis[i].remaining_pulse = 0;
@@ -640,7 +957,7 @@ static void dda_tick(void)
             pwm_apply(i, 0);
         }
         s_move.active = false;
-        s_move.current_pps = 0;
+        s_move.current_pps = completed_exit_pps;
         s_move.target_pps = 0;
     }
 }
@@ -660,7 +977,7 @@ void Stepper_Tick10kHz(void)
 
 bool Stepper_IsBusy(void)
 {
-    if (s_move.active) {
+    if (s_move.active || s_timed_count > 0u) {
         return true;
     }
     for (uint32_t i = 0; i < 2u; ++i) {
@@ -688,6 +1005,24 @@ bool Stepper_CanAcceptMove(void)
         }
     }
     return true;
+}
+
+bool Stepper_CanQueueTimedSegment(void)
+{
+    if (s_move.active) {
+        return s_move.host_timed && s_timed_count < APP_STEPPER_TIMED_SEGMENTS;
+    }
+    return Stepper_CanAcceptMove();
+}
+
+uint8_t Stepper_TimedSegmentCount(void)
+{
+    return s_timed_count;
+}
+
+uint8_t Stepper_TimedSegmentFree(void)
+{
+    return (uint8_t)(APP_STEPPER_TIMED_SEGMENTS - s_timed_count);
 }
 
 bool Stepper_TargetsAllowed(int64_t pos1, int64_t pos2)

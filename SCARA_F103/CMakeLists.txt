@@ -58,6 +58,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     UserApp/stepper_driver.c
 )
 
+set_source_files_properties(
+    UserApp/binary_traj.c
+    UserApp/gcode_stream.c
+    PROPERTIES COMPILE_OPTIONS "-Os"
+)
+
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths

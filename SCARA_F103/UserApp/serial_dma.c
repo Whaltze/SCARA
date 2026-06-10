@@ -245,6 +245,11 @@ uint32_t SerialDma_RxFreeCount(void)
     return (uint32_t)(APP_SERIAL_LINE_QUEUE_DEPTH - s_line_count);
 }
 
+uint32_t SerialDma_RxFreeBytes(void)
+{
+    return SerialDma_RxFreeCount() * APP_SERIAL_LINE_SIZE;
+}
+
 uint32_t SerialDma_TxDropCount(void)
 {
     return s_tx_drop_count;

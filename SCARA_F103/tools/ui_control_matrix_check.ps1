@@ -16,7 +16,9 @@ $BaseMm = 150.0
 $ActiveMm = 160.0
 $PassiveMm = 200.0
 $HomeX = 75.0
-$HomeY = 220.0
+$HomeY = 345.3
+$SafeControlX = 75.0
+$SafeControlY = 220.0
 $JogMm = 10.0
 $MotorJogDeg = 3.0
 
@@ -222,8 +224,9 @@ try {
     Send-Expect -Serial $serial -Line "ENABLE 1" -AcceptPrefixes @("OK ENABLE 1") -Name "使能"
     Send-Expect -Serial $serial -Line "ZERO" -AcceptPrefixes @("OK ZERO") -Name "系统一键复位/软件零点"
 
-    $x = $HomeX
-    $y = $HomeY
+    Send-UiMove -Serial $serial -Name "启动位到安全操作点" -UiX $SafeControlX -UiY $SafeControlY -Id 0
+    $x = $SafeControlX
+    $y = $SafeControlY
     Send-UiMove -Serial $serial -Name "前进点动" -UiX $x -UiY ($y + $JogMm) -Id 1
     $y += $JogMm
     Send-UiMove -Serial $serial -Name "后退点动" -UiX $x -UiY ($y - $JogMm) -Id 2

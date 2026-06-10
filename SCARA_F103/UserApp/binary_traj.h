@@ -23,6 +23,7 @@ uint16_t BinaryTraj_BufferCount(void);
 uint32_t BinaryTraj_AcceptedCount(void);
 uint32_t BinaryTraj_ExecutedCount(void);
 uint32_t BinaryTraj_StreamUnderrunTicks(void);
+uint32_t BinaryTraj_StreamUnderrunCount(void);
 uint32_t BinaryTraj_MaxDispatchGapTicks(void);
 uint16_t BinaryTraj_MinBufferCount(void);
 BinaryTrajState BinaryTraj_GetState(void);

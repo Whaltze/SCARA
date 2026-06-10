@@ -35,7 +35,7 @@ class FiveBarSerialGUI(
         self.A, self.B = np.array([0, 0]), np.array([self.L0, 0])
         self.HOME_X, self.HOME_Y = 75.0, 220.0
 
-        self.accel = 100.0
+        self.accel = 10.0
         self.junction_dev = 0.02
         self.dt = 0.02
 
@@ -57,8 +57,12 @@ class FiveBarSerialGUI(
         self.cam_proc = CameraProcessor()
         self.coord_proc = CoordinateProcessor()
 
-        self.cur_x, self.cur_y = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
-        self.HOME_X, self.HOME_Y = self.cur_x, self.cur_y
+        home_90 = self.kinematics.forward(90.0, 90.0)
+        if home_90[0] is not None and home_90[1] is not None:
+            self.HOME_X, self.HOME_Y = float(home_90[0]), float(home_90[1])
+        else:
+            self.HOME_X, self.HOME_Y = self.kinematics.find_safe_home((self.HOME_X, self.HOME_Y))
+        self.cur_x, self.cur_y = self.HOME_X, self.HOME_Y
         self.history_x, self.history_y = [self.cur_x], [self.cur_y]
         self.feedback_x, self.feedback_y = [], []
         self.preview_x, self.preview_y = [], []
@@ -87,20 +91,26 @@ class FiveBarSerialGUI(
         self.heartbeat_count = 0
         self.ack_timeout_count = 0
         self.mcu_planner_free = 32
+        self.planner_free_hint = 32
+        self.planner_free_min = 32
+        self.rx_free_hint = 256
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
         self.binary_seq = 1
+        self.binary_motion_active = False
+        self.controller_capabilities = None
+        self.host_timed_segment_mode = False
         self.emergency_paused = False
         self.emergency_resume_path = []
         self.active_binary_send_path = []
         self.active_preview_path = []
 
         # 如果接了真实电机和 HOME 开关，应该改成：
-        # self.board_only_debug = False
-        # self.is_homed = False
+        self.board_only_debug = False
+        self.is_homed = False
 
-        self.board_only_debug = True
-        self.is_homed = self.board_only_debug
+        # self.board_only_debug = True
+        # self.is_homed = self.board_only_debug
 
 
         self.home_sensor_triggered = False

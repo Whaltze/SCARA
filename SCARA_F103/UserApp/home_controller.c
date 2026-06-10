@@ -22,6 +22,10 @@ static uint16_t s_debounce_ms;
 static uint8_t s_error;
 static uint8_t s_move_started;
 static bool s_simulated;
+static int32_t s_saved_accel_pps_s[2];
+static bool s_accel_saved;
+static int64_t s_latched_switch_pulse[2];
+static bool s_switch_latched[2];
 
 static int32_t axis_search_pps(uint32_t axis)
 {
@@ -46,7 +50,10 @@ static int64_t axis_horizontal_pulse(uint32_t axis)
 {
     return axis_reference_pulse(axis, axis == 0u ? APP_HOME_AXIS1_HORIZONTAL_MRAD : APP_HOME_AXIS2_HORIZONTAL_MRAD);
 }
-
+static int64_t axis_switch_pulse(uint32_t axis)
+{
+    return axis_reference_pulse(axis, axis == 0u ? APP_HOME_AXIS1_SWITCH_MRAD : APP_HOME_AXIS2_SWITCH_MRAD);
+}
 static int64_t axis_vertical_pulse(uint32_t axis)
 {
     return axis_reference_pulse(axis, axis == 0u ? APP_HOME_AXIS1_VERTICAL_MRAD : APP_HOME_AXIS2_VERTICAL_MRAD);
@@ -93,6 +100,43 @@ static bool start_axis_move_to(uint32_t axis, int64_t target)
     return Stepper_MoveAbs(p1, p2, APP_HOME_SEARCH_PPS, APP_HOME_SEARCH_PPS);
 }
 
+static void save_motion_accel(void)
+{
+    StepperState stepper;
+    Stepper_GetStateSnapshot(&stepper);
+    s_saved_accel_pps_s[0] = stepper.axis[0].accel_pps_s;
+    s_saved_accel_pps_s[1] = stepper.axis[1].accel_pps_s;
+    s_accel_saved = true;
+}
+
+static void restore_motion_accel(void)
+{
+    if (!s_accel_saved) {
+        return;
+    }
+    Stepper_SetAccel(STEPPER_AXIS_1, s_saved_accel_pps_s[0]);
+    Stepper_SetAccel(STEPPER_AXIS_2, s_saved_accel_pps_s[1]);
+    s_accel_saved = false;
+}
+
+static void latch_switch_reference(uint32_t axis)
+{
+    if (axis >= 2u) {
+        return;
+    }
+    s_latched_switch_pulse[axis] = axis_switch_pulse(axis);
+    s_switch_latched[axis] = true;
+}
+
+static void apply_latched_switch_reference(uint32_t axis)
+{
+    if (axis >= 2u || !s_switch_latched[axis]) {
+        return;
+    }
+    Stepper_SetPosition(axis == 0u ? STEPPER_AXIS_1 : STEPPER_AXIS_2, s_latched_switch_pulse[axis]);
+    s_switch_latched[axis] = false;
+}
+
 void HomeController_Init(void)
 {
     s_state = HOME_CTRL_IDLE;
@@ -101,6 +145,9 @@ void HomeController_Init(void)
     s_error = HOME_ERR_NONE;
     s_move_started = 0;
     s_simulated = false;
+    s_accel_saved = false;
+    s_switch_latched[0] = false;
+    s_switch_latched[1] = false;
 }
 
 bool HomeController_Start(bool simulated)
@@ -117,7 +164,15 @@ bool HomeController_Start(bool simulated)
     }
     Stepper_ClearError();
     Stepper_EnableAll(true);
+    save_motion_accel();
+
+    /* 回零搜索和触发后减速停止使用专用加速度 */
+    Stepper_SetAccel(STEPPER_AXIS_1, APP_HOME_ACCEL_PPS_S);
+    Stepper_SetAccel(STEPPER_AXIS_2, APP_HOME_ACCEL_PPS_S);
+    
     s_simulated = simulated;
+    s_switch_latched[0] = false;
+    s_switch_latched[1] = false;
     if (!s_simulated) {
         Stepper_SetPps(STEPPER_AXIS_1, axis_search_pps(0));
     }
@@ -129,6 +184,7 @@ bool HomeController_Start(bool simulated)
 void HomeController_Stop(void)
 {
     Stepper_StopAll();
+    restore_motion_accel();
     if (s_state != HOME_CTRL_IDLE && s_state != HOME_CTRL_DONE) {
         enter_state(HOME_CTRL_ERROR);
         s_error = HOME_ERR_MOVE;
@@ -151,6 +207,7 @@ void HomeController_Loop(void)
 
     if (s_elapsed_ms > APP_HOME_TIMEOUT_MS) {
         Stepper_StopAll();
+        restore_motion_accel();
         enter_state(HOME_CTRL_ERROR);
         s_error = HOME_ERR_TIMEOUT;
         return;
@@ -159,22 +216,27 @@ void HomeController_Loop(void)
     if (s_state == HOME_CTRL_AXIS1_SEARCH) {
         if (s_simulated && !s_move_started && Stepper_CanAcceptMove()) {
             if (!start_axis_move_to(0, axis_horizontal_pulse(0))) {
+                restore_motion_accel();
                 enter_state(HOME_CTRL_ERROR);
                 s_error = HOME_ERR_MOVE;
                 return;
             }
             s_move_started = 1;
         } else if ((s_simulated && s_move_started && Stepper_CanAcceptMove()) ||
-                   (!s_simulated && debounce_axis(0))) {
+                (!s_simulated && debounce_axis(0))) {
+            if (!s_simulated) {
+                latch_switch_reference(0);
+            }
             Stepper_Stop(STEPPER_AXIS_1);
             enter_state(HOME_CTRL_AXIS1_RETURN);
         }
     } else if (s_state == HOME_CTRL_AXIS1_RETURN) {
         if (!s_move_started && Stepper_CanAcceptMove()) {
             if (!s_simulated) {
-                Stepper_SetPosition(STEPPER_AXIS_1, axis_horizontal_pulse(0));
+                apply_latched_switch_reference(0);
             }
             if (!start_axis_move_to(0, axis_vertical_pulse(0))) {
+                restore_motion_accel();
                 enter_state(HOME_CTRL_ERROR);
                 s_error = HOME_ERR_MOVE;
                 return;
@@ -191,28 +253,34 @@ void HomeController_Loop(void)
     } else if (s_state == HOME_CTRL_AXIS2_SEARCH) {
         if (s_simulated && !s_move_started && Stepper_CanAcceptMove()) {
             if (!start_axis_move_to(1, axis_horizontal_pulse(1))) {
+                restore_motion_accel();
                 enter_state(HOME_CTRL_ERROR);
                 s_error = HOME_ERR_MOVE;
                 return;
             }
             s_move_started = 1;
         } else if ((s_simulated && s_move_started && Stepper_CanAcceptMove()) ||
-                   (!s_simulated && debounce_axis(1))) {
+                (!s_simulated && debounce_axis(1))) {
+            if (!s_simulated) {
+                latch_switch_reference(1);
+            }
             Stepper_Stop(STEPPER_AXIS_2);
             enter_state(HOME_CTRL_AXIS2_RETURN);
         }
     } else if (s_state == HOME_CTRL_AXIS2_RETURN) {
         if (!s_move_started && Stepper_CanAcceptMove()) {
             if (!s_simulated) {
-                Stepper_SetPosition(STEPPER_AXIS_2, axis_horizontal_pulse(1));
+                apply_latched_switch_reference(1);
             }
             if (!start_axis_move_to(1, axis_vertical_pulse(1))) {
+                restore_motion_accel();
                 enter_state(HOME_CTRL_ERROR);
                 s_error = HOME_ERR_MOVE;
                 return;
             }
             s_move_started = 1;
         } else if (s_move_started && Stepper_CanAcceptMove()) {
+            restore_motion_accel();
             enter_state(HOME_CTRL_DONE);
         }
     }

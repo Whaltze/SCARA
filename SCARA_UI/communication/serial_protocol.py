@@ -31,11 +31,20 @@ def build_g1_line(x: float, y: float, feed_mm_min: float, point_id: int, limit_c
     return f"G1 X{x:.3f} Y{y:.3f} F{feed_mm_min:.0f} ;ID={point_id} LIM={lim}"
 
 
+def build_g1_timed_line(p1_abs: int, p2_abs: int, duration_ticks: int, point_id: int = 0) -> str:
+    """Build a host-planned joint timed segment."""
+    p1_abs = int(p1_abs)
+    p2_abs = int(p2_abs)
+    duration_ticks = int(duration_ticks)
+    suffix = f" ;ID={int(point_id)} HOST=1" if point_id else " ;HOST=1"
+    return f"G1 A{p1_abs} B{p2_abs} T{duration_ticks}{suffix}"
+
+
 def build_ppr_line(ppr1: int, ppr2: int = None) -> str:
     """Build the firmware command that matches the UI pulses/rev selection."""
     ppr1 = int(ppr1)
     ppr2 = ppr1 if ppr2 is None else int(ppr2)
-    return f"PPR {ppr1} {ppr2}"
+    return f"$100={ppr1} $101={ppr2}"
 
 
 def parse_ok_ack(raw: str, expected_line: str) -> AckResult:

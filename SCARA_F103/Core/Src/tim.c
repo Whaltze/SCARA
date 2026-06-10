@@ -247,6 +247,7 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
     /**TIM1 GPIO Configuration
     PA8     ------> TIM1_CH1
     */
+    M1_PUL_GPIO_Port->BSRR = M1_PUL_Pin;
     GPIO_InitStruct.Pin = M1_PUL_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
@@ -266,6 +267,7 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
     /**TIM4 GPIO Configuration
     PB6     ------> TIM4_CH1
     */
+    M2_PUL_GPIO_Port->BSRR = M2_PUL_Pin;
     GPIO_InitStruct.Pin = M2_PUL_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;

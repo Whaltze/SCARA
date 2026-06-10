@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QScrollArea,
+    QCheckBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -148,15 +149,33 @@ class ScaraUiMixin:
         hw_layout.addWidget(QLabel("脉冲/圈(需与驱动拨码一致):"), 0, 0)
         self.microstep_combo = QComboBox()
         self.microstep_combo.addItems(["400", "1600", "3200", "6400"])
+        self.microstep_combo.setEditable(True)
         # 默认 3200PPR：用于降低脉冲量化误差。若驱动器拨码不是 3200，必须同步修改。
         self.microstep_combo.setCurrentText("3200")
         self.microstep_combo.setFixedSize(box_w, box_h)
-        self.microstep_combo.currentTextChanged.connect(self.on_microstep_changed)
+        self.microstep_combo.activated.connect(lambda *_: self.on_microstep_changed())
+        if self.microstep_combo.lineEdit() is not None:
+            self.microstep_combo.lineEdit().editingFinished.connect(self.on_microstep_changed)
         hw_layout.addWidget(self.microstep_combo, 0, 1, Qt.AlignLeft)
         hw_layout.addWidget(QLabel("运行速度(mm/s):"), 1, 0)
         self.hw_speed_input = QLineEdit("20.0")
         self.hw_speed_input.setFixedSize(box_w, box_h)
         hw_layout.addWidget(self.hw_speed_input, 1, 1, Qt.AlignLeft)
+        hw_layout.addWidget(QLabel("运行加速度(mm/s²):"), 2, 0)
+        self.hw_accel_input = QLineEdit("100.0")
+        self.hw_accel_input.setFixedSize(box_w, box_h)
+        hw_layout.addWidget(self.hw_accel_input, 2, 1, Qt.AlignLeft)
+        self.jog_pps_label = QLabel("目标PPS --  峰值PPS --  周期 --")
+        self.jog_pps_label.setStyleSheet("color: #aaaaaa;")
+        hw_layout.addWidget(self.jog_pps_label, 3, 0, 1, 2)
+        self.hw_speed_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
+        self.hw_accel_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
+        self.host_timed_mode_toggle = QCheckBox("文本 G1 A/B/T 实验模式")
+        self.host_timed_mode_toggle.setChecked(bool(getattr(self, "host_timed_segment_mode", False)))
+        self.host_timed_mode_toggle.toggled.connect(
+            lambda checked: setattr(self, "host_timed_segment_mode", bool(checked))
+        )
+        hw_layout.addWidget(self.host_timed_mode_toggle, 4, 0, 1, 2)
         hw_group.setLayout(hw_layout)
         left_panel.addWidget(hw_group)
 
@@ -189,25 +208,26 @@ class ScaraUiMixin:
         jog_grid.addWidget(self.btns["LEFT"], 1, 0)
         jog_grid.addWidget(self.btns["RIGHT"], 1, 2)
         jog_grid.addWidget(self.btns["DOWN"], 2, 1)
-        self.jog_speed_input = QLineEdit("30.0")
-        # 点动速度单位 mm/s。点动抖动时先降低速度，再检查 PPR 和 BINARY_LINE_TOLERANCE_MM。
-        self.jog_speed_input.setFixedSize(82, 24)
-        self.jog_speed_input.setAlignment(Qt.AlignCenter)
-        jog_grid.addWidget(self.jog_speed_input, 1, 1)
+        self.jog_step_input = QLineEdit("10.0")
+        self.jog_step_input.setFixedSize(82, 24)
+        self.jog_step_input.setAlignment(Qt.AlignCenter)
+        self.jog_step_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
+        jog_grid.addWidget(self.jog_step_input, 1, 1)
         jog_group.setLayout(jog_grid)
         left_panel.addWidget(jog_group)
         
         # 方向点动连接
-        self.btns["UP"].clicked.connect(lambda: self.add_jog(0, 10))
-        self.btns["DOWN"].clicked.connect(lambda: self.add_jog(0, -10))
-        self.btns["LEFT"].clicked.connect(lambda: self.add_jog(-10, 0))
-        self.btns["RIGHT"].clicked.connect(lambda: self.add_jog(10, 0))
+        self.btns["UP"].clicked.connect(lambda: self.add_jog_step(0, 1))
+        self.btns["DOWN"].clicked.connect(lambda: self.add_jog_step(0, -1))
+        self.btns["LEFT"].clicked.connect(lambda: self.add_jog_step(-1, 0))
+        self.btns["RIGHT"].clicked.connect(lambda: self.add_jog_step(1, 0))
         
         # 电机单独控制连接（半步/半圈旋转）
-        self.motor_btns["M1_POS"].clicked.connect(lambda: self.motor_jog(1, 1))   # 电机1正向
-        self.motor_btns["M1_NEG"].clicked.connect(lambda: self.motor_jog(1, -1))  # 电机1逆向
-        self.motor_btns["M2_POS"].clicked.connect(lambda: self.motor_jog(2, 1))   # 电机2正向
-        self.motor_btns["M2_NEG"].clicked.connect(lambda: self.motor_jog(2, -1))  # 电机2逆向
+        self.motor_btns["M1_POS"].clicked.connect(lambda: self.motor_jog_direct(1, 1))   # 电机1正向
+        self.motor_btns["M1_NEG"].clicked.connect(lambda: self.motor_jog_direct(1, -1))  # 电机1逆向
+        self.motor_btns["M2_POS"].clicked.connect(lambda: self.motor_jog_direct(2, 1))   # 电机2正向
+        self.motor_btns["M2_NEG"].clicked.connect(lambda: self.motor_jog_direct(2, -1))  # 电机2逆向
+        self.update_jog_pps_preview()
 
         # 4. 轨迹规划
         interp_group = QGroupBox("轨迹规划")
@@ -367,7 +387,8 @@ class ScaraUiMixin:
         self.lbl_mcu_queue = QLabel("队列负载(Q): 0")
         self.lbl_mcu_interp = QLabel("插补: --  已执行 0/0  队列 0")
         self.lbl_mcu_hz = QLabel("控制频率: -- Hz")
-        for label in (self.lbl_mcu_err, self.lbl_mcu_tick, self.lbl_mcu_gbuf, self.lbl_mcu_queue, self.lbl_mcu_interp, self.lbl_mcu_hz):
+        self.lbl_sender_mode = QLabel("Sender: idle")
+        for label in (self.lbl_mcu_err, self.lbl_mcu_tick, self.lbl_mcu_gbuf, self.lbl_mcu_queue, self.lbl_mcu_interp, self.lbl_mcu_hz, self.lbl_sender_mode):
             label.setWordWrap(True)
             label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.lbl_mcu_err.setStyleSheet("font-weight: bold; color: #e06c75;")
@@ -376,12 +397,14 @@ class ScaraUiMixin:
         self.lbl_mcu_queue.setStyleSheet("color: #d19a66;")
         self.lbl_mcu_interp.setStyleSheet("color: #c678dd;")
         self.lbl_mcu_hz.setStyleSheet("color: #56b6c2;")
+        self.lbl_sender_mode.setStyleSheet("color: #e5c07b;")
         mcu_status_lay.addWidget(self.lbl_mcu_err, 0, 0)
         mcu_status_lay.addWidget(self.lbl_mcu_tick, 0, 1)
         mcu_status_lay.addWidget(self.lbl_mcu_gbuf, 1, 0)
         mcu_status_lay.addWidget(self.lbl_mcu_queue, 1, 1)
         mcu_status_lay.addWidget(self.lbl_mcu_interp, 2, 0)
         mcu_status_lay.addWidget(self.lbl_mcu_hz, 2, 1)
+        mcu_status_lay.addWidget(self.lbl_sender_mode, 3, 0, 1, 2)
         mcu_status_group.setLayout(mcu_status_lay)
         mid_panel.addWidget(mcu_status_group)
         

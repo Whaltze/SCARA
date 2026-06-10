@@ -2,6 +2,25 @@ import math
 import numpy as np
 
 
+class HostTimedSegment:
+    def __init__(self, p1_abs, p2_abs, duration_ticks, flags=0):
+        self.p1_abs = int(p1_abs)
+        self.p2_abs = int(p2_abs)
+        self.duration_ticks = int(duration_ticks)
+        self.flags = int(flags)
+
+
+class HostTimedBinaryPoint:
+    def __init__(self, segment, host_flag, exact_stop_flag):
+        ticks = int(segment.duration_ticks)
+        if ticks < 1 or ticks > 65535:
+            raise ValueError(f"invalid host segment ticks: {ticks}")
+        self.p1_abs = int(segment.p1_abs)
+        self.p2_abs = int(segment.p2_abs)
+        self.v_dom_pps = ticks
+        self.flags = int(host_flag) | (int(getattr(segment, "flags", 0)) & int(exact_stop_flag))
+
+
 class ScaraMotionMixin:
     JOINT_LIMITS_DEG = ((-180.0, 180.0), (0.0, 360.0))
     # 轨迹精度参数说明：
@@ -11,6 +30,7 @@ class ScaraMotionMixin:
     # - DEFAULT/CAR_CORNER_RADIUS_MM：默认设为 0，表示所有折线必须到达原始转折点，不提前圆角切入。
     ARC_SEGMENT_MM = 2.0
     BINARY_ARC_SEGMENT_MM = 0.75
+    BINARY_GEOMETRY_ARC_SEGMENT_MM = 0.35
     BINARY_LINE_TOLERANCE_MM = 0.45
     BINARY_LINE_MAX_SEGMENT_MM = 10.0
     BINARY_PATH_SIMPLIFY_TOLERANCE_MM = 0.08
@@ -23,8 +43,31 @@ class ScaraMotionMixin:
     TEXT_SIMPLIFY_TOLERANCE_MM = 0.06
     TEXT_MIN_POINT_SPACING_MM = 0.16
     TEXT_CORNER_RADIUS_MM = 0.0
+    DRAW_CENTER_X = 75.0
+    DRAW_CENTER_Y = 220.0
     BINARY_FLAG_EXACT_STOP = 0x0001
     BINARY_FLAG_CARTESIAN_LINE = 0x0002
+    BINARY_FLAG_HOST_SEGMENT = 0x0004
+    HOST_DDA_HZ = 10000
+    HOST_DDA_MAX_PPS = 10000
+    HOST_TRAJECTORY_SLICE_TICKS = 100
+    HOST_MIN_SMOOTH_PPS = 50.0
+    HOST_DEFAULT_ACCEL_MM_S2 = 100.0
+
+    def _read_jog_step_mm(self):
+        widget = getattr(self, "jog_step_input", None)
+        if widget is None:
+            widget = getattr(self, "jog_speed_input", None)
+        return self._read_float(widget, "点动步长", positive=True)
+
+    def _read_run_speed_mm_s(self):
+        return self._read_float(self.hw_speed_input, "运行速度", positive=True)
+
+    def _read_run_accel_mm_s2(self):
+        widget = getattr(self, "hw_accel_input", None)
+        if widget is None:
+            return self.HOST_DEFAULT_ACCEL_MM_S2
+        return self._read_float(widget, "运行加速度", positive=True)
 
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
@@ -243,7 +286,7 @@ class ScaraMotionMixin:
             if math.hypot(cursor[0] - segment.start[0], cursor[1] - segment.start[1]) > 0.01:
                 targets.extend(self.generate_binary_line_targets(cursor, segment.start, speed_max, silent=True))
             if segment.kind == "arc":
-                count = max(2, int(math.ceil(segment.length / self.BINARY_ARC_SEGMENT_MM)))
+                count = max(2, int(math.ceil(segment.length / self.BINARY_GEOMETRY_ARC_SEGMENT_MM)))
                 points = [segment.point_at(segment.length * i / count) for i in range(1, count + 1)]
                 append_points(points, exact_last=True)
             else:
@@ -503,7 +546,7 @@ class ScaraMotionMixin:
         if not self.validate_trajectory_points(keypoints, "二进制直线关键点"):
             return []
         feed_mm_min = float(speed_max) * 60.0
-        flags = self.BINARY_FLAG_EXACT_STOP | self.BINARY_FLAG_CARTESIAN_LINE
+        flags = self.BINARY_FLAG_CARTESIAN_LINE | self.BINARY_FLAG_EXACT_STOP
         return [(float(x), float(y), feed_mm_min, silent, flags) for x, y in keypoints]
 
     def start_recording(self):
@@ -820,8 +863,8 @@ class ScaraMotionMixin:
         robot_strokes = []
         width_mm = 120.0
         height_mm = 85.0
-        left = self.HOME_X - width_mm * 0.5
-        bottom = self.HOME_Y - height_mm * 0.5
+        left = self.DRAW_CENTER_X - width_mm * 0.5
+        bottom = self.DRAW_CENTER_Y - height_mm * 0.5
         for stroke in strokes:
             converted = []
             for x_norm, y_norm in stroke:
@@ -937,8 +980,8 @@ class ScaraMotionMixin:
         scale = min(float(max_width_mm) / text_w, target_h / text_h)
         out_w = text_w * scale
         out_h = text_h * scale
-        left = self.HOME_X - out_w * 0.5
-        bottom = self.HOME_Y - out_h * 0.5
+        left = self.DRAW_CENTER_X - out_w * 0.5
+        bottom = self.DRAW_CENTER_Y - out_h * 0.5
 
         strokes = []
         for item in sorted(raw_items, key=lambda value: (value["line"], value["char"])):
@@ -1071,9 +1114,9 @@ class ScaraMotionMixin:
             "<font color='cyan'>启动仿真回零：UI 不播放本地动画，只显示下位机 HOME_SIM 回传轨迹。</font>"
         )
 
-        self.send_ascii_line("CLEAR_ERROR", "HOME_SIM_PREP")
-        self.send_ascii_line("ENABLE 1", "HOME_SIM_PREP")
-        self.send_ascii_line("HOME_SIM", "HOME_SIM")
+        self.send_ascii_line("$X", "HOME_SIM_PREP")
+        self.send_ascii_line("M17", "HOME_SIM_PREP")
+        self.send_ascii_line("$H S", "HOME_SIM")
 
     def system_reset_real(self):
         """实机回零：真实 HOME 开关，UI 只跟随下位机 M:x,y 回传。"""
@@ -1110,9 +1153,9 @@ class ScaraMotionMixin:
             "<font color='cyan'>启动实机回零：UI 只显示下位机 HOME_REAL 回传轨迹。</font>"
         )
 
-        self.send_ascii_line("CLEAR_ERROR", "HOME_REAL_PREP")
-        self.send_ascii_line("ENABLE 1", "HOME_REAL_PREP")
-        self.send_ascii_line("HOME_REAL", "HOME_REAL")
+        self.send_ascii_line("$X", "HOME_REAL_PREP")
+        self.send_ascii_line("M17", "HOME_REAL_PREP")
+        self.send_ascii_line("$H", "HOME_REAL")
 
     def system_reset(self, simulated=None): 
         if simulated is None:
@@ -1132,7 +1175,7 @@ class ScaraMotionMixin:
             self.log_display.append(
                 "<font color='yellow'>BOARD_ONLY_DEBUG: 未接 HOME 开关，跳过真实 $H，发送 ZERO 作为软件零点。</font>"
             )
-            self.send_ascii_line("ZERO", "SOFT_ZERO")
+            self.send_ascii_line("G92 A0 B0", "SOFT_ZERO")
             return
         if self.ser and self.ser.is_open:
             ts = self.get_timestamp(); cmd = "$H S" if simulated else "$H"; self.is_homed = False
@@ -1144,8 +1187,15 @@ class ScaraMotionMixin:
     def stop_motion(self):
         if hasattr(self, "_stop_binary_stream"):
             self._stop_binary_stream()
+        if hasattr(self, "_finish_binary_motion"):
+            self._finish_binary_motion("Stopped")
+        else:
+            self.binary_motion_active = False
         self.point_queue = []
-        self.waiting_for_ack = False
+        if hasattr(self, "_clear_text_sender_state"):
+            self._clear_text_sender_state()
+        else:
+            self.waiting_for_ack = False
         self.stream_waiting_buffer = False
         self.last_sent_motion = None
         self.emergency_resume_path = []
@@ -1168,13 +1218,14 @@ class ScaraMotionMixin:
             self._resume_emergency_motion()
             return
 
-        if hasattr(self, "_stop_binary_stream"):
-            self._stop_binary_stream()
         if self.last_sent_motion is not None:
             self.point_queue.insert(0, self.last_sent_motion)
             self.last_sent_motion = None
             self.sent_point_id = max(0, self.sent_point_id - 1)
         self.emergency_resume_path = self._capture_emergency_resume_path()
+        if hasattr(self, "_stop_binary_stream"):
+            self._stop_binary_stream()
+        self.binary_motion_active = False
         self.waiting_for_ack = False
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
@@ -1187,7 +1238,7 @@ class ScaraMotionMixin:
             f"<font color='#e74c3c'>TX {ts} ESTOP (pause and keep remaining queue)</font>"
         )
         if self.ser and self.ser.is_open:
-            self.ser.write(b"ESTOP\n")
+            self.ser.write(b"M112\n")
 
     def _capture_emergency_resume_path(self):
         if getattr(self, "point_queue", None):
@@ -1213,8 +1264,8 @@ class ScaraMotionMixin:
             self._set_emergency_button_paused(False)
         self.motion_preamble_needed = True
         if self.ser and self.ser.is_open:
-            self.ser.write(b"CLEAR_ERROR\n")
-            self.ser.write(b"ENABLE 1\n")
+            self.ser.write(b"$X\n")
+            self.ser.write(b"M17\n")
         if not remaining:
             self.log_display.append("<font color='orange'>RESUME: no remaining motion queue.</font>")
             return
@@ -1235,16 +1286,494 @@ class ScaraMotionMixin:
             button.setText("急停 (保留队列)")
             button.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
 
+    def _binary_host_segment_class(self):
+        return HostTimedSegment
+
+    def _joint_deg_to_pulse(self, q1, q2):
+        p1, p2 = self._joint_deg_to_pulse_float(q1, q2)
+        return int(round(p1)), int(round(p2))
+
+    def _joint_deg_to_pulse_float(self, q1, q2):
+        ppr = float(int(getattr(self, "current_ppr", 3200) or 3200))
+        theta1_mrad = math.radians(float(q1)) * 1000.0
+        theta2_mrad = math.radians(float(q2)) * 1000.0
+        p1 = ((theta1_mrad - float(self.BINARY_ZERO_MRAD[0])) * ppr) / float(self.BINARY_MRAD_PER_REV)
+        p2 = ((theta2_mrad - float(self.BINARY_ZERO_MRAD[1])) * ppr) / float(self.BINARY_MRAD_PER_REV)
+        return p1, p2
+
+    def _current_feedback_pulses(self):
+        p1 = getattr(self, "feedback_p1", None)
+        p2 = getattr(self, "feedback_p2", None)
+        if p1 is not None and p2 is not None:
+            return int(p1), int(p2)
+        q1, q2 = self.inverse_kinematics(float(self.cur_x), float(self.cur_y))
+        if q1 is None or q2 is None:
+            raise ValueError("Current pose has no valid IK; cannot plan host segments.")
+        return self._joint_deg_to_pulse(q1, q2)
+
+    def _trapezoid_distance_at(self, distance, vmax, accel, t):
+        distance = max(0.0, float(distance))
+        vmax = max(1e-6, float(vmax))
+        accel = max(1e-6, float(accel))
+        t_accel = vmax / accel
+        d_accel = 0.5 * accel * t_accel * t_accel
+        if 2.0 * d_accel >= distance:
+            t_accel = math.sqrt(distance / accel)
+            total_time = 2.0 * t_accel
+            if t <= t_accel:
+                return 0.5 * accel * t * t, total_time
+            td = max(0.0, t - t_accel)
+            peak = accel * t_accel
+            return min(distance, 0.5 * distance + peak * td - 0.5 * accel * td * td), total_time
+        d_flat = distance - 2.0 * d_accel
+        t_flat = d_flat / vmax
+        total_time = 2.0 * t_accel + t_flat
+        if t <= t_accel:
+            return 0.5 * accel * t * t, total_time
+        if t <= t_accel + t_flat:
+            return d_accel + vmax * (t - t_accel), total_time
+        td = max(0.0, t - t_accel - t_flat)
+        return min(distance, d_accel + d_flat + vmax * td - 0.5 * accel * td * td), total_time
+
+    def _trapezoid_profile(self, distance, vmax, accel):
+        distance = float(distance)
+        vmax = float(vmax)
+        accel = float(accel)
+        if distance <= 0.0:
+            return {
+                "distance": 0.0,
+                "vmax": 0.0,
+                "accel": accel,
+                "t_accel": 0.0,
+                "t_flat": 0.0,
+                "d_accel": 0.0,
+                "total_time": 0.0,
+                "peak": 0.0,
+                "limited": False,
+            }
+        if vmax <= 0.0 or accel <= 0.0:
+            raise ValueError("速度和加速度必须大于 0")
+        t_accel = vmax / accel
+        d_accel = 0.5 * accel * t_accel * t_accel
+        if 2.0 * d_accel >= distance:
+            t_accel = math.sqrt(distance / accel)
+            peak = accel * t_accel
+            return {
+                "distance": distance,
+                "vmax": vmax,
+                "accel": accel,
+                "t_accel": t_accel,
+                "t_flat": 0.0,
+                "d_accel": 0.5 * distance,
+                "total_time": 2.0 * t_accel,
+                "peak": peak,
+                "limited": peak < vmax * 0.999,
+            }
+        d_flat = distance - 2.0 * d_accel
+        t_flat = d_flat / vmax
+        return {
+            "distance": distance,
+            "vmax": vmax,
+            "accel": accel,
+            "t_accel": t_accel,
+            "t_flat": t_flat,
+            "d_accel": d_accel,
+            "total_time": 2.0 * t_accel + t_flat,
+            "peak": vmax,
+            "limited": False,
+        }
+
+    def _trapezoid_time_at_distance(self, scalar, profile):
+        distance = profile["distance"]
+        if scalar <= 0.0:
+            return 0.0
+        if scalar >= distance:
+            return profile["total_time"]
+        accel = profile["accel"]
+        t_accel = profile["t_accel"]
+        d_accel = profile["d_accel"]
+        t_flat = profile["t_flat"]
+        vmax = profile["peak"] if t_flat <= 0.0 else profile["vmax"]
+        if scalar <= d_accel:
+            return math.sqrt((2.0 * scalar) / accel)
+        flat_end = distance - d_accel
+        if t_flat > 0.0 and scalar <= flat_end:
+            return t_accel + (scalar - d_accel) / vmax
+        remain = max(0.0, distance - scalar)
+        return profile["total_time"] - math.sqrt((2.0 * remain) / accel)
+
+    def _set_host_motion_status(self, stats):
+        self._last_host_plan_stats = dict(stats)
+        label = getattr(self, "jog_pps_label", None)
+        if label is None:
+            return
+        peak = float(stats.get("peak_pps", 0.0))
+        target = float(stats.get("target_pps", 0.0))
+        period = 1000.0 / peak if peak > 1e-9 else 0.0
+        limited = bool(stats.get("limited", False))
+        low = peak < self.HOST_MIN_SMOOTH_PPS
+        text = f"目标PPS {target:.1f}  峰值PPS {peak:.1f}  周期 {period:.2f}ms"
+        if limited:
+            text += "  受加速度限制"
+        if low:
+            text += "  低速步进区"
+        label.setText(text)
+        if low:
+            label.setStyleSheet("color: #f1c40f;")
+        elif limited:
+            label.setStyleSheet("color: #ffd27f;")
+        else:
+            label.setStyleSheet("color: #7CFC98;")
+
+    def _axis_circumference_mm(self, motor_id=1):
+        arm_mm = max(1.0, float(getattr(self, "L1", 160.0)))
+        return 2.0 * math.pi * arm_mm
+
+    def _speed_mm_s_to_pps(self, speed_mm_s, motor_id=1):
+        ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+        return float(speed_mm_s) * ppr / self._axis_circumference_mm(motor_id)
+
+    def _accel_mm_s2_to_pps2(self, accel_mm_s2, motor_id=1):
+        ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+        return float(accel_mm_s2) * ppr / self._axis_circumference_mm(motor_id)
+
+    def update_jog_pps_preview(self):
+        try:
+            speed = self._read_run_speed_mm_s()
+            accel = self._read_run_accel_mm_s2()
+            step = self._read_jog_step_mm()
+            target_pps = self._speed_mm_s_to_pps(speed)
+            accel_pps2 = self._accel_mm_s2_to_pps2(accel)
+            ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+            pulses = max(1.0, abs(step) * ppr / self._axis_circumference_mm())
+            profile = self._trapezoid_profile(pulses, target_pps, accel_pps2)
+            self._set_host_motion_status(
+                {
+                    "target_pps": target_pps,
+                    "peak_pps": profile["peak"],
+                    "limited": profile["limited"],
+                }
+            )
+        except Exception:
+            label = getattr(self, "jog_pps_label", None)
+            if label is not None:
+                label.setText("目标PPS --  峰值PPS --  周期 --")
+                label.setStyleSheet("color: #aaaaaa;")
+
+    def _build_joint_host_segments(self, start_pulses, end_pulses, vmax_pps, accel_pps2, sample_ticks=None):
+        BinaryHostSegment = self._binary_host_segment_class()
+        start1, start2 = int(start_pulses[0]), int(start_pulses[1])
+        end1, end2 = int(end_pulses[0]), int(end_pulses[1])
+        d1 = end1 - start1
+        d2 = end2 - start2
+        dom = max(abs(d1), abs(d2))
+        if dom == 0:
+            return []
+        vmax_pps = float(vmax_pps)
+        accel_pps2 = float(accel_pps2)
+        if vmax_pps > self.HOST_DDA_MAX_PPS:
+            raise ValueError(
+                f"目标 {vmax_pps:.1f}pps 超过当前 10kHz DDA 稳定上限 {self.HOST_DDA_MAX_PPS}pps；请降低速度或改用硬件定时器脉冲。"
+            )
+        profile = self._trapezoid_profile(dom, vmax_pps, accel_pps2)
+        if profile["peak"] > self.HOST_DDA_MAX_PPS:
+            raise ValueError(
+                f"峰值 {profile['peak']:.1f}pps 超过当前 10kHz DDA 稳定上限 {self.HOST_DDA_MAX_PPS}pps。"
+            )
+        self._set_host_motion_status(
+            {
+                "target_pps": vmax_pps,
+                "peak_pps": profile["peak"],
+                "limited": profile["limited"],
+            }
+        )
+
+        segments = []
+        last_tick = 0
+        last1, last2 = start1, start2
+
+        for event in range(1, dom + 1):
+            t = self._trapezoid_time_at_distance(event, profile)
+            tick = int(round(t * self.HOST_DDA_HZ))
+            if tick <= last_tick:
+                raise ValueError(
+                    f"规划段要求一个 100us tick 内输出多个脉冲: event={event}, tick={tick}, last={last_tick}"
+                )
+            duration = tick - last_tick
+            if duration > 65535:
+                raise ValueError(
+                    f"相邻脉冲间隔 {duration} ticks 超过协议上限；请提高速度或加速度。"
+                )
+            if event == dom:
+                target1, target2 = end1, end2
+            else:
+                target1 = start1 + int(round(d1 * event / dom))
+                target2 = start2 + int(round(d2 * event / dom))
+            if target1 == last1 and target2 == last2:
+                last_tick = tick
+                continue
+            segments.append(BinaryHostSegment(target1, target2, duration))
+            last1, last2 = target1, target2
+            last_tick = tick
+        return segments
+
+    def _build_cartesian_host_segments(self, start_xy, end_xy, speed_mm_s, accel_mm_s2=None, sample_ticks=None):
+        sx, sy = float(start_xy[0]), float(start_xy[1])
+        ex, ey = float(end_xy[0]), float(end_xy[1])
+        dx, dy = ex - sx, ey - sy
+        distance = math.hypot(dx, dy)
+        if distance <= 1e-6:
+            return []
+
+        speed_mm_s = float(speed_mm_s)
+        accel_mm_s2 = float(accel_mm_s2 or self.HOST_DEFAULT_ACCEL_MM_S2)
+        if speed_mm_s <= 0.0 or accel_mm_s2 <= 0.0:
+            raise ValueError("点动速度和加速度必须大于 0")
+        start_pulses = self._current_feedback_pulses()
+        q1, q2 = self.inverse_kinematics(ex, ey)
+        if q1 is None or q2 is None:
+            raise ValueError(f"Host segment IK failed at X={ex:.3f}, Y={ey:.3f}")
+        end1, end2 = self._joint_deg_to_pulse(q1, q2)
+        dom = max(abs(end1 - start_pulses[0]), abs(end2 - start_pulses[1]))
+        if dom == 0:
+            return []
+        pulses_per_mm = dom / distance
+        vmax_pps = speed_mm_s * pulses_per_mm
+        accel_pps2 = accel_mm_s2 * pulses_per_mm
+        return self._build_joint_host_segments(start_pulses, (end1, end2), vmax_pps, accel_pps2)
+
+    def build_host_segments_from_path(self, path, start_xy=None, label="host trajectory"):
+        """Convert a planned UI XY path into smoothed timed joint DDA segments."""
+        BinaryHostSegment = self._binary_host_segment_class()
+        if not path:
+            return []
+
+        start_xy = (float(start_xy[0]), float(start_xy[1])) if start_xy is not None else (float(self.cur_x), float(self.cur_y))
+        q1_start, q2_start = self.inverse_kinematics(start_xy[0], start_xy[1])
+        if q1_start is None or q2_start is None:
+            start_i = self._current_feedback_pulses()
+            start_f = (float(start_i[0]), float(start_i[1]))
+        else:
+            start_f = self._joint_deg_to_pulse_float(q1_start, q2_start)
+            start_i = (int(round(start_f[0])), int(round(start_f[1])))
+
+        samples = [{"u": 0.0, "t": 0.0, "p1": start_f[0], "p2": start_f[1], "flags": 0}]
+        last_xy = start_xy
+        last_pulse_f = start_f
+        last_speed = 0.0
+
+        def point_feed_mm_s(point):
+            if len(point) > 2:
+                return max(0.0, float(point[2]) / 60.0)
+            return max(0.0, self._read_run_speed_mm_s())
+
+        def point_flags(point):
+            return int(point[4]) if len(point) > 4 else 0
+
+        for index, point in enumerate(path):
+            x = float(point[0])
+            y = float(point[1])
+            speed = point_feed_mm_s(point)
+            ds = math.hypot(x - last_xy[0], y - last_xy[1])
+            if ds <= 1e-6:
+                last_speed = speed
+                last_xy = (x, y)
+                continue
+            q1, q2 = self.inverse_kinematics(x, y)
+            if q1 is None or q2 is None:
+                raise ValueError(f"{label}: IK failed at index={index} X={x:.3f}, Y={y:.3f}")
+            pulse_f = self._joint_deg_to_pulse_float(q1, q2)
+            avg_speed = 0.5 * (max(0.0, last_speed) + max(0.0, speed))
+            if avg_speed <= 1e-6:
+                avg_speed = max(0.1, speed, last_speed)
+            dt = ds / avg_speed
+            du = max(abs(pulse_f[0] - last_pulse_f[0]), abs(pulse_f[1] - last_pulse_f[1]))
+            samples.append(
+                {
+                    "u": samples[-1]["u"] + max(0.0, du),
+                    "t": samples[-1]["t"] + max(0.0, dt),
+                    "p1": float(pulse_f[0]),
+                    "p2": float(pulse_f[1]),
+                    "flags": point_flags(point),
+                }
+            )
+            last_xy = (x, y)
+            last_pulse_f = pulse_f
+            last_speed = speed
+
+        if len(samples) <= 1 or samples[-1]["u"] <= 1e-9:
+            return []
+
+        segments = []
+        sample_index = 1
+        last_tick = 0
+        last_pulse = (int(start_i[0]), int(start_i[1]))
+        peak_pps = 0.0
+        target_pps = 0.0
+
+        def interpolate_at_time(target_time):
+            nonlocal sample_index
+            target_time = max(0.0, min(float(target_time), samples[-1]["t"]))
+            while sample_index < len(samples) - 1 and samples[sample_index]["t"] < target_time:
+                sample_index += 1
+            prev = samples[sample_index - 1]
+            cur = samples[sample_index]
+            span = cur["t"] - prev["t"]
+            ratio = 1.0 if span <= 1e-9 else max(0.0, min(1.0, (target_time - prev["t"]) / span))
+            return {
+                "p1": prev["p1"] + (cur["p1"] - prev["p1"]) * ratio,
+                "p2": prev["p2"] + (cur["p2"] - prev["p2"]) * ratio,
+                "flags": cur["flags"],
+            }
+
+        def append_one(target, duration, flags=0):
+            nonlocal last_pulse, peak_pps, target_pps
+            target = (int(target[0]), int(target[1]))
+            d1 = target[0] - last_pulse[0]
+            d2 = target[1] - last_pulse[1]
+            dom = max(abs(d1), abs(d2))
+            if dom == 0:
+                return
+            duration = int(duration)
+            if duration > 65535:
+                raise ValueError(f"{label}: segment interval {duration} ticks exceeds protocol limit; increase speed/accel or PPR.")
+            if dom > duration:
+                requested_pps = dom * self.HOST_DDA_HZ / max(1, duration)
+                raise ValueError(f"{label}: requested {requested_pps:.1f}pps exceeds 10kHz DDA execution; reduce speed or use hardware timer.")
+            segment_flags = self.BINARY_FLAG_HOST_SEGMENT | (int(flags) & self.BINARY_FLAG_EXACT_STOP)
+            segments.append(BinaryHostSegment(target[0], target[1], duration, flags=segment_flags))
+            pps = dom * self.HOST_DDA_HZ / max(1, duration)
+            peak_pps = max(peak_pps, pps)
+            target_pps = max(target_pps, pps)
+            last_pulse = target
+
+        total_tick = max(1, int(round(samples[-1]["t"] * self.HOST_DDA_HZ)))
+        final_target = (int(round(samples[-1]["p1"])), int(round(samples[-1]["p2"])))
+        slice_ticks = max(10, int(self.HOST_TRAJECTORY_SLICE_TICKS))
+        tick = slice_ticks
+        while tick <= total_tick:
+            interp = interpolate_at_time(tick / self.HOST_DDA_HZ)
+            is_final = tick >= total_tick
+            target = final_target if is_final else (int(round(interp["p1"])), int(round(interp["p2"])))
+            flags = (interp["flags"] | self.BINARY_FLAG_EXACT_STOP) if is_final else interp["flags"]
+            before_count = len(segments)
+            append_one(target, tick - last_tick, flags)
+            if len(segments) != before_count:
+                last_tick = tick
+            tick += slice_ticks
+
+        if last_tick < total_tick:
+            interp = interpolate_at_time(samples[-1]["t"])
+            before_count = len(segments)
+            append_one(final_target, total_tick - last_tick, interp["flags"] | self.BINARY_FLAG_EXACT_STOP)
+            if len(segments) != before_count:
+                last_tick = total_tick
+
+        if segments and (segments[-1].p1_abs, segments[-1].p2_abs) != final_target:
+            append_one(final_target, max(1, total_tick - last_tick), self.BINARY_FLAG_EXACT_STOP)
+        if not segments:
+            return []
+        if (segments[-1].flags & self.BINARY_FLAG_EXACT_STOP) == 0:
+            segments[-1].flags |= self.BINARY_FLAG_EXACT_STOP
+        self._set_host_motion_status(
+            {
+                "target_pps": target_pps,
+                "peak_pps": peak_pps,
+                "limited": peak_pps < self.HOST_MIN_SMOOTH_PPS,
+            }
+        )
+        return segments
+
+    def binary_points_from_host_segments(self, segments):
+        return [
+            HostTimedBinaryPoint(segment, self.BINARY_FLAG_HOST_SEGMENT, self.BINARY_FLAG_EXACT_STOP)
+            for segment in segments
+        ]
+
+    def _upload_host_segments(self, segments, label):
+        if not segments:
+            self.log_error("Host segment planner produced no motion.")
+            return False
+        if not (self.ser and self.ser.is_open):
+            self.log_error("Serial is not connected; host segments require the controller.")
+            return False
+        if self.waiting_for_ack or self.point_queue or getattr(self, "binary_motion_active", False):
+            self.log_error("Motion is busy; wait or stop before host-planned jog.")
+            return False
+        if bool(getattr(self, "host_timed_segment_mode", False)) and hasattr(self, "_queue_gcode_segments"):
+            return self._queue_gcode_segments(segments, label=label)
+        if hasattr(self, "_upload_binary_points"):
+            try:
+                points = self.binary_points_from_host_segments(segments)
+            except Exception as exc:
+                self.log_error(f"Timed binary segment conversion failed: {exc}")
+                return False
+            self._publish_commanded_segments(segments)
+            return self._upload_binary_points(points, label=f"{label} timed binary")
+        self.log_error("Buffered timed segment uploader is unavailable.")
+        return False
+
+    def _publish_commanded_segments(self, segments):
+        monitor = getattr(self, "velocity_monitor", None)
+        if monitor is None or not hasattr(monitor, "process_commanded_pps"):
+            return
+        try:
+            last1, last2 = self._current_feedback_pulses()
+            ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+            for segment in segments:
+                ticks = max(1, int(segment.duration_ticks))
+                pps1 = (int(segment.p1_abs) - last1) * 10000.0 / ticks
+                pps2 = (int(segment.p2_abs) - last2) * 10000.0 / ticks
+                monitor.process_commanded_pps(pps1, pps2, ticks, ppr)
+                last1, last2 = int(segment.p1_abs), int(segment.p2_abs)
+        except Exception:
+            return
+
+    def motor_jog_direct(self, motor_id, direction):
+        """Direct single-axis pulse jog for motor bring-up."""
+        try:
+            if motor_id not in (1, 2):
+                self.log_error(f"Unknown motor id: {motor_id}")
+                return
+            start = self._current_feedback_pulses()
+            ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+            step_mm = self._read_jog_step_mm()
+            v_mm_s = self._read_run_speed_mm_s()
+            accel_mm_s2 = self._read_run_accel_mm_s2()
+            delta = int(round(direction * step_mm * ppr / self._axis_circumference_mm(motor_id)))
+            if delta == 0:
+                self.log_error("点动步长换算后小于 1 脉冲，请增大步长或拨码 PPR。")
+                return
+            end = [int(start[0]), int(start[1])]
+            end[motor_id - 1] += delta
+            v_pps = self._speed_mm_s_to_pps(v_mm_s, motor_id)
+            accel_pps2 = self._accel_mm_s2_to_pps2(accel_mm_s2, motor_id)
+            segments = self._build_joint_host_segments(start, tuple(end), v_pps, accel_pps2)
+            if self._upload_host_segments(segments, f"host axis jog M{motor_id}"):
+                stats = getattr(self, "_last_host_plan_stats", {})
+                self.log_display.append(
+                    f"<font color='#ffffff'>HOST_JOG M{motor_id} step={step_mm:g}mm delta={delta} segments={len(segments)} target={v_pps:.1f}pps peak={float(stats.get('peak_pps', 0.0)):.1f}pps</font>"
+                )
+        except Exception as e:
+            self.log_error(f"Single-axis jog error: {e}")
+
+    def add_jog_step(self, ux, uy):
+        try:
+            step = self._read_jog_step_mm()
+            self.add_jog(float(ux) * step, float(uy) * step)
+        except Exception as e:
+            self.log_error(f"点动步长错误: {e}")
+
     def add_jog(self, dx, dy):
         """方向点动：空闲时走二进制关节插补，运动队列中才退回 ASCII 追加。
 
         调节入口：
         - 点动距离来自 UI 按钮绑定的 dx/dy。
-        - 点动速度来自 jog_speed_input，单位 mm/s。
+        - 点动速度来自 hw_speed_input，单位 mm/s。
         - 直线平滑度由 BINARY_LINE_TOLERANCE_MM 和当前 PPR 决定。
         """
         try:
-            v_max = float(self.jog_speed_input.text())
+            v_max = self._read_run_speed_mm_s()
             if getattr(self, "binary_stream_active", False):
                 self.log_error("二进制轨迹续传中，暂不追加点动；请等待当前轨迹完成或先停止")
                 return
@@ -1259,14 +1788,28 @@ class ScaraMotionMixin:
                 self.update_plot()
             tx, ty = sx + dx, sy + dy
             if self.check_workspace_safety(tx, ty):
-                blend_speed = min(v_max * 0.35, 8.0) if (self.waiting_for_ack or self.point_queue) else 0.0
+                moving = bool(self.waiting_for_ack or self.point_queue)
+                if not moving:
+                    path = self.generate_linear_path(sx, sy, tx, ty, v_max)
+                    if not path:
+                        self.log_error("点动距离过短，未生成轨迹")
+                        return
+                    self.preview_planned_path(path, "点动")
+                    accel = self._read_run_accel_mm_s2()
+                    segments = self._build_cartesian_host_segments((sx, sy), (tx, ty), v_max, accel)
+                    if self._upload_host_segments(segments, "host cartesian jog"):
+                        stats = getattr(self, "_last_host_plan_stats", {})
+                        self.log_display.append(
+                            f"<font color='#ffffff'>HOST_JOG XY dx={dx:g} dy={dy:g} segments={len(segments)} peak={float(stats.get('peak_pps', 0.0)):.1f}pps</font>"
+                        )
+                    return
+                blend_speed = v_max * 0.35
                 path = self.generate_linear_path(sx, sy, tx, ty, v_max, v_start=blend_speed, v_end=blend_speed)
                 if not path:
                     self.log_error("点动距离过短，未生成轨迹")
                     return
                 self.preview_planned_path(path, "点动")
-                moving = bool(self.waiting_for_ack or self.point_queue)
-                send_path = None if moving else self.generate_binary_line_targets((sx, sy), (tx, ty), v_max)
+                send_path = None
                 self.load_motion_queue(path, append=moving, send_path=send_path)
             else: self.log_error(f"不可达区域: X={tx:.1f}, Y={ty:.1f}")
         except Exception as e: self.log_error(f"点动错误: {e}")
@@ -1319,7 +1862,7 @@ class ScaraMotionMixin:
                 self.log_error(f"电机{motor_id}点动目标不可达: X={new_x:.1f}, Y={new_y:.1f}")
                 return
 
-            v_max = float(self.jog_speed_input.text())
+            v_max = self._read_run_speed_mm_s()
             num_steps = 20
 
             # 按关节角度均匀采样，保证电机点动本质上是一根轴在动，而不是 XY 直线点动。

@@ -14,6 +14,7 @@ bool SerialDma_SendFormat(const char *fmt, ...);
 bool SerialDma_IsTxBusy(void);
 uint32_t SerialDma_RxOverflowCount(void);
 uint32_t SerialDma_RxFreeCount(void);
+uint32_t SerialDma_RxFreeBytes(void);
 uint32_t SerialDma_TxDropCount(void);
 uint32_t SerialDma_TxQueuedCount(void);
 void SerialDma_TxCpltCallback(void);

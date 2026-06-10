@@ -33,6 +33,9 @@ class FeedbackErrorStats:
 
 
 class FeedbackErrorTracker:
+    SEARCH_BACKTRACK_SEGMENTS = 8
+    SEARCH_FORWARD_SEGMENTS = 160
+
     def __init__(self):
         self.expected: List[Point2D] = []
         self.samples: List[FeedbackErrorSample] = []
@@ -102,31 +105,16 @@ class FeedbackErrorTracker:
 
         best = None
         segment_count = len(self.expected) - 1
-        window = 80
-        start = max(0, self._last_segment_hint - window)
-        end = min(segment_count, self._last_segment_hint + window)
-        if end - start < segment_count:
-            ranges = ((start, end),)
-        else:
-            ranges = ((0, segment_count),)
+        start = max(0, self._last_segment_hint - self.SEARCH_BACKTRACK_SEGMENTS)
+        end = min(segment_count, self._last_segment_hint + self.SEARCH_FORWARD_SEGMENTS)
 
-        for range_start, range_end in ranges:
-            for index in range(range_start, range_end + 1):
-                ax, ay = self.expected[index]
-                bx, by = self.expected[min(index + 1, len(self.expected) - 1)]
-                px, py = _project_point_to_segment(x, y, ax, ay, bx, by)
-                dist2 = (x - px) * (x - px) + (y - py) * (y - py)
-                if best is None or dist2 < best[0]:
-                    best = (dist2, px, py, index)
-
-        if best is None or best[0] > 4.0:
-            for index in range(0, segment_count + 1):
-                ax, ay = self.expected[index]
-                bx, by = self.expected[min(index + 1, len(self.expected) - 1)]
-                px, py = _project_point_to_segment(x, y, ax, ay, bx, by)
-                dist2 = (x - px) * (x - px) + (y - py) * (y - py)
-                if best is None or dist2 < best[0]:
-                    best = (dist2, px, py, index)
+        for index in range(start, end + 1):
+            ax, ay = self.expected[index]
+            bx, by = self.expected[min(index + 1, len(self.expected) - 1)]
+            px, py = _project_point_to_segment(x, y, ax, ay, bx, by)
+            dist2 = (x - px) * (x - px) + (y - py) * (y - py)
+            if best is None or dist2 < best[0]:
+                best = (dist2, px, py, index)
 
         if best is None:
             ax, ay = self.expected[-1]

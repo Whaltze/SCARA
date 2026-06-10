@@ -35,6 +35,7 @@
 
 #define BT_POINT_FLAG_EXACT_STOP 0x0001u
 #define BT_POINT_FLAG_CARTESIAN_LINE 0x0002u
+#define BT_POINT_FLAG_HOST_TIMED 0x0004u
 
 typedef struct {
     int32_t p1_abs;
@@ -61,10 +62,10 @@ static uint32_t s_accepted_count;
 static uint32_t s_executed_count;
 static BinaryTrajState s_state;
 static bool s_run_requested;
-static uint32_t s_tick10khz;
-static uint32_t s_last_dispatch_tick;
 static uint32_t s_max_dispatch_gap_ticks;
 static uint32_t s_stream_underrun_ticks;
+static uint32_t s_stream_underrun_count;
+static bool s_stream_underrun_active;
 static uint16_t s_min_buffer_count;
 
 typedef struct {
@@ -231,10 +232,10 @@ static void clear_queue(void)
 
 static void reset_runtime_stats(void)
 {
-    s_tick10khz = 0;
-    s_last_dispatch_tick = 0;
     s_max_dispatch_gap_ticks = 0;
     s_stream_underrun_ticks = 0;
+    s_stream_underrun_count = 0;
+    s_stream_underrun_active = false;
     s_min_buffer_count = APP_BINARY_TRAJ_POINTS;
 }
 
@@ -290,7 +291,7 @@ static void send_status_frame(uint16_t seq, uint8_t type)
     wr_u32(&payload[20], s_stream_underrun_ticks);
     wr_u32(&payload[24], s_max_dispatch_gap_ticks);
     wr_u16(&payload[28], s_min_buffer_count == APP_BINARY_TRAJ_POINTS ? s_count : s_min_buffer_count);
-    wr_u16(&payload[30], 0u);
+    wr_u16(&payload[30], s_stream_underrun_count > 65535u ? 65535u : (uint16_t)s_stream_underrun_count);
     send_frame(BT_TYPE_STATUS_RSP, seq, payload, sizeof(payload));
 }
 
@@ -323,7 +324,13 @@ static bool decode_point(const uint8_t *payload, BinaryTrajPoint *point)
     point->p2_abs = rd_i32(payload + 4);
     point->v_dom_pps = rd_u16(payload + 8);
     point->flags = rd_u16(payload + 10);
-    if (point->v_dom_pps == 0u || point->v_dom_pps > APP_MAX_PPS_DEFAULT) {
+    if (point->v_dom_pps == 0u) {
+        return false;
+    }
+    if ((point->flags & BT_POINT_FLAG_HOST_TIMED) != 0u) {
+        return (point->flags & BT_POINT_FLAG_CARTESIAN_LINE) == 0u;
+    }
+    if (point->v_dom_pps > APP_MAX_PPS_DEFAULT) {
         return false;
     }
     return true;
@@ -407,6 +414,7 @@ static void process_frame(void)
         }
     } else if (s_frame_type == BT_TYPE_ABORT) {
         BinaryTraj_Stop();
+        MotionPlanner_Stop();
         send_ack(s_frame_seq, s_frame_type, BT_ERR_OK);
     } else if (s_frame_type == BT_TYPE_STATUS) {
         send_status_frame(s_frame_seq, s_frame_type);
@@ -463,14 +471,11 @@ static void discard_current_point(void)
     uint32_t primask = irq_save();
     s_tail = next_index(s_tail);
     s_count--;
-    s_executed_count++;
-    if (s_last_dispatch_tick != 0u) {
-        uint32_t gap = s_tick10khz - s_last_dispatch_tick;
-        if (gap > s_max_dispatch_gap_ticks) {
-            s_max_dispatch_gap_ticks = gap;
-        }
+    if (s_executed_count > 0u && s_max_dispatch_gap_ticks < 1u) {
+        /* Binary dispatch follows Stepper_Tick10kHz in the same ISR cycle. */
+        s_max_dispatch_gap_ticks = 1u;
     }
-    s_last_dispatch_tick = s_tick10khz;
+    s_executed_count++;
     irq_restore(primask);
 }
 
@@ -583,15 +588,26 @@ static void service_motion_10khz(void)
             s_min_buffer_count = s_count;
         }
         if (s_count == 0u && s_accepted_count < s_total_expected) {
+            if (!s_stream_underrun_active) {
+                s_stream_underrun_active = true;
+                s_stream_underrun_count++;
+            }
             s_stream_underrun_ticks++;
             if (!Stepper_IsBusy() && s_stream_underrun_ticks > APP_CONTROL_HZ) {
                 s_run_requested = false;
                 s_state = BINARY_TRAJ_STATE_ERROR;
             }
+        } else {
+            s_stream_underrun_active = false;
         }
     }
 
-    if (!s_run_requested || s_state != BINARY_TRAJ_STATE_RUNNING || s_count == 0u || !Stepper_CanAcceptMove()) {
+    BinaryTrajPoint *point = s_count > 0u ? &s_points[s_tail] : NULL;
+    bool can_dispatch = point != NULL &&
+                        (((point->flags & BT_POINT_FLAG_HOST_TIMED) != 0u)
+                             ? Stepper_CanQueueTimedSegment()
+                             : Stepper_CanAcceptMove());
+    if (!s_run_requested || s_state != BINARY_TRAJ_STATE_RUNNING || s_count == 0u || !can_dispatch) {
         if (s_run_requested &&
             s_state == BINARY_TRAJ_STATE_RUNNING &&
             s_count == 0u &&
@@ -605,7 +621,16 @@ static void service_motion_10khz(void)
 
     StepperState snapshot;
     Stepper_GetStateSnapshot(&snapshot);
-    BinaryTrajPoint *point = &s_points[s_tail];
+    point = &s_points[s_tail];
+    if ((point->flags & BT_POINT_FLAG_HOST_TIMED) != 0u) {
+        if (Stepper_MoveAbsTicks(point->p1_abs, point->p2_abs, point->v_dom_pps)) {
+            discard_current_point();
+        } else {
+            s_state = BINARY_TRAJ_STATE_ERROR;
+            s_run_requested = false;
+        }
+        return;
+    }
     if (service_cartesian_line_10khz(point)) {
         return;
     }
@@ -660,14 +685,11 @@ static void service_motion_10khz(void)
         uint32_t primask = irq_save();
         s_tail = next_index(s_tail);
         s_count--;
-        s_executed_count++;
-        if (s_last_dispatch_tick != 0u) {
-            uint32_t gap = s_tick10khz - s_last_dispatch_tick;
-            if (gap > s_max_dispatch_gap_ticks) {
-                s_max_dispatch_gap_ticks = gap;
-            }
+        if (s_executed_count > 0u && s_max_dispatch_gap_ticks < 1u) {
+            /* The next block is dispatched in the first tick after completion. */
+            s_max_dispatch_gap_ticks = 1u;
         }
-        s_last_dispatch_tick = s_tick10khz;
+        s_executed_count++;
         irq_restore(primask);
     } else {
         s_state = BINARY_TRAJ_STATE_ERROR;
@@ -681,7 +703,6 @@ void BinaryTraj_Loop(void)
 
 void BinaryTraj_Tick10kHz(void)
 {
-    s_tick10khz++;
     service_motion_10khz();
 }
 
@@ -768,6 +789,11 @@ uint32_t BinaryTraj_ExecutedCount(void)
 uint32_t BinaryTraj_StreamUnderrunTicks(void)
 {
     return s_stream_underrun_ticks;
+}
+
+uint32_t BinaryTraj_StreamUnderrunCount(void)
+{
+    return s_stream_underrun_count;
 }
 
 uint32_t BinaryTraj_MaxDispatchGapTicks(void)

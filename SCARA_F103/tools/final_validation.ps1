@@ -1,5 +1,5 @@
 param(
-    [string]$Port = "COM13",
+    [string]$Port = "AUTO",
     [int]$Count = 300,
     [int]$ChunkPoints = 10,
     [int]$FeedPps = 300,
@@ -12,6 +12,13 @@ param(
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+if ($Port.ToUpperInvariant() -eq "AUTO") {
+    $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+    if ($ports.Count -ne 1) {
+        throw "AUTO requires exactly one serial port; found: $($ports -join ', ')"
+    }
+    $Port = $ports[0]
+}
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $OutDir = Join-Path $projectRoot "logs\final_validation_$stamp"
@@ -47,6 +54,13 @@ try {
     Invoke-Step -Name "Serial Link" -File (Join-Path $PSScriptRoot "serial_link_check.ps1") -StepArgs @(
         "-Port", $Port,
         "-Repeat", "2"
+    )
+    Invoke-Step -Name "Buffered Stream Capability" -File (Join-Path $PSScriptRoot "buffered_stream_capability_check.ps1") -StepArgs @(
+        "-Port", $Port
+    )
+    Invoke-Step -Name "G-code Burst No Motion" -File (Join-Path $PSScriptRoot "gcode_burst_no_motion_check.ps1") -StepArgs @(
+        "-Port", $Port,
+        "-BurstLines", "6"
     )
 
     if (-not $SkipMotion) {
