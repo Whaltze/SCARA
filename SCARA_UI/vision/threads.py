@@ -83,8 +83,19 @@ class ImageProcessingThread(QThread):
             mask = self.get_color_mask(frame)
             cts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in cts:
-                if cv2.contourArea(c) > 300:
+                area = cv2.contourArea(c)
+                if area > 300:
                     cv2.drawContours(frame_rgb, [c], -1, (0, 255, 0), 2)
+                    # 几何中心
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        cv2.drawMarker(frame_rgb, (cx, cy), (0, 0, 255),
+                                       cv2.MARKER_CROSS, 10, 2)
+                        cv2.putText(frame_rgb, f"({cx},{cy})", (cx + 10, cy - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                                    (255, 255, 255), 1, cv2.LINE_AA)
         if self.edge_detection:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray, 100, 200)
