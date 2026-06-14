@@ -1,126 +1,53 @@
 #include "gcode_stream.h"
 
-/* G-code 流接收层：解析上位机已经规划好的 G0/G1 X/Y/F，并返回 ok seq/cs/line 回显。 */
+/*
+ * Grbl-style streaming G-code front end for the SCARA Cartesian planner.
+ * Lines are acknowledged when parsed and accepted into the planner. Realtime
+ * commands bypass this parser in serial_dma.c.
+ */
 
 #include "app_config.h"
-#include "app_main.h"
 #include "app_params.h"
-#include "binary_traj.h"
 #include "home_controller.h"
 #include "home_sensor.h"
+#include "laser_control.h"
 #include "motion_planner.h"
 #include "scara_kinematics.h"
 #include "serial_dma.h"
 #include "stepper_driver.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-typedef struct {
-    /* 规划块只保存执行所需信息；速度和限位规划由上位机提前完成。 */
-    int32_t x_um;
-    int32_t y_um;
-    int32_t dx_um;
-    int32_t dy_um;
-    int32_t p1;
-    int32_t p2;
-    int16_t v1_pps;
-    int16_t v2_pps;
-    int16_t exit1_pps;
-    int16_t exit2_pps;
-    uint16_t duration_ticks;
-    uint8_t rapid;
-    uint8_t timed;
-} GcodeBlock;
+#define GC_PI_F 3.14159265358979323846f
 
 typedef struct {
     uint8_t absolute;
     uint8_t mm_units;
     uint8_t motion_mode;
+    uint8_t laser_mode;
     int32_t feed_mm_min;
     int32_t x_um;
     int32_t y_um;
-    int32_t p1;
-    int32_t p2;
+    int32_t offset_x_um;
+    int32_t offset_y_um;
+    uint16_t spindle_speed;
 } GcodeState;
 
-static GcodeBlock s_blocks[APP_GCODE_PLANNER_BLOCKS];
-static uint8_t s_head;
-static uint8_t s_tail;
-static uint8_t s_count;
 static GcodeState s_gc;
-static char s_pending[APP_SERIAL_LINE_SIZE];
-static uint8_t s_pending_valid;
 static volatile uint8_t s_status_due;
 static uint16_t s_status_divider;
 static uint8_t s_hold;
-static uint32_t s_ack_seq;
-static uint16_t s_start_wait_ms;
+static uint8_t s_home_pending_ack;
+static uint8_t s_jog_pending_ack;
+static uint8_t s_motion_settle_pending;
 
-static uint8_t next_index(uint8_t index)
+static int32_t i32_abs(int32_t value)
 {
-    index++;
-    if (index >= APP_GCODE_PLANNER_BLOCKS) {
-        index = 0;
-    }
-    return index;
-}
-
-static uint8_t prev_index(uint8_t index)
-{
-    if (index == 0u) {
-        return APP_GCODE_PLANNER_BLOCKS - 1u;
-    }
-    return (uint8_t)(index - 1u);
-}
-
-static int64_t i64_abs(int64_t v)
-{
-    return v < 0 ? -v : v;
-}
-
-static int32_t i32_abs(int32_t v)
-{
-    return v < 0 ? -v : v;
-}
-
-static int32_t i32_isqrt_i64(int64_t value)
-{
-    int64_t bit = 1LL << 62;
-    int64_t result = 0;
-
-    if (value <= 0) {
-        return 0;
-    }
-    while (bit > value) {
-        bit >>= 2;
-    }
-    while (bit != 0) {
-        if (value >= result + bit) {
-            value -= result + bit;
-            result = (result >> 1) + bit;
-        } else {
-            result >>= 1;
-        }
-        bit >>= 2;
-    }
-    if (result > 2147483647LL) {
-        return 2147483647;
-    }
-    return (int32_t)result;
-}
-
-static int16_t pps_to_i16(int32_t pps)
-{
-    if (pps > 30000) {
-        return 30000;
-    }
-    if (pps < -30000) {
-        return -30000;
-    }
-    return (int16_t)pps;
+    return value < 0 ? -value : value;
 }
 
 static bool starts_gcode(const char *line)
@@ -129,20 +56,28 @@ static bool starts_gcode(const char *line)
         line++;
     }
     char ch = (char)toupper((unsigned char)*line);
-    return ch == 'G' || ch == 'M' || ch == '$' || ch == '?' || ch == '!' || ch == '~' || (unsigned char)ch == 0x18u;
+    return ch == 'G' || ch == 'M' || ch == '$' || ch == '?' || ch == '!' ||
+           ch == '~' || (unsigned char)ch == 0x18u || (unsigned char)ch == 0x85u;
+}
+
+static bool is_home_sim_command(const char *line)
+{
+    const char *cursor = line + 2;
+    while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    return toupper((unsigned char)*cursor) == 'S';
 }
 
 static bool parse_int_word(const char **cursor, int32_t *out)
 {
     int32_t value = 0;
     bool digit = false;
-
     while (**cursor >= '0' && **cursor <= '9') {
         digit = true;
         value = value * 10 + (**cursor - '0');
         (*cursor)++;
     }
-
     if (!digit) {
         return false;
     }
@@ -152,44 +87,35 @@ static bool parse_int_word(const char **cursor, int32_t *out)
 
 static bool parse_decimal_scaled(const char **cursor, int32_t scale, int32_t *out)
 {
-    int sign = 1;
+    int32_t sign = 1;
     int64_t whole = 0;
-    int64_t frac = 0;
-    int32_t frac_scale = scale;
+    int64_t fraction = 0;
+    int32_t fraction_scale = scale;
     bool digit = false;
-
     if (**cursor == '+' || **cursor == '-') {
         sign = **cursor == '-' ? -1 : 1;
         (*cursor)++;
     }
-
     while (**cursor >= '0' && **cursor <= '9') {
         digit = true;
         whole = whole * 10 + (**cursor - '0');
         (*cursor)++;
     }
-
     if (**cursor == '.') {
         (*cursor)++;
         while (**cursor >= '0' && **cursor <= '9') {
             digit = true;
-            if (frac_scale > 1) {
-                frac_scale /= 10;
-                frac += (int64_t)(**cursor - '0') * frac_scale;
+            if (fraction_scale > 1) {
+                fraction_scale /= 10;
+                fraction += (int64_t)(**cursor - '0') * fraction_scale;
             }
             (*cursor)++;
         }
     }
-
     if (!digit) {
         return false;
     }
-
-    int64_t value = whole * scale + frac;
-    if (sign < 0) {
-        value = -value;
-    }
-    *out = (int32_t)value;
+    *out = (int32_t)((whole * scale + fraction) * sign);
     return true;
 }
 
@@ -198,225 +124,182 @@ static void send_error(uint8_t code)
     SerialDma_SendFormat("error:%u\n", (unsigned int)code);
 }
 
-static uint8_t line_checksum(const char *line)
+static void send_ok(void)
 {
-    uint8_t sum = 0;
-    while (*line != '\0') {
-        sum = (uint8_t)(sum + (uint8_t)*line);
-        line++;
-    }
-    return sum;
-}
-
-static void send_ok_for_line(const char *line)
-{
-    /* 每条已接收指令必须完整回显，方便上位机确认高频通信没有错包/串包。 */
-    s_ack_seq++;
-    SerialDma_SendFormat("ok seq=%lu cs=%02X line=%s\n",
-                         (unsigned long)s_ack_seq,
-                         (unsigned int)line_checksum(line),
-                         line);
-}
-
-static bool buffer_full(void)
-{
-    return s_count >= APP_GCODE_PLANNER_BLOCKS;
-}
-
-static void enqueue_block(const GcodeBlock *block)
-{
-    /* 下位机不做角点降速，只根据相邻段的上位机给定速度做薄执行拼接。 */
-    GcodeBlock planned = *block;
-    planned.exit1_pps = 0;
-    planned.exit2_pps = 0;
-    if (s_count > 0u && !planned.rapid && !planned.timed) {
-        GcodeBlock *prev = &s_blocks[prev_index(s_head)];
-        if (!prev->rapid && !prev->timed) {
-            int32_t exit1 = i32_abs(prev->v1_pps) < i32_abs(planned.v1_pps) ? i32_abs(prev->v1_pps) : i32_abs(planned.v1_pps);
-            int32_t exit2 = i32_abs(prev->v2_pps) < i32_abs(planned.v2_pps) ? i32_abs(prev->v2_pps) : i32_abs(planned.v2_pps);
-            if (exit1 > 0 && exit1 < APP_MIN_EFFECTIVE_PPS) {
-                exit1 = APP_MIN_EFFECTIVE_PPS;
-            }
-            if (exit2 > 0 && exit2 < APP_MIN_EFFECTIVE_PPS) {
-                exit2 = APP_MIN_EFFECTIVE_PPS;
-            }
-            prev->exit1_pps = pps_to_i16(exit1);
-            prev->exit2_pps = pps_to_i16(exit2);
-        }
-    }
-    if (!planned.timed && planned.v1_pps > 0 && planned.v1_pps < APP_MIN_EFFECTIVE_PPS) {
-        planned.v1_pps = APP_MIN_EFFECTIVE_PPS;
-    }
-    if (!planned.timed && planned.v2_pps > 0 && planned.v2_pps < APP_MIN_EFFECTIVE_PPS) {
-        planned.v2_pps = APP_MIN_EFFECTIVE_PPS;
-    }
-
-    s_blocks[s_head] = planned;
-    s_head = next_index(s_head);
-    s_count++;
-    if (s_count == 1u) {
-        s_start_wait_ms = 0;
-    }
-    s_gc.x_um = block->x_um;
-    s_gc.y_um = block->y_um;
-    s_gc.p1 = block->p1;
-    s_gc.p2 = block->p2;
-}
-
-static bool current_xy_from_stepper(int32_t *x_um, int32_t *y_um)
-{
-    StepperState state;
-    ScaraPose pose;
-    Stepper_GetStateSnapshot(&state);
-    if (!ScaraKinematics_PulseToPose(state.axis[0].position_pulse, state.axis[1].position_pulse, &pose)) {
-        return false;
-    }
-    *x_um = pose.x_um;
-    *y_um = pose.y_um;
-    return true;
+    SerialDma_Send("ok\n");
 }
 
 static void sync_position_from_stepper(void)
 {
     StepperState state;
+    ScaraPose pose;
     Stepper_GetStateSnapshot(&state);
-    s_gc.p1 = (int32_t)state.axis[0].position_pulse;
-    s_gc.p2 = (int32_t)state.axis[1].position_pulse;
-    (void)current_xy_from_stepper(&s_gc.x_um, &s_gc.y_um);
+    if (ScaraKinematics_PulseToPose(state.axis[0].position_pulse, state.axis[1].position_pulse, &pose)) {
+        s_gc.x_um = pose.x_um;
+        s_gc.y_um = pose.y_um;
+    }
 }
 
-static bool build_motion_block(int32_t target_x_um, int32_t target_y_um, uint8_t rapid, GcodeBlock *out)
+static void resync_parser_to_stepper_if_diverged(void)
 {
-    /* 逆解和脉冲换算在主循环中完成，TIM 中断不做浮点/三角计算。 */
-    int64_t p1 = 0;
-    int64_t p2 = 0;
-    if (!ScaraKinematics_InverseUmToPulse(target_x_um, target_y_um, &p1, &p2) ||
-        !Stepper_TargetsAllowed(p1, p2)) {
+    /*
+     * The parser position is commanded Cartesian micrometres; the machine truth is
+     * integer joint pulses reached through nonlinear IK. A cleanly finished move
+     * leaves the stepper at exactly round(IK(commanded endpoint)), so the divergence
+     * is zero and the exact commanded coordinate is kept (no FK/IK round-trip noise).
+     * An interrupted or fault-stopped move (e.g. preparation_fault, soft-limit clamp,
+     * cancel) leaves the parser ahead of where the arm actually stopped; re-anchor to
+     * the stepped pulses so the next relative/jog move starts from the true position.
+     */
+    int64_t cmd_p1;
+    int64_t cmd_p2;
+    if (!ScaraKinematics_InverseUmToPulse(s_gc.x_um, s_gc.y_um, &cmd_p1, &cmd_p2)) {
+        sync_position_from_stepper();
+        return;
+    }
+    StepperState state;
+    Stepper_GetStateSnapshot(&state);
+    int64_t d1 = state.axis[0].position_pulse - cmd_p1;
+    int64_t d2 = state.axis[1].position_pulse - cmd_p2;
+    if (d1 < 0) {
+        d1 = -d1;
+    }
+    if (d2 < 0) {
+        d2 = -d2;
+    }
+    if (d1 > APP_POSITION_RESYNC_PULSE_TOL || d2 > APP_POSITION_RESYNC_PULSE_TOL) {
+        sync_position_from_stepper();
+    }
+}
+
+static MotionLaserMode current_laser_mode(void)
+{
+    if (s_gc.spindle_speed == 0u) {
+        return MOTION_LASER_OFF;
+    }
+    if (s_gc.laser_mode == 3u) {
+        return MOTION_LASER_CONSTANT;
+    }
+    if (s_gc.laser_mode == 4u) {
+        return MOTION_LASER_DYNAMIC;
+    }
+    return MOTION_LASER_OFF;
+}
+
+static void apply_spindle_power(void)
+{
+    if (s_gc.spindle_speed == 0u) {
+        MotionPlanner_SetLaserPower(0u);
+        return;
+    }
+    uint32_t power = ((uint32_t)s_gc.spindle_speed * APP_LASER_POWER_MAX_PERMILLE + 999u) / 1000u;
+    if (power < APP_LASER_POWER_MIN_PERMILLE) {
+        power = APP_LASER_POWER_MIN_PERMILLE;
+    }
+    MotionPlanner_SetLaserPower((uint16_t)power);
+    (void)LaserControl_SetPowerPermille((uint16_t)power);
+}
+
+static bool arc_center_from_radius(int32_t sx,
+                                   int32_t sy,
+                                   int32_t ex,
+                                   int32_t ey,
+                                   int32_t radius_um,
+                                   bool clockwise,
+                                   int32_t *cx,
+                                   int32_t *cy)
+{
+    float dx = (float)(ex - sx);
+    float dy = (float)(ey - sy);
+    float chord = hypotf(dx, dy);
+    float radius = fabsf((float)radius_um);
+    if (chord < 0.001f || radius < chord * 0.5f) {
         return false;
     }
-
-    int64_t dp1 = p1 - (int64_t)s_gc.p1;
-    int64_t dp2 = p2 - (int64_t)s_gc.p2;
-    int32_t dx = target_x_um - s_gc.x_um;
-    int32_t dy = target_y_um - s_gc.y_um;
-    int32_t dist_um = i32_isqrt_i64((int64_t)dx * (int64_t)dx + (int64_t)dy * (int64_t)dy);
-    if (dist_um < 1) {
-        dist_um = 1;
+    float mx = 0.5f * ((float)sx + (float)ex);
+    float my = 0.5f * ((float)sy + (float)ey);
+    float h = sqrtf(radius * radius - 0.25f * chord * chord);
+    float nx = -dy / chord;
+    float ny = dx / chord;
+    float sign = clockwise ? -1.0f : 1.0f;
+    if (radius_um < 0) {
+        sign = -sign;
     }
-
-    int32_t v1 = APP_GCODE_RAPID_PPS;
-    int32_t v2 = APP_GCODE_RAPID_PPS;
-    if (!rapid) {
-        int32_t feed = s_gc.feed_mm_min > 0 ? s_gc.feed_mm_min : APP_GCODE_DEFAULT_FEED_MM_MIN;
-        int64_t n1 = i64_abs(dp1) * (int64_t)feed * 50;
-        int64_t n2 = i64_abs(dp2) * (int64_t)feed * 50;
-        v1 = (int32_t)(n1 / ((int64_t)dist_um * 3));
-        v2 = (int32_t)(n2 / ((int64_t)dist_um * 3));
-        if (v1 < APP_MIN_EFFECTIVE_PPS && dp1 != 0) {
-            v1 = APP_MIN_EFFECTIVE_PPS;
-        }
-        if (v2 < APP_MIN_EFFECTIVE_PPS && dp2 != 0) {
-            v2 = APP_MIN_EFFECTIVE_PPS;
-        }
-        if (v1 > APP_MAX_PPS_DEFAULT) {
-            v1 = APP_MAX_PPS_DEFAULT;
-        }
-        if (v2 > APP_MAX_PPS_DEFAULT) {
-            v2 = APP_MAX_PPS_DEFAULT;
-        }
-    }
-
-    out->x_um = target_x_um;
-    out->y_um = target_y_um;
-    out->dx_um = dx;
-    out->dy_um = dy;
-    out->p1 = (int32_t)p1;
-    out->p2 = (int32_t)p2;
-    out->v1_pps = pps_to_i16(v1);
-    out->v2_pps = pps_to_i16(v2);
-    out->exit1_pps = 0;
-    out->exit2_pps = 0;
-    out->duration_ticks = 0;
-    out->rapid = rapid;
-    out->timed = 0;
+    *cx = (int32_t)lroundf(mx + sign * h * nx);
+    *cy = (int32_t)lroundf(my + sign * h * ny);
     return true;
 }
 
-static bool build_timed_block(int32_t p1, int32_t p2, uint16_t duration_ticks, GcodeBlock *out)
+static bool process_block(const char *line)
 {
-    int32_t d1 = p1 - s_gc.p1;
-    int32_t d2 = p2 - s_gc.p2;
-    uint32_t events = (uint32_t)(i32_abs(d1) > i32_abs(d2) ? i32_abs(d1) : i32_abs(d2));
-
-    if (duration_ticks == 0u || events > (uint32_t)duration_ticks) {
-        return false;
-    }
-    if (!Stepper_TargetsAllowed(p1, p2)) {
-        return false;
-    }
-
-    memset(out, 0, sizeof(*out));
-    out->x_um = s_gc.x_um;
-    out->y_um = s_gc.y_um;
-    out->p1 = p1;
-    out->p2 = p2;
-    out->duration_ticks = duration_ticks;
-    out->timed = 1;
-    return true;
-}
-
-static bool process_block(const char *line, uint8_t send_ok_now)
-{
-    const char *original_line = line;
+    int32_t g_code = -1;
     int32_t m_code = -1;
     int32_t x_um = s_gc.x_um;
     int32_t y_um = s_gc.y_um;
+    int32_t i_um = 0;
+    int32_t j_um = 0;
+    int32_t r_um = 0;
     int32_t feed = s_gc.feed_mm_min;
-    int32_t a_pulse = s_gc.p1;
-    int32_t b_pulse = s_gc.p2;
-    int32_t t_ticks = 0;
-    uint8_t seen_x = 0;
-    uint8_t seen_y = 0;
-    uint8_t seen_a = 0;
-    uint8_t seen_b = 0;
-    uint8_t seen_t = 0;
-    uint8_t has_motion_word = 0;
-    uint8_t dwell = 0;
-    uint8_t coordinate_set = 0;
+    int32_t p_ms = 0;
+    int32_t s_word = s_gc.spindle_speed;
+    int32_t a_pulse = 0;
+    int32_t b_pulse = 0;
+    int32_t x_word_um = 0;
+    int32_t y_word_um = 0;
+    uint8_t seen_x = 0u;
+    uint8_t seen_y = 0u;
+    uint8_t seen_i = 0u;
+    uint8_t seen_j = 0u;
+    uint8_t seen_r = 0u;
+    uint8_t seen_a = 0u;
+    uint8_t seen_b = 0u;
+    uint8_t coordinate_set = 0u;
+    uint8_t jog = 0u;
 
     while (*line != '\0') {
-        while (*line != '\0' && (isspace((unsigned char)*line) || *line == ';')) {
-            if (*line == ';') {
-                break;
-            }
+        while (*line != '\0' && isspace((unsigned char)*line)) {
             line++;
         }
         if (*line == '\0' || *line == ';' || *line == '(') {
             break;
         }
-
+        if (line[0] == '$' && toupper((unsigned char)line[1]) == 'J' && line[2] == '=') {
+            jog = 1u;
+            line += 3;
+            continue;
+        }
         char letter = (char)toupper((unsigned char)*line++);
+        int32_t value = 0;
         if (letter == 'G') {
-            int32_t value = 0;
             if (!parse_int_word(&line, &value)) {
                 send_error(2);
                 return true;
             }
-            if (value == 0 || value == 1) {
-                s_gc.motion_mode = (uint8_t)value;
-                has_motion_word = 1;
-            } else if (value == 92) {
-                coordinate_set = 1;
-            } else if (value == 90) {
-                s_gc.absolute = 1;
-            } else if (value == 91) {
-                s_gc.absolute = 0;
-            } else if (value == 20) {
-                s_gc.mm_units = 0;
-            } else if (value == 21) {
-                s_gc.mm_units = 1;
+            if (value == 0 || value == 1 || value == 2 || value == 3) {
+                g_code = value;
+                if (!jog) {
+                    s_gc.motion_mode = (uint8_t)value;
+                }
             } else if (value == 4) {
-                dwell = 1;
+                g_code = 4;
+            } else if (value == 20) {
+                if (!jog) {
+                    s_gc.mm_units = 0u;
+                }
+            } else if (value == 21) {
+                if (!jog) {
+                    s_gc.mm_units = 1u;
+                }
+            } else if (value == 90) {
+                if (!jog) {
+                    s_gc.absolute = 1u;
+                }
+            } else if (value == 91) {
+                if (!jog) {
+                    s_gc.absolute = 0u;
+                }
+            } else if (value == 92) {
+                coordinate_set = 1u;
             } else {
                 send_error(20);
                 return true;
@@ -426,76 +309,65 @@ static bool process_block(const char *line, uint8_t send_ok_now)
                 send_error(2);
                 return true;
             }
-            if (!(m_code == 0 || m_code == 2 || m_code == 17 || m_code == 18 || m_code == 30 || m_code == 112)) {
-                send_error(20);
-                return true;
-            }
-        } else if (letter == 'X' || letter == 'Y') {
-            int32_t value_um = 0;
-            if (!parse_decimal_scaled(&line, s_gc.mm_units ? 1000 : 25400, &value_um)) {
+        } else if (letter == 'X' || letter == 'Y' || letter == 'I' || letter == 'J' || letter == 'R') {
+            int32_t scaled;
+            if (!parse_decimal_scaled(&line, s_gc.mm_units ? 1000 : 25400, &scaled)) {
                 send_error(2);
                 return true;
             }
             if (letter == 'X') {
-                if (seen_x) {
-                    send_error(25);
-                    return true;
-                }
-                seen_x = 1;
-                x_um = s_gc.absolute ? value_um : s_gc.x_um + value_um;
+                if (seen_x) { send_error(25); return true; }
+                seen_x = 1u;
+                x_word_um = scaled;
+                x_um = (s_gc.absolute && !jog)
+                           ? scaled + s_gc.offset_x_um
+                           : s_gc.x_um + scaled;
+            } else if (letter == 'Y') {
+                if (seen_y) { send_error(25); return true; }
+                seen_y = 1u;
+                y_word_um = scaled;
+                y_um = (s_gc.absolute && !jog)
+                           ? scaled + s_gc.offset_y_um
+                           : s_gc.y_um + scaled;
+            } else if (letter == 'I') {
+                seen_i = 1u;
+                i_um = scaled;
+            } else if (letter == 'J') {
+                seen_j = 1u;
+                j_um = scaled;
             } else {
-                if (seen_y) {
-                    send_error(25);
-                    return true;
-                }
-                seen_y = 1;
-                y_um = s_gc.absolute ? value_um : s_gc.y_um + value_um;
+                seen_r = 1u;
+                r_um = scaled;
             }
         } else if (letter == 'F') {
-            int32_t value = 0;
-            if (!parse_decimal_scaled(&line, 1, &value) || value <= 0) {
+            if (!parse_decimal_scaled(&line, 1, &feed) || feed <= 0) {
                 send_error(4);
                 return true;
             }
-            feed = value;
+        } else if (letter == 'P') {
+            if (!parse_decimal_scaled(&line, 1000, &p_ms) || p_ms < 0) {
+                send_error(4);
+                return true;
+            }
+        } else if (letter == 'S') {
+            if (!parse_decimal_scaled(&line, 1, &s_word) || s_word < 0 || s_word > 1000) {
+                send_error(4);
+                return true;
+            }
         } else if (letter == 'A' || letter == 'B') {
-            int32_t value = 0;
             if (!parse_decimal_scaled(&line, 1, &value)) {
                 send_error(2);
                 return true;
             }
             if (letter == 'A') {
-                if (seen_a) {
-                    send_error(25);
-                    return true;
-                }
-                seen_a = 1;
-                a_pulse = s_gc.absolute ? value : s_gc.p1 + value;
+                seen_a = 1u;
+                a_pulse = value;
             } else {
-                if (seen_b) {
-                    send_error(25);
-                    return true;
-                }
-                seen_b = 1;
-                b_pulse = s_gc.absolute ? value : s_gc.p2 + value;
-            }
-        } else if (letter == 'T') {
-            int32_t value = 0;
-            if (!parse_decimal_scaled(&line, 1, &value) || value <= 0 || value > 65535) {
-                send_error(4);
-                return true;
-            }
-            seen_t = 1;
-            t_ticks = value;
-        } else if (letter == 'P') {
-            int32_t unused = 0;
-            if (!parse_decimal_scaled(&line, 1000, &unused)) {
-                send_error(2);
-                return true;
+                seen_b = 1u;
+                b_pulse = value;
             }
         } else if (letter == 'N') {
-            int32_t unused = 0;
-            if (!parse_int_word(&line, &unused)) {
+            if (!parse_int_word(&line, &value)) {
                 send_error(2);
                 return true;
             }
@@ -505,170 +377,210 @@ static bool process_block(const char *line, uint8_t send_ok_now)
         }
     }
 
-    s_gc.feed_mm_min = feed;
+    if (!jog) {
+        s_gc.feed_mm_min = feed;
+        s_gc.spindle_speed = (uint16_t)s_word;
+        apply_spindle_power();
+    }
 
-    if (m_code == 17) {
-        Stepper_EnableAll(true);
-        if (send_ok_now) {
-            send_ok_for_line(original_line);
+    if (m_code >= 0) {
+        if (m_code == 17) {
+            Stepper_EnableAll(true);
+        } else if (m_code == 18) {
+            Stepper_EnableAll(false);
+        } else if (m_code == 3 || m_code == 4) {
+            if (!MotionPlanner_PlanDwell(1u, MOTION_LASER_OFF)) {
+                send_error(8);
+                return true;
+            }
+            s_gc.laser_mode = (uint8_t)m_code;
+        } else if (m_code == 5) {
+            if (!MotionPlanner_PlanDwell(1u, MOTION_LASER_OFF)) {
+                send_error(8);
+                return true;
+            }
+            s_gc.laser_mode = 0u;
+        } else if (m_code == 0 || m_code == 2 || m_code == 30) {
+            if (!MotionPlanner_PlanDwell(1u, MOTION_LASER_OFF)) {
+                send_error(8);
+                return true;
+            }
+            if (m_code == 2 || m_code == 30) {
+                s_gc.laser_mode = 0u;
+            }
+        } else if (m_code == 112) {
+            SerialDma_FlushRxLines();
+            GcodeStream_Clear();
+            HomeController_Stop();
+            Stepper_EStopAll();
+        } else {
+            send_error(20);
+            return true;
         }
-        return true;
-    }
-    if (m_code == 18) {
-        Stepper_EnableAll(false);
-        if (send_ok_now) {
-            send_ok_for_line(original_line);
-        }
-        return true;
-    }
-    if (m_code == 112) {
-        GcodeStream_Clear();
-        HomeController_Stop();
-        Stepper_EStopAll();
-        if (send_ok_now) {
-            send_ok_for_line(original_line);
-        }
-        return true;
     }
 
     if (coordinate_set) {
-        if (Stepper_IsBusy() || s_count > 0u) {
+        if (MotionPlanner_IsBusy()) {
             send_error(8);
             return true;
         }
+        MotionPlanner_Clear();
         if (seen_a) {
             Stepper_SetPosition(STEPPER_AXIS_1, a_pulse);
-            s_gc.p1 = a_pulse;
         }
         if (seen_b) {
             Stepper_SetPosition(STEPPER_AXIS_2, b_pulse);
-            s_gc.p2 = b_pulse;
         }
-        sync_position_from_stepper();
-        if (send_ok_now) {
-            send_ok_for_line(original_line);
+        if (seen_a || seen_b) {
+            sync_position_from_stepper();
         }
+        if (seen_x) {
+            s_gc.offset_x_um = s_gc.x_um - x_word_um;
+        }
+        if (seen_y) {
+            s_gc.offset_y_um = s_gc.y_um - y_word_um;
+        }
+        send_ok();
         return true;
     }
-
-    if (seen_t || seen_a || seen_b) {
-        if (!(seen_a && seen_b && seen_t)) {
-            send_error(2);
+    if (seen_a || seen_b) {
+        send_error(20);
+        return true;
+    }
+    if (g_code == 4) {
+        if (!MotionPlanner_PlanDwell((uint32_t)p_ms, current_laser_mode())) {
+            send_error(8);
             return true;
         }
-        GcodeBlock block;
-        if (!build_timed_block(a_pulse, b_pulse, (uint16_t)t_ticks, &block)) {
-            send_error(15);
+        send_ok();
+        return true;
+    }
+    if (!seen_x && !seen_y) {
+        send_ok();
+        return true;
+    }
+    if (jog && MotionPlanner_IsBusy()) {
+        send_error(8);
+        return true;
+    }
+    if (MotionPlanner_Free() == 0u) {
+        send_error(8);
+        return true;
+    }
+
+    bool accepted;
+    uint8_t motion = jog ? 1u : (g_code >= 0 ? (uint8_t)g_code : s_gc.motion_mode);
+    if (motion == 2u || motion == 3u) {
+        int32_t cx;
+        int32_t cy;
+        if (seen_i || seen_j) {
+            cx = s_gc.x_um + i_um;
+            cy = s_gc.y_um + j_um;
+        } else if (seen_r && arc_center_from_radius(s_gc.x_um, s_gc.y_um, x_um, y_um, r_um, motion == 2u, &cx, &cy)) {
+            /* Center computed from R. */
+        } else {
+            send_error(33);
             return true;
         }
-        enqueue_block(&block);
-        if (send_ok_now) {
-            send_ok_for_line(original_line);
-        }
-        return true;
+        accepted = MotionPlanner_PlanArc(s_gc.x_um, s_gc.y_um, x_um, y_um, cx, cy,
+                                         motion == 2u, feed, jog != 0u, current_laser_mode());
+    } else {
+        accepted = MotionPlanner_PlanLine(s_gc.x_um, s_gc.y_um, x_um, y_um, feed,
+                                          motion == 0u, jog != 0u, current_laser_mode());
     }
-
-    if (dwell || m_code == 0 || m_code == 2 || m_code == 30 || (!seen_x && !seen_y && !has_motion_word)) {
-        if (send_ok_now) {
-            send_ok_for_line(original_line);
-        }
-        return true;
-    }
-
-    GcodeBlock block;
-    if (!build_motion_block(x_um, y_um, s_gc.motion_mode == 0u, &block)) {
+    if (!accepted) {
         send_error(15);
         return true;
     }
-    enqueue_block(&block);
-    if (send_ok_now) {
-        send_ok_for_line(original_line);
+    s_gc.x_um = x_um;
+    s_gc.y_um = y_um;
+    if (jog) {
+        /*
+         * Defer the jog ACK until the move actually finishes. The host serializes
+         * jogs on this "ok": acknowledging at planner-accept time lets a reversing
+         * jog be issued while the previous one is still draining the segment/stepper
+         * FIFO, where MotionPlanner_IsBusy() rejects it (error:8) and it is silently
+         * dropped, leaving the arm one full jog step short. GcodeStream_Loop emits
+         * the ok once motion is complete.
+         */
+        s_jog_pending_ack = 1u;
+        return true;
     }
+    send_ok();
     return true;
 }
 
 void GcodeStream_Init(void)
 {
-    s_head = 0;
-    s_tail = 0;
-    s_count = 0;
-    s_pending_valid = 0;
-    s_status_due = 0;
-    s_status_divider = 0;
-    s_hold = 0;
-    s_ack_seq = 0;
-    s_start_wait_ms = 0;
     memset(&s_gc, 0, sizeof(s_gc));
-    s_gc.absolute = 1;
-    s_gc.mm_units = 1;
-    s_gc.motion_mode = 0;
+    s_gc.absolute = 1u;
+    s_gc.mm_units = 1u;
+    s_gc.motion_mode = 0u;
     s_gc.feed_mm_min = APP_GCODE_DEFAULT_FEED_MM_MIN;
+    s_status_due = 0u;
+    s_status_divider = 0u;
+    s_hold = 0u;
+    s_home_pending_ack = 0u;
+    s_jog_pending_ack = 0u;
+    s_motion_settle_pending = 0u;
     sync_position_from_stepper();
 }
 
 void GcodeStream_Clear(void)
 {
-    s_head = 0;
-    s_tail = 0;
-    s_count = 0;
-    s_pending_valid = 0;
-    s_start_wait_ms = 0;
+    MotionPlanner_Clear();
+    s_home_pending_ack = 0u;
+    s_jog_pending_ack = 0u;
+    s_motion_settle_pending = 0u;
+    sync_position_from_stepper();
 }
 
-uint8_t GcodeStream_PlannerFree(void)
-{
-    return (uint8_t)(APP_GCODE_PLANNER_BLOCKS - s_count);
-}
-
-uint8_t GcodeStream_PlannerCount(void)
-{
-    return s_count;
-}
+uint8_t GcodeStream_PlannerFree(void) { return MotionPlanner_Free(); }
+uint8_t GcodeStream_PlannerCount(void) { return MotionPlanner_Count(); }
+bool GcodeStream_HomeAckPending(void) { return s_home_pending_ack != 0u; }
 
 void GcodeStream_RequestStatus(void)
 {
-    s_status_due = 1;
+    s_status_due = 1u;
 }
 
 static void send_status(void)
 {
     StepperState state;
     HomeSensorState home;
-    BinaryTrajSnapshot traj;
-    int32_t x = s_gc.x_um;
-    int32_t y = s_gc.y_um;
+    MotionPlannerSnapshot planner;
+    LaserControlState laser;
+    ScaraPose pose = {s_gc.x_um, s_gc.y_um};
     Stepper_GetStateSnapshot(&state);
     HomeSensor_GetState(&home);
-    BinaryTraj_GetSnapshot(&traj);
-    (void)current_xy_from_stepper(&x, &y);
-    const char *mode = Stepper_IsBusy() || s_count > 0 ? "Run" : "Idle";
-    uint32_t err = state.axis[0].error | state.axis[1].error;
-    SerialDma_SendFormat("<%s|M:%ld.%03ld,%ld.%03ld|P:%ld,%ld|Bf:%u,%u|Q:%u|Sq:%u,%u|JT:%s,%lu,%lu,%u,%u|JU:%lu,%lu,%u,%lu|E:%lu|H:%u,%u|HS:%s|Hz:%lu|IC:%lu|A1:%u,%u,%ld,%ld|A2:%u,%u,%ld,%ld>\n",
+    MotionPlanner_GetSnapshot(&planner);
+    LaserControl_GetState(&laser);
+    (void)ScaraKinematics_PulseToPose(state.axis[0].position_pulse, state.axis[1].position_pulse, &pose);
+    const char *mode = s_hold ? "Hold" : (MotionPlanner_IsBusy() ? "Run" : "Idle");
+    const char *home_state = HomeController_StateName(HomeController_GetState());
+    uint32_t stepper_error = state.axis[0].error | state.axis[1].error;
+    SerialDma_SendFormat("<%s|MPos:%ld.%03ld,%ld.%03ld|JPos:%ld,%ld|FS:%ld,%u|Bf:%u,%lu|Q:%u|E:%lu|Seg:%u,%u,%u,%lu|Pf:%lu|Rl:%lu|Pg:%lu|H:%u,%u|HS:%s|A1:%u,%u,%ld,%ld|A2:%u,%u,%ld,%ld|Lz:%u,%u,%u,%u>\n",
                          mode,
-                         (long)(x / 1000), (long)i32_abs(x % 1000),
-                         (long)(y / 1000), (long)i32_abs(y % 1000),
+                         (long)(pose.x_um / 1000), (long)i32_abs(pose.x_um % 1000),
+                         (long)(pose.y_um / 1000), (long)i32_abs(pose.y_um % 1000),
                          (long)state.axis[0].position_pulse,
                          (long)state.axis[1].position_pulse,
-                         (unsigned int)GcodeStream_PlannerFree(),
-                         (unsigned int)SerialDma_RxFreeBytes(),
-                         (unsigned int)GcodeStream_PlannerCount(),
-                         (unsigned int)Stepper_TimedSegmentCount(),
-                         (unsigned int)Stepper_TimedSegmentFree(),
-                         BinaryTraj_StateName(traj.state),
-                         (unsigned long)traj.accepted_count,
-                         (unsigned long)traj.executed_count,
-                         (unsigned int)traj.buffer_count,
-                         (unsigned int)traj.buffer_free,
-                         (unsigned long)traj.stream_underrun_ticks,
-                         (unsigned long)traj.max_dispatch_gap_ticks,
-                         (unsigned int)traj.min_buffer_count,
-                         (unsigned long)traj.stream_underrun_count,
-                         (unsigned long)err,
+                         (long)s_gc.feed_mm_min,
+                         (unsigned int)s_gc.spindle_speed,
+                         (unsigned int)planner.planner_free,
+                         (unsigned long)SerialDma_RxFreeBytes(),
+                         (unsigned int)planner.planner_count,
+                         (unsigned long)stepper_error,
+                         (unsigned int)planner.segment_count,
+                         (unsigned int)planner.segment_free,
+                         (unsigned int)planner.segment_low_water,
+                         (unsigned long)planner.segment_underrun_count,
+                         (unsigned long)planner.preparation_fault_count,
+                         (unsigned long)planner.rate_limited_segment_count,
+                         (unsigned long)planner.max_refill_gap_ms,
                          home.home1_active ? 1u : 0u,
                          home.home2_active ? 1u : 0u,
-                         HomeController_StateName(HomeController_GetState()),
-                         (unsigned long)APP_CONTROL_HZ,
-                         (unsigned long)App_MaxTickCycles(),
+                         home_state,
                          state.axis[0].enabled ? 1u : 0u,
                          state.axis[0].running ? 1u : 0u,
                          (long)state.axis[0].current_pps,
@@ -676,53 +588,47 @@ static void send_status(void)
                          state.axis[1].enabled ? 1u : 0u,
                          state.axis[1].running ? 1u : 0u,
                          (long)state.axis[1].current_pps,
-                         (long)state.axis[1].target_pps);
+                         (long)state.axis[1].target_pps,
+                         laser.armed ? 1u : 0u,
+                         laser.relay_ready ? 1u : 0u,
+                         laser.marking ? 1u : 0u,
+                         (unsigned int)laser.power_permille);
 }
 
 void GcodeStream_Loop(void)
 {
-    /* 主循环消费待入队行和规划块；不会在中断里解析 G-code。 */
-    if (s_pending_valid && !buffer_full()) {
-        char pending[APP_SERIAL_LINE_SIZE];
-        strncpy(pending, s_pending, sizeof(pending) - 1u);
-        pending[sizeof(pending) - 1u] = '\0';
-        s_pending_valid = 0;
-        (void)process_block(pending, 1);
-    }
-
-    if (!s_hold && s_count > 0) {
-        GcodeBlock *block = &s_blocks[s_tail];
-        bool can_dispatch = block->timed ? Stepper_CanQueueTimedSegment() : Stepper_CanAcceptMove();
-        uint8_t start_ready = block->timed || block->rapid || s_count >= 2u || s_start_wait_ms >= APP_GCODE_BLEND_START_DELAY_MS;
-        bool started = false;
-        if (can_dispatch) {
-            if (start_ready && block->timed) {
-                started = Stepper_MoveAbsTicks(block->p1, block->p2, block->duration_ticks);
-            } else if (start_ready) {
-                started = MotionPlanner_MoveAbsBlend(block->p1,
-                                                     block->p2,
-                                                     block->v1_pps,
-                                                     block->v2_pps,
-                                                     block->exit1_pps,
-                                                     block->exit2_pps);
-            }
-            if (started) {
-                s_tail = next_index(s_tail);
-                s_count--;
-                s_start_wait_ms = 0;
-            } else {
-                if (start_ready) {
-                    send_error(15);
-                    s_tail = next_index(s_tail);
-                    s_count--;
-                    s_start_wait_ms = 0;
-                }
-            }
+    if (s_home_pending_ack && !SerialDma_IsTxBusy()) {
+        HomeControllerState home_state = HomeController_GetState();
+        if (home_state == HOME_CTRL_DONE) {
+            sync_position_from_stepper();
+            s_home_pending_ack = 0u;
+            send_ok();
+            return;
+        }
+        if (home_state == HOME_CTRL_ERROR) {
+            s_home_pending_ack = 0u;
+            send_error(5);
+            return;
         }
     }
-
+    if (!s_home_pending_ack) {
+        /* Re-anchor the parser to the executed pulses on the busy->idle edge only,
+         * so mid-stream the parser stays at the last commanded endpoint. */
+        if (MotionPlanner_IsBusy()) {
+            s_motion_settle_pending = 1u;
+        } else if (s_motion_settle_pending) {
+            s_motion_settle_pending = 0u;
+            resync_parser_to_stepper_if_diverged();
+        }
+    }
+    if (s_jog_pending_ack && !SerialDma_IsTxBusy() && !MotionPlanner_IsBusy()) {
+        /* Jog motion has fully drained (planner empty and stepper idle). */
+        s_jog_pending_ack = 0u;
+        send_ok();
+        return;
+    }
     if (s_status_due && !SerialDma_IsTxBusy()) {
-        s_status_due = 0;
+        s_status_due = 0u;
         send_status();
     }
 }
@@ -731,131 +637,158 @@ void GcodeStream_Tick1kHz(void)
 {
     s_status_divider++;
     if (s_status_divider >= APP_GCODE_STATUS_PERIOD_MS) {
-        s_status_divider = 0;
-        s_status_due = 1;
+        s_status_divider = 0u;
+        s_status_due = 1u;
     }
-    if (s_count > 0u && s_start_wait_ms < APP_GCODE_BLEND_START_DELAY_MS) {
-        s_start_wait_ms++;
+}
+
+static bool process_setting(const char *line)
+{
+    long value = 0;
+    long value2 = 0;
+    if (sscanf(line, "$100=%ld $101=%ld", &value, &value2) == 2) {
+        if (value <= 0 || value2 <= 0 || MotionPlanner_IsBusy()) {
+            send_error((value <= 0 || value2 <= 0) ? 4u : 8u);
+            return true;
+        }
+        AppParams *params = AppParams_Mutable();
+        params->pulses_per_rev[0] = (int32_t)value;
+        params->pulses_per_rev[1] = (int32_t)value2;
+        send_ok();
+        return true;
     }
+    if (sscanf(line, "$100=%ld", &value) == 1 || sscanf(line, "$101=%ld", &value) == 1) {
+        if (value <= 0 || MotionPlanner_IsBusy()) {
+            send_error(value <= 0 ? 4u : 8u);
+            return true;
+        }
+        AppParams *params = AppParams_Mutable();
+        if (line[3] == '0') {
+            params->pulses_per_rev[0] = (int32_t)value;
+        } else {
+            params->pulses_per_rev[1] = (int32_t)value;
+        }
+        send_ok();
+        return true;
+    }
+    if (sscanf(line, "$11=%ld", &value) == 1) {
+        MotionPlanner_SetJunctionDeviation((float)value / 1000.0f);
+        send_ok();
+        return true;
+    }
+    if (sscanf(line, "$12=%ld", &value) == 1) {
+        MotionPlanner_SetArcTolerance((float)value / 1000.0f);
+        send_ok();
+        return true;
+    }
+    if (sscanf(line, "$110=%ld", &value) == 1 || sscanf(line, "$111=%ld", &value) == 1) {
+        if (value <= 0 || MotionPlanner_IsBusy()) {
+            send_error(value <= 0 ? 4u : 8u);
+            return true;
+        }
+        MotionPlanner_SetMaxFeed((float)value);
+        send_ok();
+        return true;
+    }
+    if (sscanf(line, "$120=%ld", &value) == 1 || sscanf(line, "$121=%ld", &value) == 1) {
+        if (value <= 0 || MotionPlanner_IsBusy()) {
+            send_error(value <= 0 ? 4u : 8u);
+            return true;
+        }
+        MotionPlanner_SetAcceleration((float)value);
+        send_ok();
+        return true;
+    }
+    if (strcmp(line, "$$") == 0) {
+        const AppParams *params = AppParams_Get();
+        SerialDma_SendFormat("$11=%ld\n$12=%ld\n$100=%ld\n$101=%ld\n$110=%ld\n$111=%ld\n$120=%ld\n$121=%ld\nok\n",
+                             (long)lroundf(MotionPlanner_GetJunctionDeviation() * 1000.0f),
+                             (long)lroundf(MotionPlanner_GetArcTolerance() * 1000.0f),
+                             (long)params->pulses_per_rev[0],
+                             (long)params->pulses_per_rev[1],
+                             (long)lroundf(MotionPlanner_GetMaxFeed()),
+                             (long)lroundf(MotionPlanner_GetMaxFeed()),
+                             (long)lroundf(MotionPlanner_GetAcceleration()),
+                             (long)lroundf(MotionPlanner_GetAcceleration()));
+        return true;
+    }
+    return false;
 }
 
 bool GcodeStream_TryProcessLine(const char *line)
 {
-    if (line == 0 || !starts_gcode(line)) {
+    if (line == NULL || !starts_gcode(line)) {
         return false;
     }
-
     while (*line != '\0' && isspace((unsigned char)*line)) {
         line++;
     }
-
     if (line[0] == '?') {
         GcodeStream_RequestStatus();
         return true;
     }
     if (line[0] == '!') {
-        s_hold = 1;
-        GcodeStream_Clear();
-        BinaryTraj_Stop();
-        MotionPlanner_Stop();
+        s_hold = 1u;
+        MotionPlanner_SetHold(true);
         return true;
     }
     if (line[0] == '~') {
-        s_hold = 0;
+        s_hold = 0u;
+        MotionPlanner_SetHold(false);
         return true;
     }
     if ((unsigned char)line[0] == 0x18u) {
+        SerialDma_FlushRxLines();
         GcodeStream_Clear();
-        BinaryTraj_Stop();
-        s_hold = 0;
-        MotionPlanner_Stop();
+        HomeController_Stop();
+        HomeController_ClearError();
+        Stepper_StopAll();
         Stepper_ClearError();
+        s_hold = 0u;
+        return true;
+    }
+    if ((unsigned char)line[0] == 0x85u) {
+        MotionPlanner_Stop();
         sync_position_from_stepper();
-        send_ok_for_line(line);
+        s_hold = 0u;
         return true;
     }
     if (line[0] == '$') {
-        long ppr1 = 0;
-        long ppr2 = 0;
-        if (sscanf(line, "$100=%ld $101=%ld", &ppr1, &ppr2) == 2 ||
-            sscanf(line, "$100=%ld", &ppr1) == 1) {
-            if (ppr2 <= 0) {
-                ppr2 = ppr1;
-            }
-            if (ppr1 <= 0 || ppr2 <= 0) {
-                send_error(4);
-            } else if (Stepper_IsBusy() || GcodeStream_PlannerCount() > 0u) {
-                send_error(8);
-            } else {
-                AppParams *p = AppParams_Mutable();
-                p->pulses_per_rev[0] = (int32_t)ppr1;
-                p->pulses_per_rev[1] = (int32_t)ppr2;
-                sync_position_from_stepper();
-                send_ok_for_line(line);
-            }
-            return true;
+        if (toupper((unsigned char)line[1]) == 'J' && line[2] == '=') {
+            return process_block(line);
         }
-        if (strcmp(line, "$$") == 0) {
-            const AppParams *p = AppParams_Get();
-            SerialDma_SendFormat("$100=%ld\n$101=%ld\n$110=%ld\n$111=%ld\nok\n",
-                                 (long)p->pulses_per_rev[0],
-                                 (long)p->pulses_per_rev[1],
-                                 (long)APP_CONTROL_HZ,
-                                 (long)APP_GCODE_PLANNER_BLOCKS);
-            return true;
-        }
-        char cmd = (char)toupper((unsigned char)line[1]);
-        if (cmd == 'X') {
+        if (toupper((unsigned char)line[1]) == 'X') {
             Stepper_ClearError();
-            send_ok_for_line(line);
-        } else if (cmd == 'H') {
-            const char *home_args = line;
-            while (*home_args != '\0' && !isspace((unsigned char)*home_args)) {
-                home_args++;
-            }
-            while (*home_args != '\0' && isspace((unsigned char)*home_args)) {
-                home_args++;
-            }
-            bool simulated = (toupper((unsigned char)home_args[0]) == 'S');
-            if (HomeController_Start(simulated)) {
-                send_ok_for_line(line);
+            HomeController_ClearError();
+            send_ok();
+            return true;
+        }
+        if (toupper((unsigned char)line[1]) == 'H') {
+            if (MotionPlanner_IsBusy()) {
+                send_error(8);
+            } else if (HomeController_Start(is_home_sim_command(line))) {
+                MotionPlanner_Clear();
+                s_home_pending_ack = 1u;
             } else {
                 send_error(5);
             }
-        } else if (cmd == 'G') {
-            SerialDma_SendFormat("[GC:G%u G%u G%u F%ld]\n",
+            return true;
+        }
+        if (toupper((unsigned char)line[1]) == 'G') {
+            SerialDma_SendFormat("[GC:G%u G%u G%u M%u F%ld S%u]\nok\n",
                                  (unsigned int)s_gc.motion_mode,
                                  s_gc.absolute ? 90u : 91u,
                                  s_gc.mm_units ? 21u : 20u,
-                                 (long)s_gc.feed_mm_min);
-            send_ok_for_line(line);
-        } else {
-            send_error(3);
+                                 (unsigned int)s_gc.laser_mode,
+                                 (long)s_gc.feed_mm_min,
+                                 (unsigned int)s_gc.spindle_speed);
+            return true;
         }
+        if (process_setting(line)) {
+            return true;
+        }
+        send_error(3);
         return true;
     }
-
-    if ((toupper((unsigned char)line[0]) == 'M') &&
-        (line[1] == '1') && (line[2] == '1') && (line[3] == '2')) {
-        GcodeStream_Clear();
-        BinaryTraj_Stop();
-        HomeController_Stop();
-        Stepper_EStopAll();
-        send_ok_for_line(line);
-        return true;
-    }
-
-    if (s_pending_valid) {
-        send_error(8);
-        return true;
-    }
-
-    if (buffer_full()) {
-        strncpy(s_pending, line, sizeof(s_pending) - 1u);
-        s_pending[sizeof(s_pending) - 1u] = '\0';
-        s_pending_valid = 1;
-        return true;
-    }
-
-    return process_block(line, 1);
+    return process_block(line);
 }

@@ -32,7 +32,7 @@ Push-Location $projectRoot
 try {
     $flashed = $false
     foreach ($interface in $interfaces) {
-        Write-Host "Flashing v0.26.3 with $interface; motor-driver power confirmed off."
+        Write-Host "Flashing v0.28.0 with $interface; motor-driver and laser power confirmed off."
         & openocd -f $interface -f target/stm32f1x.cfg -c "program build/Debug/SCARA_F103.elf verify reset exit"
         if ($LASTEXITCODE -eq 0) {
             $flashed = $true

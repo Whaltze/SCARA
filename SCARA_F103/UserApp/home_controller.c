@@ -5,6 +5,7 @@
 #include "app_config.h"
 #include "app_params.h"
 #include "home_sensor.h"
+#include "laser_control.h"
 #include "stepper_driver.h"
 
 #define HOME_MRAD_PER_REV_I 6283LL
@@ -13,7 +14,8 @@ typedef enum {
     HOME_ERR_NONE = 0,
     HOME_ERR_BUSY = 1,
     HOME_ERR_TIMEOUT = 2,
-    HOME_ERR_MOVE = 3
+    HOME_ERR_MOVE = 3,
+    HOME_ERR_SWITCH_ACTIVE = 4
 } HomeError;
 
 static HomeControllerState s_state;
@@ -152,6 +154,7 @@ void HomeController_Init(void)
 
 bool HomeController_Start(bool simulated)
 {
+    LaserControl_Disarm();
     if (s_state == HOME_CTRL_DONE || s_state == HOME_CTRL_ERROR) {
         enter_state(HOME_CTRL_IDLE);
         s_error = HOME_ERR_NONE;
@@ -161,6 +164,14 @@ bool HomeController_Start(bool simulated)
         s_state == HOME_CTRL_AXIS2_SEARCH || s_state == HOME_CTRL_AXIS2_RETURN) {
         s_error = HOME_ERR_BUSY;
         return false;
+    }
+    if (!simulated) {
+        HomeSensorState home;
+        HomeSensor_GetState(&home);
+        if (home.home1_active || home.home2_active) {
+            s_error = HOME_ERR_SWITCH_ACTIVE;
+            return false;
+        }
     }
     Stepper_ClearError();
     Stepper_EnableAll(true);

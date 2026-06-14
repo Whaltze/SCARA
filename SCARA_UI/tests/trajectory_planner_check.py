@@ -1,354 +1,334 @@
-import importlib.util
-import inspect
-import math
-from dataclasses import dataclass
 from pathlib import Path
+import math
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from SCARA_UI.motion.motion_mixin import ScaraMotionMixin
+from SCARA_UI.trajectory.look_ahead import LookAheadPlanner
+from SCARA_UI.ui.plotting import ScaraPlotMixin
+from SCARA_UI.ui.ui_mixin import HandwritingPad
 
 
-def load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, ROOT / path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-kinematics_mod = load_module("kinematics", "SCARA_UI/core/kinematics.py")
-planner_mod = load_module("look_ahead", "SCARA_UI/trajectory/look_ahead.py")
-motion_mod = load_module("motion_mixin", "SCARA_UI/motion/motion_mixin.py")
-protocol_mod = load_module("serial_protocol", "SCARA_UI/communication/serial_protocol.py")
-
-MRAD_PER_REV = motion_mod.ScaraMotionMixin.BINARY_MRAD_PER_REV
-DEFAULT_ZERO_MRAD = motion_mod.ScaraMotionMixin.BINARY_ZERO_MRAD
-FLAG_EXACT_STOP = motion_mod.ScaraMotionMixin.BINARY_FLAG_EXACT_STOP
-FLAG_CARTESIAN_LINE = motion_mod.ScaraMotionMixin.BINARY_FLAG_CARTESIAN_LINE
-FLAG_HOST_SEGMENT = motion_mod.ScaraMotionMixin.BINARY_FLAG_HOST_SEGMENT
-
-if "generate_binary_line_targets" not in inspect.getsource(motion_mod.ScaraMotionMixin.plan_trajectory):
-    raise AssertionError("G1 UI button is not using the binary geometric line path")
-
-
-@dataclass
-class JointPoint:
-    p1_abs: int
-    p2_abs: int
-    v_dom_pps: int
-    flags: int
-
-
-def joint_deg_to_pulse(theta1_deg, theta2_deg, ppr, zero_mrad=DEFAULT_ZERO_MRAD):
-    theta1_mrad = math.radians(float(theta1_deg)) * 1000.0
-    theta2_mrad = math.radians(float(theta2_deg)) * 1000.0
-    p1 = int(round(((theta1_mrad - zero_mrad[0]) * int(ppr)) / MRAD_PER_REV))
-    p2 = int(round(((theta2_mrad - zero_mrad[1]) * int(ppr)) / MRAD_PER_REV))
-    return p1, p2
-
-
-def path_to_joint_points(path, kinematics, ppr, start_xy=None):
-    result = []
-    start_xy = start_xy or (float(path[0][0]), float(path[0][1]))
-    prev = joint_deg_to_pulse(*kinematics.inverse(*start_xy), ppr)
-    for point in path:
-        q = kinematics.inverse(float(point[0]), float(point[1]))
-        pulse = joint_deg_to_pulse(*q, ppr)
-        flags = int(point[4]) if len(point) > 4 else 0
-        dom = max(abs(pulse[0] - prev[0]), abs(pulse[1] - prev[1]))
-        feed = max(1.0, float(point[2]) / 60.0) if len(point) > 2 else 1.0
-        v_dom = max(16, min(10000, int(round(dom * feed))))
-        result.append(JointPoint(pulse[0], pulse[1], v_dom, flags))
-        prev = pulse
-    return result
-
-
-class DummyLog:
+class GeometryOwner(ScaraMotionMixin):
     def __init__(self):
-        self.items = []
-
-    def append(self, item):
-        self.items.append(item)
-
-
-class DummyUi(motion_mod.ScaraMotionMixin):
-    def __init__(self):
-        self.L0, self.L1, self.L2 = 150.0, 160.0, 200.0
-        self.current_ppr = 3200
-        self.kinematics = kinematics_mod.FiveBarKinematics()
-        self.HOME_X, self.HOME_Y = self.kinematics.forward(90.0, 90.0)
-        self.cur_x, self.cur_y = self.HOME_X, self.HOME_Y
-        self.path_planner = planner_mod.LookAheadPlanner(accel_mm_s2=100.0, junction_deviation=0.02, sample_dt=0.02)
+        self.cur_x = 75.0
+        self.cur_y = 220.0
+        self.path_planner = LookAheadPlanner(accel_mm_s2=100.0, junction_deviation=0.02)
+        self.junction_dev = 0.02
         self.errors = []
-        self.log_display = DummyLog()
 
-    def log_error(self, msg):
-        self.errors.append(str(msg))
+    def ui_to_mcu_xy(self, x, y):
+        return x - 75.0, y
 
+    def _read_run_accel_mm_s2(self):
+        return 80.0
 
-def assert_true(condition, message):
-    if not condition:
-        raise AssertionError(message)
+    def validate_trajectory_points(self, _points, label="trajectory"):
+        return True
 
-
-def speed_mm_s(path):
-    return [float(item[2]) / 60.0 for item in path]
-
-
-def assert_accel_limited(path, accel_mm_s2, name):
-    speeds = speed_mm_s(path)
-    for index in range(1, len(path)):
-        dx = float(path[index][0]) - float(path[index - 1][0])
-        dy = float(path[index][1]) - float(path[index - 1][1])
-        ds = math.hypot(dx, dy)
-        dv2 = abs(speeds[index] ** 2 - speeds[index - 1] ** 2)
-        allowed = 2.0 * accel_mm_s2 * ds + 0.75
-        assert_true(dv2 <= allowed, f"{name} accel jump at {index}: dv2={dv2:.3f} allowed={allowed:.3f}")
+    def log_error(self, message):
+        self.errors.append(str(message))
 
 
-def assert_no_mid_speed_drop(path, name):
-    speeds = speed_mm_s(path)
-    assert_true(len(speeds) > 20, f"{name} produced too few planner points")
-    vmax = max(speeds)
-    start = len(speeds) // 5
-    end = len(speeds) * 4 // 5
-    mid_min = min(speeds[start:end])
-    assert_true(mid_min >= vmax * 0.80, f"{name} mid-curve speed drop: min={mid_min:.3f} max={vmax:.3f}")
+def check_real_geometry_gcode():
+    owner = GeometryOwner()
+    line = owner.path_planner.line_segment((75.0, 220.0), (85.0, 220.0))
+    arc = owner.path_planner.arc_segment((85.0, 220.0), (95.0, 230.0), 10.0, clockwise=False)
+    commands = owner.generate_geometry_gcode([line, arc], 20.0, start=(75.0, 220.0))
+    assert commands[0].startswith("G1 ")
+    assert commands[1].startswith("G3 ")
+    assert " I" in commands[1] and " J" in commands[1]
+    assert len(commands) == 2
+
+    small_arc = owner.path_planner.arc_segment((75.0, 220.0), (77.0, 222.0), 2.0, clockwise=False)
+    small_commands = owner.generate_geometry_gcode([small_arc], 20.0, start=(75.0, 220.0))
+    assert len(small_commands) == 1
+    assert small_commands[0].startswith("G3 ")
+
+    car_segments = owner.build_car1_segments(75.0, 200.0)
+    body_points = [
+        (75.0, 200.0),
+        (75.0, 224.0),
+        (147.0, 224.0),
+        (147.0, 248.0),
+        (183.0, 248.0),
+        (195.0, 236.0),
+        (195.0, 200.0),
+        (183.0, 200.0),
+    ]
+    car_endpoints = [car_segments[0].start] + [segment.end for segment in car_segments]
+    assert all(point in car_endpoints for point in body_points)
+    assert all(segment.kind == "line" for segment in car_segments[:7])
+
+    car = owner.generate_geometry_gcode(car_segments, 20.0, start=(75.0, 220.0))
+    assert sum(line.startswith(("G2 ", "G3 ")) for line in car) == 2
+    assert car.count("G4 P0.001") == 1
+    for x, y in body_points:
+        expected = f"X{x - 75.0:.3f} Y{y:.3f}"
+        assert any(expected in line for line in car), expected
 
 
-def assert_path_safe(ui, path, name):
-    assert_true(path, f"{name} generated no points")
-    assert_true(ui.validate_trajectory_points(path, name), f"{name} failed five-bar limit validation")
+def check_look_ahead():
+    planner = LookAheadPlanner(accel_mm_s2=100.0, junction_deviation=0.02)
+    straight = [
+        planner.line_segment((0.0, 0.0), (30.0, 0.0)),
+        planner.line_segment((30.0, 0.0), (60.0, 0.0)),
+    ]
+    corner = [
+        planner.line_segment((0.0, 0.0), (30.0, 0.0)),
+        planner.line_segment((30.0, 0.0), (30.0, 30.0)),
+    ]
+    planner.plan_segments(straight, 20.0)
+    planner.plan_segments(corner, 20.0)
+    assert math.isclose(straight[1].entry_speed, 20.0, rel_tol=0.05)
+    assert corner[1].entry_speed > 0.0
+    assert corner[1].entry_speed < straight[1].entry_speed
+
+    sharp = [
+        planner.line_segment((0.0, 0.0), (30.0, 0.0)),
+        planner.line_segment((30.0, 0.0), (4.019, 15.0)),
+    ]
+    planner.plan_segments(sharp, 20.0)
+    assert sharp[1].entry_speed < corner[1].entry_speed
+
+    reversal = [
+        planner.line_segment((0.0, 0.0), (30.0, 0.0)),
+        planner.line_segment((30.0, 0.0), (0.0, 0.0)),
+    ]
+    planner.plan_segments(reversal, 20.0)
+    assert reversal[1].entry_speed == 0.0
 
 
-def assert_bounds(path, expected, name):
-    xs = [float(item[0]) for item in path]
-    ys = [float(item[1]) for item in path]
-    actual = (min(xs), max(xs), min(ys), max(ys))
-    for got, want, label in zip(actual, expected, ("min_x", "max_x", "min_y", "max_y")):
-        assert_true(abs(got - want) <= 0.05, f"{name} {label}: got {got:.3f}, want {want:.3f}")
+def check_stroke_geometry_stream():
+    owner = GeometryOwner()
+    strokes = [
+        [(75.0, 220.0), (85.0, 220.0), (85.0, 230.0)],
+        [(95.0, 230.0), (105.0, 230.0)],
+    ]
+    groups = owner._stroke_geometry_groups(strokes, label="test writing")
+    assert all(segment.kind == "line" for group in groups for segment in group)
+    first_group = groups[0]
+    assert first_group[0].end == (85.0, 220.0)
+    assert first_group[1].start == (85.0, 220.0)
+
+    preview, command_source, command_count = owner.generate_stroke_motion(strokes, 20.0, label="test writing")
+    commands = list(command_source)
+    geometry = [line for line in commands if line.startswith(("G1 ", "G2 ", "G3 "))]
+    assert preview
+    assert geometry
+    assert len(geometry) < len(preview)
+    assert all("F1200" in line for line in geometry)
+    assert not any(line.startswith(("G2 ", "G3 ")) for line in geometry)
+    assert any("X10.000 Y220.000" in line for line in geometry)
+    assert commands.count("G4 P0.001") >= 2
+    assert any(line.startswith("G0 ") for line in commands)
+    assert command_count == len(commands)
+    assert math.isclose(owner.path_planner.accel_mm_s2, 80.0)
 
 
-def assert_has_arc(segments, name):
-    assert_true(any(segment.kind == "arc" for segment in segments), f"{name} did not include rounded arc segments")
+def check_every_writing_input_point_is_retained():
+    owner = GeometryOwner()
+    stroke = [
+        (75.0, 220.0),
+        (75.05, 220.02),
+        (75.10, 220.0),
+        (75.15, 220.08),
+        (75.20, 220.0),
+    ]
+    groups = owner._stroke_geometry_groups([stroke], label="exact writing")
+    assert len(groups) == 1
+    endpoints = [groups[0][0].start] + [segment.end for segment in groups[0]]
+    assert endpoints == stroke
+
+    preview, command_source, command_count = owner.generate_stroke_motion([stroke], 20.0, label="exact writing")
+    commands = list(command_source)
+    geometry = [line for line in commands if line.startswith("G1 ")]
+    assert len(geometry) == len(stroke) - 1
+    for x, y in stroke[1:]:
+        assert any(f"X{x - 75.0:.3f} Y{y:.3f}" in line for line in geometry)
+    assert command_count == len(commands)
+    flagged = [(point[0], point[1]) for point in preview if len(point) > 4 and point[4]]
+    assert flagged == stroke[1:]
 
 
-def assert_has_line_between(segments, start, end, name):
-    for segment in segments:
-        if segment.kind != "line":
-            continue
-        if (
-            abs(segment.start[0] - start[0]) <= 0.05
-            and abs(segment.start[1] - start[1]) <= 0.05
-            and abs(segment.end[0] - end[0]) <= 0.05
-            and abs(segment.end[1] - end[1]) <= 0.05
-        ):
-                return
-    raise AssertionError(f"{name} missing preserved line {start}->{end}")
+def check_preview_decimation_preserves_key_points():
+    class ExpectedPath:
+        def set_expected_path(self, path):
+            self.path = list(path)
+
+    class PreviewOwner(ScaraPlotMixin):
+        MAX_PREVIEW_POINTS = 4
+
+        def __init__(self):
+            self.feedback_error_tracker = ExpectedPath()
+
+        def update_plot(self, force=False):
+            return
+
+        def _update_feedback_error_label(self):
+            return
+
+    owner = PreviewOwner()
+    path = [(float(index), 0.0, 100.0, False, index in (3, 7)) for index in range(10)]
+    owner.set_planned_preview(path)
+    assert owner.preview_x == [0.0, 3.0, 7.0, 9.0]
+    assert len(owner.feedback_error_tracker.path) == len(path)
 
 
-def assert_arc_endpoints_consistent(segments, name):
-    for index, segment in enumerate(segments):
-        if segment.kind != "arc":
-            continue
-        end = segment.point_at(segment.length)
-        error = math.hypot(end[0] - segment.end[0], end[1] - segment.end[1])
-        assert_true(error <= 1e-6, f"{name} arc {index} endpoint mismatch: {error:.6f}mm")
+def check_handwriting_release_endpoint_is_recorded():
+    class Pad:
+        CAPTURE_MIN_DELTA = HandwritingPad.CAPTURE_MIN_DELTA
+        _append_event_point = HandwritingPad._append_event_point
+
+        def __init__(self):
+            self._strokes = [[(0.1, 0.1)]]
+
+        def _event_point(self, event):
+            return event
+
+    pad = Pad()
+    assert pad._append_event_point((0.2, 0.2))
+    assert pad._strokes[-1][-1] == (0.2, 0.2)
+    assert not pad._append_event_point((0.2001, 0.2001))
 
 
-def point_line_error(px, py, ax, ay, bx, by):
-    vx = bx - ax
-    vy = by - ay
-    den = vx * vx + vy * vy
-    if den <= 1e-12:
-        return math.hypot(px - ax, py - ay)
-    t = ((px - ax) * vx + (py - ay) * vy) / den
-    t = max(0.0, min(1.0, t))
-    return math.hypot(px - (ax + vx * t), py - (ay + vy * t))
+def check_large_stroke_simplification_is_iterative():
+    owner = GeometryOwner()
+    points = [(75.0 + index * 0.02, 220.0 + (0.25 if index % 2 else 0.0)) for index in range(5000)]
+    simplified = owner._rdp_points(points, 0.01)
+    assert simplified[0] == points[0]
+    assert simplified[-1] == points[-1]
+    assert len(simplified) > 1000
 
 
-def max_joint_linearized_line_error(ui, start, targets, ppr=3200):
-    prev_pulse = joint_deg_to_pulse(*ui.kinematics.inverse(*start), ppr)
-    max_error = 0.0
-    for target in targets:
-        x, y = target[0], target[1]
-        pulse = joint_deg_to_pulse(*ui.kinematics.inverse(x, y), ppr)
-        steps = max(abs(pulse[0] - prev_pulse[0]), abs(pulse[1] - prev_pulse[1]), 1)
-        for index in range(1, steps + 1):
-            t = index / steps
-            p1 = round(prev_pulse[0] + (pulse[0] - prev_pulse[0]) * t)
-            p2 = round(prev_pulse[1] + (pulse[1] - prev_pulse[1]) * t)
-            q1 = math.degrees(((p1 * MRAD_PER_REV / ppr) + DEFAULT_ZERO_MRAD[0]) / 1000.0)
-            q2 = math.degrees(((p2 * MRAD_PER_REV / ppr) + DEFAULT_ZERO_MRAD[1]) / 1000.0)
-            xy = ui.kinematics.forward(q1, q2)
-            max_error = max(max_error, point_line_error(xy[0], xy[1], start[0], start[1], targets[-1][0], targets[-1][1]))
-        prev_pulse = pulse
-    return max_error
+def check_semantic_font_path_preserves_line_corner():
+    owner = GeometryOwner()
+
+    class Element:
+        def __init__(self, kind, x, y):
+            self.kind = kind
+            self.x = x
+            self.y = y
+
+        def isMoveTo(self):
+            return self.kind == "move"
+
+        def isLineTo(self):
+            return self.kind == "line"
+
+        def isCurveTo(self):
+            return self.kind == "curve"
+
+    class Path:
+        elements = [
+            Element("move", 0.0, 0.0),
+            Element("line", 10.0, 0.0),
+            Element("line", 10.0, 10.0),
+            Element("curve", 12.0, 12.0),
+            Element("data", 18.0, 12.0),
+            Element("data", 20.0, 10.0),
+        ]
+
+        def elementCount(self):
+            return len(self.elements)
+
+        def elementAt(self, index):
+            return self.elements[index]
+
+    contours = owner._qt_path_contours(Path(), lambda x, y: (x, y))
+    assert len(contours) == 1
+    assert contours[0][1] == (10.0, 0.0)
+    assert contours[0][2] == (10.0, 10.0)
+    assert contours[0][-1] == (20.0, 10.0)
+    assert len(contours[0]) > 4
 
 
-def max_joint_path_error(ui, start, targets, expected_path, ppr=3200):
-    prev_pulse = joint_deg_to_pulse(*ui.kinematics.inverse(*start), ppr)
-    expected = [(float(p[0]), float(p[1])) for p in expected_path]
-    expanded = []
-    cursor = (float(start[0]), float(start[1]))
-    for target in targets:
-        x, y = float(target[0]), float(target[1])
-        flags = int(target[4]) if len(target) > 4 else 0
-        expanded.append((x, y))
-        cursor = (x, y)
-    max_error = 0.0
-    for x, y in expanded:
-        pulse = joint_deg_to_pulse(*ui.kinematics.inverse(x, y), ppr)
-        steps = max(abs(pulse[0] - prev_pulse[0]), abs(pulse[1] - prev_pulse[1]), 1)
-        for index in range(1, steps + 1):
-            t = index / steps
-            p1 = round(prev_pulse[0] + (pulse[0] - prev_pulse[0]) * t)
-            p2 = round(prev_pulse[1] + (pulse[1] - prev_pulse[1]) * t)
-            q1 = math.degrees(((p1 * MRAD_PER_REV / ppr) + DEFAULT_ZERO_MRAD[0]) / 1000.0)
-            q2 = math.degrees(((p2 * MRAD_PER_REV / ppr) + DEFAULT_ZERO_MRAD[1]) / 1000.0)
-            xy = ui.kinematics.forward(q1, q2)
-            nearest = min(
-                point_line_error(xy[0], xy[1], expected[i][0], expected[i][1], expected[i + 1][0], expected[i + 1][1])
-                for i in range(len(expected) - 1)
-            )
-            max_error = max(max_error, nearest)
-        prev_pulse = pulse
-    return max_error
+def check_teach_chaining():
+    owner = GeometryOwner()
+    planner = owner.path_planner
 
+    def on_arc(seg, p):
+        if abs(math.hypot(p[0] - seg.center[0], p[1] - seg.center[1]) - seg.radius) > 1e-4:
+            return False
+        ang = math.atan2(p[1] - seg.center[1], p[0] - seg.center[0])
+        off = (ang - seg.start_angle) % (2.0 * math.pi)
+        d = seg.delta_angle
+        if d >= 0.0:
+            return -1e-6 <= off <= d + 1e-6
+        return d - 1e-6 <= off - 2.0 * math.pi <= 1e-6
 
-def assert_closed_strokes(ui, strokes, name):
-    assert_true(strokes, f"{name} generated no text contours")
-    for index, stroke in enumerate(strokes):
-        assert_true(ui._is_closed_stroke(stroke, threshold=0.5), f"{name} contour {index} is not closed")
+    # 3-point arc: unit circle, CCW upper semicircle through (1,0)->(0,1)->(-1,0).
+    seg = planner.arc_segment_3pt((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))
+    assert seg.kind == "arc"
+    assert abs(seg.radius - 1.0) < 1e-6
+    assert abs(seg.center[0]) < 1e-6 and abs(seg.center[1]) < 1e-6
+    assert seg.delta_angle > 0.0  # CCW because the middle point is above
+    assert math.hypot(seg.point_at(0.0)[0] - 1.0, seg.point_at(0.0)[1]) < 1e-9
+    assert math.hypot(seg.point_at(seg.length)[0] + 1.0, seg.point_at(seg.length)[1]) < 1e-9
+    assert on_arc(seg, (0.0, 1.0))  # passes through the middle point
+    # A clockwise version (middle point below) flips the sweep sign.
+    seg_cw = planner.arc_segment_3pt((1.0, 0.0), (0.0, -1.0), (-1.0, 0.0))
+    assert seg_cw.delta_angle < 0.0
 
+    # Collinear / coincident points cannot form an arc.
+    for bad in (((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)), ((0.0, 0.0), (0.0, 0.0), (1.0, 1.0))):
+        try:
+            planner.arc_segment_3pt(*bad)
+            raise AssertionError("collinear/coincident points must raise")
+        except ValueError:
+            pass
 
-def assert_host_segments_valid(ui, path, start_xy, name):
-    segments = ui.build_host_segments_from_path(path, start_xy=start_xy, label=name)
-    assert_true(segments, f"{name} produced no HOST_SEGMENT output")
-    q1, q2 = ui.inverse_kinematics(start_xy[0], start_xy[1])
-    assert_true(q1 is not None and q2 is not None, f"{name} invalid host start")
-    last = ui._joint_deg_to_pulse(q1, q2)
-    for index, segment in enumerate(segments):
-        assert_true(segment.flags & FLAG_HOST_SEGMENT, f"{name} segment {index} lost HOST flag")
-        duration = int(segment.duration_ticks)
-        dominant = max(abs(int(segment.p1_abs) - last[0]), abs(int(segment.p2_abs) - last[1]))
-        assert_true(duration >= 1, f"{name} segment {index} has zero duration")
-        assert_true(duration <= 65535, f"{name} segment {index} exceeds uint16 duration")
-        assert_true(dominant <= duration, f"{name} segment {index} requests multi-pulse tick: d={dominant} ticks={duration}")
-        last = (int(segment.p1_abs), int(segment.p2_abs))
-    assert_true(segments[-1].flags & FLAG_EXACT_STOP, f"{name} final host segment is not exact-stop")
-    return segments
+    # Line chain: N points -> N-1 shared-endpoint line segments.
+    line_pts = [(0.0, 200.0), (10.0, 200.0), (10.0, 210.0), (0.0, 210.0)]
+    line_segs = owner._teach_primitive_segments("直线模式", line_pts)
+    assert len(line_segs) == len(line_pts) - 1
+    assert all(s.kind == "line" for s in line_segs)
+    for a, b in zip(line_segs, line_segs[1:]):
+        assert math.hypot(a.end[0] - b.start[0], a.end[1] - b.start[1]) < 1e-9
+    assert owner._teach_primitive_count("直线模式", len(line_pts)) == len(line_pts) - 1
+
+    # Arc chain: shared endpoints, N//2 arcs, last teach point always covered (wrap when needed).
+    def circle_points(n):
+        cx, cy, r = 75.0, 200.0, 40.0
+        return [(cx + r * math.cos(i * 0.6), cy + r * math.sin(i * 0.6)) for i in range(n)]
+
+    for n in (3, 4, 5, 6, 7, 8):
+        pts = circle_points(n)
+        segs = owner._teach_arc_chain(pts)
+        assert len(segs) == n // 2, f"N={n}: expected {n // 2} arcs, got {len(segs)}"
+        assert owner._teach_primitive_count("圆弧模式", n) == n // 2
+        assert all(s.kind == "arc" for s in segs)
+        # consecutive arcs share an endpoint (continuous path)
+        for a, b in zip(segs, segs[1:]):
+            assert math.hypot(a.end[0] - b.start[0], a.end[1] - b.start[1]) < 1e-6
+        # arc1 starts exactly at the first teach point
+        assert math.hypot(segs[0].start[0] - pts[0][0], segs[0].start[1] - pts[0][1]) < 1e-9
+        # the last teach point lies on one of the arcs
+        assert any(on_arc(s, pts[-1]) for s in segs), f"N={n}: last teach point not covered"
+
+    # Too-few points raise clearly.
+    for mode, pts in (("直线模式", [(0.0, 200.0)]), ("圆弧模式", [(0.0, 200.0), (10.0, 200.0)])):
+        try:
+            owner._teach_primitive_segments(mode, pts)
+            raise AssertionError("insufficient points must raise")
+        except ValueError:
+            pass
 
 
 def main():
-    ui = DummyUi()
-    line = ui.generate_linear_path(75.0, 220.0, 150.0, 250.0, 20.0)
-    cw = ui.generate_arc_path(75.0, 220.0, 150.0, 250.0, 60.0, True, 20.0)
-    ccw = ui.generate_arc_path(150.0, 250.0, 75.0, 220.0, 60.0, False, 20.0)
-    car1 = ui.generate_geometry_path(ui.build_car1_segments(75.0, 200.0), 20.0, label="小车轨迹1")
-    car2 = ui.generate_geometry_path(ui.build_car2_segments(75.0, 200.0), 20.0, label="小车轨迹2")
-    car1_segments = ui.build_car1_segments(75.0, 200.0)
-    car1_preview, car1_send = ui.generate_geometry_motion(car1_segments, 20.0, label="car1")
-    car2_preview, car2_send = ui.generate_geometry_motion(ui.build_car2_segments(75.0, 200.0), 20.0, label="car2")
-    rounded_segments = ui.path_planner.rounded_polyline_segments(
-        [(75.0, 220.0), (115.0, 220.0), (115.0, 260.0), (150.0, 260.0)],
-        corner_radius_mm=3.0,
-    )
-    rounded = ui.generate_polyline_path(
-        [(75.0, 220.0), (115.0, 220.0), (115.0, 260.0), (150.0, 260.0)],
-        20.0,
-    )
-    handwriting_strokes = ui.handwriting_strokes_to_robot([[(0.1, 0.8), (0.3, 0.2), (0.7, 0.6)]])
-    handwriting = ui.generate_stroke_path(handwriting_strokes, 20.0, label="handwriting")
-
-    assert_has_arc(rounded_segments, "rounded polyline")
-    assert_has_arc(car1_segments, "car1")
-    assert_has_arc(ui.build_car2_segments(75.0, 200.0), "car2")
-    assert_arc_endpoints_consistent(car1_segments, "car1")
-    assert_arc_endpoints_consistent(ui.build_car2_segments(75.0, 200.0), "car2")
-    assert_arc_endpoints_consistent(rounded_segments, "rounded polyline")
-
-    for name, path in (
-        ("G1", line),
-        ("G2", cw),
-        ("G3", ccw),
-        ("car1", car1),
-        ("car2", car2),
-        ("rounded", rounded),
-        ("handwriting", handwriting),
-    ):
-        assert_path_safe(ui, path, name)
-        assert_accel_limited(path, ui.path_planner.accel_mm_s2, name)
-
-    assert_no_mid_speed_drop(line, "G1")
-    assert_no_mid_speed_drop(cw, "G2")
-    assert_no_mid_speed_drop(ccw, "G3")
-    line_send = ui.generate_binary_line_targets((75.0, 220.0), (150.0, 250.0), 20.0)
-    arc_send = ui.generate_binary_arc_targets((75.0, 220.0), (150.0, 250.0), 60.0, True, 20.0)
-    assert_true(len(line_send) == 1, f"G1 binary line should upload endpoint only: send={len(line_send)}")
-    assert_true(line_send[0][0] == 150.0 and line_send[0][1] == 250.0, "G1 binary endpoint changed")
-    assert_true((line_send[0][4] & ui.BINARY_FLAG_EXACT_STOP) != 0, "G1 endpoint is not exact-stop")
-    assert_true(8 <= len(arc_send) < len(cw) // 2, f"G2 binary arc keypoints not compact: send={len(arc_send)} preview={len(cw)}")
-    joint_points = path_to_joint_points(line_send, ui.kinematics, 3200, start_xy=(75.0, 220.0))
-    assert_true(len(joint_points) == len(line_send), "G1 binary joint conversion changed keypoint count")
-    assert_true((joint_points[0].flags & FLAG_EXACT_STOP) != 0, "G1 exact-stop flag lost during joint conversion")
-    assert_true(all(16 <= point.v_dom_pps <= 10000 for point in joint_points), "G1 v_dom out of range")
-    assert_true(car1_preview and car1_send, "car1 geometry motion did not produce binary send path")
-    assert_true(car2_preview and car2_send, "car2 geometry motion did not produce binary send path")
-    assert_true(car1_send[0][3] is True and car1_send[0][1] < 220.0, "car1 missing silent connector to shape start")
-    assert_true(car2_send[0][3] is True and car2_send[0][1] < 220.0, "car2 missing silent connector to shape start")
-    assert_true(any((point[4] & FLAG_CARTESIAN_LINE) != 0 for point in car1_send), "car1 has no endpoint-style line blocks")
-    assert_true(any((point[4] & FLAG_CARTESIAN_LINE) != 0 for point in car2_send), "car2 has no endpoint-style line blocks")
-    assert_true(all((point[4] & ui.BINARY_FLAG_EXACT_STOP) != 0 for point in car1_send if point[4] & ui.BINARY_FLAG_CARTESIAN_LINE), "car1 line endpoints are not exact-stop")
-    assert_true(all((point[4] & ui.BINARY_FLAG_EXACT_STOP) != 0 for point in car2_send if point[4] & ui.BINARY_FLAG_CARTESIAN_LINE), "car2 line endpoints are not exact-stop")
-    assert_true(len(car1_send) < len(car1_preview) // 5, f"car1 binary path was not simplified: send={len(car1_send)} preview={len(car1_preview)}")
-    assert_true(len(car2_send) < len(car2_preview) // 5, f"car2 binary path was not simplified: send={len(car2_send)} preview={len(car2_preview)}")
-    assert_true(len(path_to_joint_points(car1_send, ui.kinematics, 3200, start_xy=(75.0, 220.0))) <= 3000, "car1 binary upload exceeds stress target size")
-    assert_true(len(path_to_joint_points(car2_send, ui.kinematics, 3200, start_xy=(75.0, 220.0))) <= 3000, "car2 binary upload exceeds stress target size")
-    handwriting_send = ui.generate_binary_send_from_path(handwriting, 20.0)
-    assert_true(len(handwriting_send) < len(handwriting), f"handwriting binary path was not simplified: send={len(handwriting_send)} preview={len(handwriting)}")
-    line_host = assert_host_segments_valid(ui, line, (75.0, 220.0), "G1 host")
-    arc_host = assert_host_segments_valid(ui, cw, (75.0, 220.0), "G2 host")
-    car1_host = assert_host_segments_valid(ui, car1_preview, (ui.cur_x, ui.cur_y), "car1 host")
-    car2_host = assert_host_segments_valid(ui, car2_preview, (ui.cur_x, ui.cur_y), "car2 host")
-    handwriting_host = assert_host_segments_valid(ui, handwriting, (ui.cur_x, ui.cur_y), "handwriting host")
-    assert_true(len(line_host) >= len(line) // 2, "G1 host output unexpectedly sparse")
-    assert_true(len(arc_host) >= len(cw) // 2, "G2 host output unexpectedly sparse")
-    assert_true(len(car1_host) > 100 and len(car2_host) > 100 and len(handwriting_host) > 100, "complex host output too small")
-    assert_bounds(car1, (75.0, 195.0, 188.0, 248.0), "小车轨迹1")
-    assert_bounds(car2, (75.0, 235.0, 188.0, 240.0), "小车轨迹2")
-    assert_true(protocol_mod.build_ppr_line(3200) == "$100=3200 $101=3200", "single-value PPR command mismatch")
-    assert_true(protocol_mod.build_ppr_line(3200, 6400) == "$100=3200 $101=6400", "dual-value PPR command mismatch")
-    assert_true(protocol_mod.build_g1_timed_line(10, -20, 300, 7) == "G1 A10 B-20 T300 ;ID=7 HOST=1", "G1 A/B/T command mismatch")
-
-    square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
-    rotated = ui._rotate_closed_stroke_near_current(square, (9.8, 9.7))
-    assert_true(ui._is_closed_stroke(rotated), "rotated text contour is not closed")
-    assert_true(math.hypot(rotated[0][0] - 10.0, rotated[0][1] - 10.0) <= 0.5, "closed contour did not choose nearest start")
-
-    try:
-        for sample in ("福州大学", "FZU", "SCARA2026", "FZU福大2026"):
-            strokes = ui.build_text_outline_strokes(sample, height_mm=70.0)
-            assert_closed_strokes(ui, strokes, sample)
-            text_path = ui.generate_stroke_path(
-                strokes,
-                20.0,
-                label=sample,
-                simplify_tolerance=ui.TEXT_SIMPLIFY_TOLERANCE_MM,
-                min_spacing=ui.TEXT_MIN_POINT_SPACING_MM,
-                corner_radius_mm=ui.TEXT_CORNER_RADIUS_MM,
-                optimize_closed_start=True,
-            )
-            assert_path_safe(ui, text_path, sample)
-            assert_accel_limited(text_path, ui.path_planner.accel_mm_s2, sample)
-        fzu_strokes = ui.build_text_outline_strokes("FZU", height_mm=70.0)
-        first_min_x, _, _, _ = ui._stroke_bounds(fzu_strokes[0])
-        last_min_x, _, _, _ = ui._stroke_bounds(fzu_strokes[-1])
-        assert_true(first_min_x <= last_min_x, "FZU contours are not ordered left-to-right")
-    except (ModuleNotFoundError, ImportError):
-        print("SKIP text outline check: PySide6 is not installed in this Python runtime")
-
+    check_real_geometry_gcode()
+    check_look_ahead()
+    check_stroke_geometry_stream()
+    check_every_writing_input_point_is_retained()
+    check_preview_decimation_preserves_key_points()
+    check_handwriting_release_endpoint_is_recorded()
+    check_large_stroke_simplification_is_iterative()
+    check_semantic_font_path_preserves_line_corner()
+    check_teach_chaining()
     print("TRAJECTORY_PLANNER_CHECK PASS")
-    print(f"G1 points={len(line)} G2 points={len(cw)} G3 points={len(ccw)} car1={len(car1)} car2={len(car2)} rounded={len(rounded)} handwriting={len(handwriting)}")
 
 
 if __name__ == "__main__":

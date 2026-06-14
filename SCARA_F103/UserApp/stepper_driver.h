@@ -53,7 +53,15 @@ void Stepper_SetAccel(StepperAxis axis, int32_t accel_pps_s);
 bool Stepper_MoveRel(int64_t delta1, int64_t delta2, int32_t v1, int32_t v2);
 bool Stepper_MoveAbs(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2);
 bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, int32_t exit1, int32_t exit2);
+bool Stepper_MoveAbsBlendLaser(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, int32_t exit1, int32_t exit2, bool laser_mark, bool laser_prep);
 bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks);
+bool Stepper_MoveAbsTicksLaser(int64_t pos1, int64_t pos2, uint32_t duration_ticks, bool laser_mark, bool laser_prep);
+bool Stepper_MoveAbsTicksLaserPower(int64_t pos1,
+                                    int64_t pos2,
+                                    uint32_t duration_ticks,
+                                    bool laser_mark,
+                                    bool laser_prep,
+                                    uint16_t laser_power_permille);
 void Stepper_Stop(StepperAxis axis);
 void Stepper_StopAll(void);
 void Stepper_EStopAll(void);
@@ -61,7 +69,7 @@ void Stepper_ClearError(void);
 void Stepper_SetErrorAll(uint32_t error_bits);
 void Stepper_SetPosition(StepperAxis axis, int64_t position_pulse);
 void Stepper_Zero(void);
-void Stepper_Tick10kHz(void);
+void Stepper_StepEventIrq(void);
 bool Stepper_IsBusy(void);
 bool Stepper_CanAcceptMove(void);
 bool Stepper_CanQueueTimedSegment(void);

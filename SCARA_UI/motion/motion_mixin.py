@@ -1,62 +1,48 @@
 import math
+import os
+
 import numpy as np
-
-
-class HostTimedSegment:
-    def __init__(self, p1_abs, p2_abs, duration_ticks, flags=0):
-        self.p1_abs = int(p1_abs)
-        self.p2_abs = int(p2_abs)
-        self.duration_ticks = int(duration_ticks)
-        self.flags = int(flags)
-
-
-class HostTimedBinaryPoint:
-    def __init__(self, segment, host_flag, exact_stop_flag):
-        ticks = int(segment.duration_ticks)
-        if ticks < 1 or ticks > 65535:
-            raise ValueError(f"invalid host segment ticks: {ticks}")
-        self.p1_abs = int(segment.p1_abs)
-        self.p2_abs = int(segment.p2_abs)
-        self.v_dom_pps = ticks
-        self.flags = int(host_flag) | (int(getattr(segment, "flags", 0)) & int(exact_stop_flag))
 
 
 class ScaraMotionMixin:
     JOINT_LIMITS_DEG = ((-180.0, 180.0), (0.0, 360.0))
-    # 轨迹精度参数说明：
-    # - BINARY_LINE_TOLERANCE_MM：上位机把一条直线拆成二进制关键点时，允许的关节空间线性化误差。
-    #   调小会更贴合直线，但关键点增多、上传更慢；调大则点数少但末端更容易偏离期望线。
-    # - BINARY_ARC_SEGMENT_MM：圆弧关键点弧长间隔。调小圆弧更圆滑，调大会减少通信量。
-    # - DEFAULT/CAR_CORNER_RADIUS_MM：默认设为 0，表示所有折线必须到达原始转折点，不提前圆角切入。
+    # Preview sampling is independent from the compact geometry G-code stream.
     ARC_SEGMENT_MM = 2.0
-    BINARY_ARC_SEGMENT_MM = 0.75
-    BINARY_GEOMETRY_ARC_SEGMENT_MM = 0.35
-    BINARY_LINE_TOLERANCE_MM = 0.45
-    BINARY_LINE_MAX_SEGMENT_MM = 10.0
-    BINARY_PATH_SIMPLIFY_TOLERANCE_MM = 0.08
-    BINARY_RAD_PER_REV = 2.0 * math.pi
-    BINARY_ZERO_RAD = (2.251, 0.890)
-    # Retained for firmware/status compatibility; motion targets use radians above.
-    BINARY_MRAD_PER_REV = 6283
-    BINARY_ZERO_MRAD = (2251, 890)
+    PREVIEW_ARC_SEGMENT_MM = 0.75
+    RAD_PER_REV = 2.0 * math.pi
+    JOINT_ZERO_RAD = (2.251, 0.890)
     DEFAULT_CORNER_RADIUS_MM = 0.0
     CAR_CORNER_RADIUS_MM = 0.0
-    PATH_SIMPLIFY_TOLERANCE_MM = 0.18
-    PATH_MIN_POINT_SPACING_MM = 0.20
-    TEXT_SIMPLIFY_TOLERANCE_MM = 0.06
-    TEXT_MIN_POINT_SPACING_MM = 0.16
+    # 小车要求“每段到点停稳再转向”：在每条直线/圆弧后插入该时长的 G4 暂停，
+    # 复用固件 exact-stop 屏障(相邻 dwell 块把 junction 速度强制为 0)，
+    # 让开环步进减速到 0、停稳片刻让杆件振荡衰减后再转向，最大化落点精度。
+    # 仅小车轨迹启用；其余轨迹保持默认 0(不插停顿，行为不变)。
+    CAR_EXACT_STOP_DWELL_MS = 30.0
+    # Writing is a true polyline. Every input control point is a real G1
+    # endpoint; GRBL junction deviation slows at the sharp corner without
+    # replacing it with a fillet arc or deleting a nearby point.
+    HANDWRITING_CORNER_RADIUS_MM = 0.0
+    PATH_SIMPLIFY_TOLERANCE_MM = 0.0
+    PATH_MIN_POINT_SPACING_MM = 0.001
+    # Font paths retain true LineTo corners. Only CurveTo elements are
+    # adaptively flattened to this Cartesian tolerance.
+    TEXT_SIMPLIFY_TOLERANCE_MM = 0.0
+    TEXT_MIN_POINT_SPACING_MM = 0.001
+    TEXT_CURVE_TOLERANCE_MM = 0.10
     TEXT_CORNER_RADIUS_MM = 0.0
     DRAW_CENTER_X = 75.0
     DRAW_CENTER_Y = 220.0
-    BINARY_FLAG_EXACT_STOP = 0x0001
-    BINARY_FLAG_CARTESIAN_LINE = 0x0002
-    BINARY_FLAG_HOST_SEGMENT = 0x0004
-    HOST_DDA_HZ = 10000
-    HOST_DDA_MAX_PPS = 10000
-    HOST_TRAJECTORY_SLICE_TICKS = 100
-    JOG_CARTESIAN_SAMPLE_MM = 0.20
-    HOST_MIN_SMOOTH_PPS = 50.0
-    HOST_DEFAULT_ACCEL_MM_S2 = 100.0
+    JOG_MIN_SMOOTH_PPS = 50.0
+    DEFAULT_RUN_ACCEL_MM_S2 = 100.0
+    # 自定义图案（SVG 线条 / 图片点阵）共用的缩放安全框，单位 mm；与空心字一致。
+    PATTERN_MAX_WIDTH_MM = 135.0
+    PATTERN_MAX_HEIGHT_MM = 85.0
+    # 图片激光点阵参数：网格点间距、驻点出光停留、灰度阈值（< 阈值视为偏暗→打点）、点阵安全框。
+    HALFTONE_SPACING_MM = 2.0
+    HALFTONE_DWELL_MS = 30.0
+    HALFTONE_THRESHOLD = 128
+    HALFTONE_MAX_WIDTH_MM = 120.0
+    HALFTONE_MAX_HEIGHT_MM = 80.0
 
     def _read_jog_step_mm(self):
         widget = getattr(self, "jog_step_input", None)
@@ -70,11 +56,18 @@ class ScaraMotionMixin:
     def _read_run_accel_mm_s2(self):
         widget = getattr(self, "hw_accel_input", None)
         if widget is None:
-            return self.HOST_DEFAULT_ACCEL_MM_S2
+            return self.DEFAULT_RUN_ACCEL_MM_S2
         return self._read_float(widget, "运行加速度", positive=True)
 
     def inverse_kinematics(self, x, y):
         return self.kinematics.inverse(x, y)
+
+    def _sync_preview_planner_profile(self):
+        """Keep preview geometry limits identical to the next MCU task."""
+        accel = self._read_run_accel_mm_s2()
+        junction = float(getattr(self, "junction_dev", 0.02))
+        self.path_planner.accel_mm_s2 = max(1.0, float(accel))
+        self.path_planner.junction_deviation = max(0.001, junction)
 
     def check_workspace_safety(self, x, y):
         return self.kinematics.is_reachable(x, y, margin=5.0)
@@ -94,31 +87,63 @@ class ScaraMotionMixin:
     def _limit_violations_at(self, x, y, index):
         c = self.kinematics.config
         violations = []
+        if not math.isfinite(x) or not math.isfinite(y):
+            return [f"Point {index}({x},{y}): coordinate is not finite; motion cannot be verified."]
         d1 = math.hypot(x, y)
         d2 = math.hypot(x - c.base_distance, y)
 
         if y < c.min_y:
-            violations.append(f"点{index}: Y 低于下限 {c.min_y:.1f}mm，超出 {c.min_y - y:.2f}mm")
+            excess = c.min_y - y
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): Y 低于下限 {c.min_y:.1f}mm，超出 {excess:.2f}mm；"
+                f"请将 Y 至少增大 {excess:.2f}mm 到 {c.min_y:.2f}mm"
+            )
         if d1 < c.min_anchor_dist:
-            violations.append(f"点{index}: 左基座距离低于下限 {c.min_anchor_dist:.1f}mm，超出 {c.min_anchor_dist - d1:.2f}mm")
+            excess = c.min_anchor_dist - d1
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 左基座距离低于下限 {c.min_anchor_dist:.1f}mm，超出 {excess:.2f}mm；"
+                f"请将该点远离左基座至少 {excess:.2f}mm"
+            )
         if d1 > c.max_anchor_dist:
-            violations.append(f"点{index}: 左基座距离超过上限 {c.max_anchor_dist:.1f}mm，超出 {d1 - c.max_anchor_dist:.2f}mm")
+            excess = d1 - c.max_anchor_dist
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 左基座距离超过上限 {c.max_anchor_dist:.1f}mm，超出 {excess:.2f}mm；"
+                f"请将该点向左基座靠近至少 {excess:.2f}mm"
+            )
         if d2 < c.min_anchor_dist:
-            violations.append(f"点{index}: 右基座距离低于下限 {c.min_anchor_dist:.1f}mm，超出 {c.min_anchor_dist - d2:.2f}mm")
+            excess = c.min_anchor_dist - d2
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 右基座距离低于下限 {c.min_anchor_dist:.1f}mm，超出 {excess:.2f}mm；"
+                f"请将该点远离右基座至少 {excess:.2f}mm"
+            )
         if d2 > c.max_anchor_dist:
-            violations.append(f"点{index}: 右基座距离超过上限 {c.max_anchor_dist:.1f}mm，超出 {d2 - c.max_anchor_dist:.2f}mm")
+            excess = d2 - c.max_anchor_dist
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 右基座距离超过上限 {c.max_anchor_dist:.1f}mm，超出 {excess:.2f}mm；"
+                f"请将该点向右基座靠近至少 {excess:.2f}mm"
+            )
 
         q1, q2 = self.inverse_kinematics(x, y)
         if q1 is None or q2 is None:
-            violations.append(f"点{index}: 五连杆无逆解 X={x:.2f}, Y={y:.2f}")
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 五连杆无逆解；请将目标点向工作空间中央移动后重新预览"
+            )
             return violations
 
         for axis, angle in ((1, q1), (2, q2)):
             low, high = self.JOINT_LIMITS_DEG[axis - 1]
             if angle < low:
-                violations.append(f"点{index}: M{axis} 低于下限 {low:.1f}deg，超出 {low - angle:.2f}deg")
+                excess = low - angle
+                violations.append(
+                    f"点{index}({x:.2f},{y:.2f}): M{axis} 低于下限 {low:.1f}deg，超出 {excess:.2f}deg；"
+                    f"请调整目标点，使 M{axis} 至少增大 {excess:.2f}deg"
+                )
             if angle > high:
-                violations.append(f"点{index}: M{axis} 超过上限 {high:.1f}deg，超出 {angle - high:.2f}deg")
+                excess = angle - high
+                violations.append(
+                    f"点{index}({x:.2f},{y:.2f}): M{axis} 超过上限 {high:.1f}deg，超出 {excess:.2f}deg；"
+                    f"请调整目标点，使 M{axis} 至少减小 {excess:.2f}deg"
+                )
 
         q1_rad = math.radians(q1)
         q2_rad = math.radians(q2)
@@ -131,11 +156,23 @@ class ScaraMotionMixin:
             c.active_link * math.sin(q2_rad),
         )
         if left_elbow[0] >= right_elbow[0]:
-            violations.append(f"点{index}: 左右主动臂交叉，交叉量 {left_elbow[0] - right_elbow[0]:.2f}mm")
+            excess = left_elbow[0] - right_elbow[0]
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 左右主动臂交叉，交叉量 {excess:.2f}mm；"
+                "请调整目标点，使左臂肘点位于右臂肘点左侧"
+            )
         if left_elbow[1] < 0.0:
-            violations.append(f"点{index}: 左主动臂低于基座线，超出 {-left_elbow[1]:.2f}mm")
+            excess = -left_elbow[1]
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 左主动臂低于基座线，超出 {excess:.2f}mm；"
+                "请提高目标点 Y 或向工作空间中央移动"
+            )
         if right_elbow[1] < 0.0:
-            violations.append(f"点{index}: 右主动臂低于基座线，超出 {-right_elbow[1]:.2f}mm")
+            excess = -right_elbow[1]
+            violations.append(
+                f"点{index}({x:.2f},{y:.2f}): 右主动臂低于基座线，超出 {excess:.2f}mm；"
+                "请提高目标点 Y 或向工作空间中央移动"
+            )
 
         return violations
 
@@ -150,7 +187,7 @@ class ScaraMotionMixin:
                 violations.extend(point_violations[: 5 - len(violations)])
 
         if total:
-            self.log_error(f"{label}预检查失败，共 {total} 项超限，已拦截发送")
+            self.log_error(f"{label}预检查失败，共 {total} 项超限，已拦截发送；请按以下建议修改后重新预览")
             for item in violations:
                 self.log_error(item)
             if total > len(violations):
@@ -159,6 +196,7 @@ class ScaraMotionMixin:
         return True
 
     def generate_linear_path(self, x1, y1, x2, y2, speed_max, v_start=0.0, v_end=0.0, silent=False):
+        self._sync_preview_planner_profile()
         planned = self.path_planner.plan_line(
             (x1, y1),
             (x2, y2),
@@ -167,12 +205,13 @@ class ScaraMotionMixin:
             end_speed=v_end,
             silent=silent,
         )
-        path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
+        path = [(p.x, p.y, p.feed_mm_min, p.silent, p.key_point) for p in planned]
         if path and not self.validate_trajectory_points(path, "直线路径"):
             return []
         return path
 
     def generate_arc_path(self, x1, y1, x2, y2, radius, clockwise, speed_max, silent=False):
+        self._sync_preview_planner_profile()
         planned = self.path_planner.plan_arc(
             (x1, y1),
             (x2, y2),
@@ -183,12 +222,13 @@ class ScaraMotionMixin:
             end_speed=0.0,
             silent=silent,
         )
-        path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
+        path = [(p.x, p.y, p.feed_mm_min, p.silent, p.key_point) for p in planned]
         if path and not self.validate_trajectory_points(path, "圆弧路径"):
             return []
         return path
 
     def generate_polyline_path(self, points, speed_max, silent_first=False):
+        self._sync_preview_planner_profile()
         # 上位机按真实弧长预先规划速度；下位机只接收带 F 的 G1 点流。
         clean_points = self.preprocess_control_points(points)
         if len(clean_points) < 2:
@@ -202,7 +242,7 @@ class ScaraMotionMixin:
             corner_radius_mm=self.DEFAULT_CORNER_RADIUS_MM,
             silent_first=silent_first,
         )
-        path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
+        path = [(p.x, p.y, p.feed_mm_min, p.silent, p.key_point) for p in planned]
         if path and not self.validate_trajectory_points(path, "轨迹采样点"):
             return []
         return path
@@ -222,29 +262,37 @@ class ScaraMotionMixin:
     def _rdp_points(self, points, epsilon):
         if len(points) <= 2:
             return list(points)
-        start = points[0]
-        end = points[-1]
-        dx = end[0] - start[0]
-        dy = end[1] - start[1]
-        length = math.hypot(dx, dy)
-        max_dist = -1.0
-        split_index = 0
-        for index in range(1, len(points) - 1):
-            px, py = points[index]
-            if length <= 1e-9:
-                dist = math.hypot(px - start[0], py - start[1])
-            else:
-                dist = abs(dy * px - dx * py + end[0] * start[1] - end[1] * start[0]) / length
-            if dist > max_dist:
-                max_dist = dist
-                split_index = index
-        if max_dist > epsilon:
-            left = self._rdp_points(points[: split_index + 1], epsilon)
-            right = self._rdp_points(points[split_index:], epsilon)
-            return left[:-1] + right
-        return [start, end]
+        # Iterative RDP avoids Python recursion failures on long handwriting and
+        # font-outline strokes while preserving every geometrically significant
+        # corner as an actual polyline endpoint.
+        keep = {0, len(points) - 1}
+        pending = [(0, len(points) - 1)]
+        while pending:
+            start_index, end_index = pending.pop()
+            start = points[start_index]
+            end = points[end_index]
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = math.hypot(dx, dy)
+            max_dist = -1.0
+            split_index = -1
+            for index in range(start_index + 1, end_index):
+                px, py = points[index]
+                if length <= 1e-9:
+                    dist = math.hypot(px - start[0], py - start[1])
+                else:
+                    dist = abs(dy * px - dx * py + end[0] * start[1] - end[1] * start[0]) / length
+                if dist > max_dist:
+                    max_dist = dist
+                    split_index = index
+            if split_index >= 0 and max_dist > epsilon:
+                keep.add(split_index)
+                pending.append((start_index, split_index))
+                pending.append((split_index, end_index))
+        return [points[index] for index in sorted(keep)]
 
     def generate_geometry_path(self, segments, speed_max, silent_first=False, label="固定轨迹"):
+        self._sync_preview_planner_profile()
         control_points = []
         for segment in segments:
             if not control_points:
@@ -256,57 +304,13 @@ class ScaraMotionMixin:
         if not self.validate_trajectory_points(control_points, f"{label}控制点"):
             return []
         planned = self.path_planner.plan_segments(segments, feed_mm_s=speed_max, silent_first=silent_first)
-        path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
+        path = [(p.x, p.y, p.feed_mm_min, p.silent, p.key_point) for p in planned]
         if path and not self.validate_trajectory_points(path, f"{label}采样点"):
             return []
         return path
 
-    def generate_binary_targets_for_segments(self, segments, speed_max, start=None, include_connector=True):
-        """把几何段转换为下位机二进制关节插补关键点。
-
-        直线段只保留必要关键点，由下位机在关节空间同步插补；圆弧段按
-        BINARY_ARC_SEGMENT_MM 采样。这里不做 UI 仿真绘图，只准备要上传给 MCU 的目标点。
-        """
-        segments = [segment for segment in segments if segment and segment.length > 0.001]
-        if not segments:
-            return []
-        feed_mm_min = float(speed_max) * 60.0
-        cursor = (float(start[0]), float(start[1])) if start is not None else tuple(segments[0].start)
-        targets = []
-
-        def append_points(points, silent=False, exact_last=True):
-            for index, (x, y) in enumerate(points):
-                if targets and math.hypot(float(x) - targets[-1][0], float(y) - targets[-1][1]) <= 0.001:
-                    continue
-                flags = self.BINARY_FLAG_EXACT_STOP if exact_last and index == len(points) - 1 else 0
-                targets.append((float(x), float(y), feed_mm_min, silent, flags))
-
-        if include_connector and math.hypot(cursor[0] - segments[0].start[0], cursor[1] - segments[0].start[1]) > 0.01:
-            connector = self.generate_binary_line_targets(cursor, segments[0].start, speed_max, silent=True)
-            targets.extend(connector)
-            cursor = tuple(segments[0].start)
-
-        for segment in segments:
-            if math.hypot(cursor[0] - segment.start[0], cursor[1] - segment.start[1]) > 0.01:
-                targets.extend(self.generate_binary_line_targets(cursor, segment.start, speed_max, silent=True))
-            if segment.kind == "arc":
-                count = max(2, int(math.ceil(segment.length / self.BINARY_GEOMETRY_ARC_SEGMENT_MM)))
-                points = [segment.point_at(segment.length * i / count) for i in range(1, count + 1)]
-                append_points(points, exact_last=True)
-            else:
-                line_targets = self.generate_binary_line_targets(segment.start, segment.end, speed_max, silent=False)
-                for item in line_targets:
-                    if targets and math.hypot(float(item[0]) - targets[-1][0], float(item[1]) - targets[-1][1]) <= 0.001:
-                        continue
-                    targets.append(item)
-            cursor = tuple(segment.end)
-
-        if targets and not self.validate_trajectory_points(targets, "二进制图形关键点"):
-            return []
-        return targets
-
-    def generate_geometry_motion(self, segments, speed_max, label="固定轨迹"):
-        """生成固定图形的双轨迹：preview 用于界面显示，send_path 用于 MCU 二进制插补。"""
+    def generate_geometry_motion(self, segments, speed_max, label="固定轨迹", exact_stop_dwell_ms=0.0):
+        """Generate a sampled preview and compact geometry G-code."""
         if not segments:
             self.log_error(f"{label}没有有效几何段")
             return [], []
@@ -323,104 +327,56 @@ class ScaraMotionMixin:
         if not body:
             return [], []
         preview.extend(body)
-        send_path = self.generate_binary_targets_for_segments(segments, speed_max, start=start, include_connector=True)
-        return preview, send_path
+        return preview, self.generate_geometry_gcode(
+            segments, speed_max, start=start, exact_stop_dwell_ms=exact_stop_dwell_ms
+        )
 
-    def generate_binary_send_from_path(self, path, speed_max=None, start=None, simplify_tolerance=None):
-        if not path:
-            return []
-        start = (float(start[0]), float(start[1])) if start is not None else (float(self.cur_x), float(self.cur_y))
-        tolerance = self.BINARY_PATH_SIMPLIFY_TOLERANCE_MM if simplify_tolerance is None else float(simplify_tolerance)
-        result = []
-        cursor = start
-        chunk = []
-        chunk_silent = None
+    def generate_geometry_gcode(self, segments, speed_max, start=None, exact_stop_dwell_ms=0.0):
+        """Generate compact G0/G1/G2/G3 commands without rewriting true geometry."""
+        return list(
+            self._iter_geometry_gcode(
+                segments, speed_max, start=start, exact_stop_dwell_ms=exact_stop_dwell_ms
+            )
+        )
 
-        def point_silent(point):
-            return bool(point[3]) if len(point) > 3 else False
+    def _iter_geometry_gcode(self, segments, speed_max, start=None, exact_stop_dwell_ms=0.0):
+        """Yield compact geometry commands without sampling the path.
 
-        def point_feed_mm_s(point):
-            if speed_max is not None:
-                return max(0.1, float(speed_max))
-            if len(point) > 2:
-                return max(0.1, float(point[2]) / 60.0)
-            return 1.0
+        When ``exact_stop_dwell_ms > 0`` a ``G4`` dwell is appended after every
+        line/arc so the controller treats each segment as an exact-stop barrier
+        (junction speed forced to 0) and the arm settles at every commanded
+        vertex before turning. The line/arc commands themselves are unchanged.
+        """
+        cursor = tuple(start or (self.cur_x, self.cur_y))
+        dwell_cmd = f"G4 P{exact_stop_dwell_ms / 1000.0:.3f}" if exact_stop_dwell_ms > 0.0 else None
 
-        def append_targets(targets):
-            for item in targets:
-                if result and math.hypot(float(item[0]) - result[-1][0], float(item[1]) - result[-1][1]) <= 0.001:
-                    continue
-                result.append(item)
+        def mcu_xy(point):
+            if hasattr(self, "ui_to_mcu_xy"):
+                return self.ui_to_mcu_xy(float(point[0]), float(point[1]))
+            return float(point[0]), float(point[1])
 
-        def nearest_feed(points, target, start_index):
-            if not points:
-                return max(0.1, float(speed_max or 1.0)), start_index
-            best_index = start_index
-            best_dist = float("inf")
-            for index in range(start_index, len(points)):
-                dist = math.hypot(float(points[index][0]) - target[0], float(points[index][1]) - target[1])
-                if dist < best_dist:
-                    best_dist = dist
-                    best_index = index
-                elif index > best_index and dist > best_dist:
-                    break
-            return point_feed_mm_s(points[best_index]), best_index
-
-        def flush_chunk(points, silent):
-            nonlocal cursor
-            if not points:
-                return
-            coords = [cursor] + [(float(p[0]), float(p[1])) for p in points]
-            simplified = self._rdp_points_preserve_turns(coords, tolerance) if len(coords) > 2 and tolerance > 0.0 else coords
-            source_index = 0
-            for target in simplified[1:]:
-                if math.hypot(target[0] - cursor[0], target[1] - cursor[1]) <= 0.001:
-                    continue
-                feed_mm_s, source_index = nearest_feed(points, target, source_index)
-                append_targets(self.generate_binary_line_targets(cursor, target, feed_mm_s, silent=silent))
-                cursor = target
-
-        for point in path:
-            silent = point_silent(point)
-            if chunk and silent != chunk_silent:
-                flush_chunk(chunk, chunk_silent)
-                chunk = []
-            chunk.append(point)
-            chunk_silent = silent
-        flush_chunk(chunk, chunk_silent)
-
-        if result and not self.validate_trajectory_points(result, "二进制简化轨迹关键点"):
-            return []
-        return result
-
-    def _rdp_points_preserve_turns(self, points, epsilon):
-        if len(points) <= 2:
-            return list(points)
-        breaks = [0]
-        for index in range(1, len(points) - 1):
-            ax, ay = points[index - 1]
-            bx, by = points[index]
-            cx, cy = points[index + 1]
-            v1x, v1y = bx - ax, by - ay
-            v2x, v2y = cx - bx, cy - by
-            l1 = math.hypot(v1x, v1y)
-            l2 = math.hypot(v2x, v2y)
-            if l1 <= 1e-6 or l2 <= 1e-6:
-                continue
-            dot = (v1x * v2x + v1y * v2y) / (l1 * l2)
-            if dot < 0.985:
-                breaks.append(index)
-        breaks.append(len(points) - 1)
-
-        simplified = []
-        for start_index, end_index in zip(breaks, breaks[1:]):
-            section = points[start_index : end_index + 1]
-            reduced = self._rdp_points(section, epsilon) if len(section) > 2 else section
-            if simplified:
-                simplified.extend(reduced[1:])
+        first = tuple(segments[0].start) if segments else cursor
+        if math.hypot(first[0] - cursor[0], first[1] - cursor[1]) > 0.01:
+            x, y = mcu_xy(first)
+            yield f"G0 X{x:.3f} Y{y:.3f}"
+            yield "G4 P0.001"
+            cursor = first
+        for segment in segments:
+            if math.hypot(segment.start[0] - cursor[0], segment.start[1] - cursor[1]) > 0.01:
+                x, y = mcu_xy(segment.start)
+                yield f"G0 X{x:.3f} Y{y:.3f}"
+            feed = max(1, int(round(float(speed_max) * 60.0)))
+            x, y = mcu_xy(segment.end)
+            if segment.kind == "arc":
+                code = "G2" if segment.delta_angle < 0.0 else "G3"
+                i = float(segment.center[0]) - float(segment.start[0])
+                j = float(segment.center[1]) - float(segment.start[1])
+                yield f"{code} X{x:.3f} Y{y:.3f} I{i:.3f} J{j:.3f} F{feed}"
             else:
-                simplified.extend(reduced)
-        return simplified
+                yield f"G1 X{x:.3f} Y{y:.3f} F{feed}"
+            if dwell_cmd is not None:
+                yield dwell_cmd
+            cursor = tuple(segment.end)
 
     def generate_arc_control_points(self, start, end, radius, clockwise):
         sx, sy = start
@@ -429,10 +385,16 @@ class ScaraMotionMixin:
         dy = ey - sy
         chord = math.hypot(dx, dy)
         if chord < 0.001:
-            raise ValueError("圆弧起点和终点重合；当前界面未定义整圆圆心")
+            raise ValueError("圆弧起点和终点重合；请将任一目标点移动至少 0.001mm 后重试")
         min_radius = chord * 0.5
         if radius < min_radius:
-            raise ValueError(f"圆弧半径过小，至少需要 {min_radius:.2f}mm，当前为 {radius:.2f}mm")
+            missing = min_radius - radius
+            chord_excess = chord - 2.0 * radius
+            raise ValueError(
+                f"圆弧半径不足 {missing:.2f}mm：两点距离为 {chord:.2f}mm，半径至少需要 {min_radius:.2f}mm，"
+                f"当前为 {radius:.2f}mm；请将半径增大到至少 {min_radius:.2f}mm，"
+                f"或将两点距离缩短至少 {chord_excess:.2f}mm"
+            )
 
         mx = (sx + ex) * 0.5
         my = (sy + ey) * 0.5
@@ -455,7 +417,7 @@ class ScaraMotionMixin:
 
         _, cx, cy, a0, delta = min(candidates, key=lambda item: item[0])
         arc_len = abs(delta) * radius
-        segments = max(8, int(math.ceil(arc_len / self.BINARY_ARC_SEGMENT_MM)))
+        segments = max(8, int(math.ceil(arc_len / self.PREVIEW_ARC_SEGMENT_MM)))
         segments = min(segments, 5000)
         points = []
         for i in range(segments + 1):
@@ -466,119 +428,229 @@ class ScaraMotionMixin:
         points[-1] = end
         return points
 
-    def generate_binary_arc_targets(self, start, end, radius, clockwise, speed_max, silent=False):
-        points = self.generate_arc_control_points(start, end, radius, clockwise)
-        if not self.validate_trajectory_points(points, "二进制圆弧关键点"):
-            return []
-        feed_mm_min = float(speed_max) * 60.0
-        targets = []
-        for index, (x, y) in enumerate(points[1:], start=1):
-            flags = self.BINARY_FLAG_EXACT_STOP if index == len(points) - 1 else 0
-            targets.append((float(x), float(y), feed_mm_min, silent, flags))
-        return targets
-
-    def _binary_pulse_from_xy(self, point, ppr):
-        q1, q2 = self.inverse_kinematics(float(point[0]), float(point[1]))
-        if q1 is None or q2 is None:
-            return None
-        scale = float(int(ppr)) / self.BINARY_RAD_PER_REV
-        p1 = (math.radians(float(q1)) - self.BINARY_ZERO_RAD[0]) * scale
-        p2 = (math.radians(float(q2)) - self.BINARY_ZERO_RAD[1]) * scale
-        return int(round(p1)), int(round(p2))
-
-    def _binary_xy_from_pulse(self, p1, p2, ppr):
-        q1 = math.degrees(float(p1) * self.BINARY_RAD_PER_REV / float(ppr) + self.BINARY_ZERO_RAD[0])
-        q2 = math.degrees(float(p2) * self.BINARY_RAD_PER_REV / float(ppr) + self.BINARY_ZERO_RAD[1])
+    def _xy_from_pulse(self, p1, p2, ppr):
+        q1 = math.degrees(float(p1) * self.RAD_PER_REV / float(ppr) + self.JOINT_ZERO_RAD[0])
+        q2 = math.degrees(float(p2) * self.RAD_PER_REV / float(ppr) + self.JOINT_ZERO_RAD[1])
         return self.kinematics.forward(q1, q2)
 
-    def _point_to_line_error(self, point, start, end):
-        px, py = point
-        ax, ay = start
-        bx, by = end
-        vx = bx - ax
-        vy = by - ay
-        den = vx * vx + vy * vy
-        if den <= 1e-12:
-            return math.hypot(px - ax, py - ay)
-        t = ((px - ax) * vx + (py - ay) * vy) / den
-        t = max(0.0, min(1.0, t))
-        qx = ax + vx * t
-        qy = ay + vy * t
-        return math.hypot(px - qx, py - qy)
-
-    def _joint_linearized_line_error(self, start, end, ppr):
-        p0 = self._binary_pulse_from_xy(start, ppr)
-        p1 = self._binary_pulse_from_xy(end, ppr)
-        if p0 is None or p1 is None:
-            return float("inf")
-        max_error = 0.0
-        steps = max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1]), 1)
-        if steps <= 64:
-            sample_indices = range(1, steps)
-        else:
-            sample_indices = [int(round(steps * i / 32.0)) for i in range(1, 32)]
-        for index in sample_indices:
-            t = index / steps
-            ip1 = int(round(p0[0] + (p1[0] - p0[0]) * t))
-            ip2 = int(round(p0[1] + (p1[1] - p0[1]) * t))
-            xy = self._binary_xy_from_pulse(ip1, ip2, ppr)
-            if xy[0] is None or xy[1] is None:
-                return float("inf")
-            max_error = max(max_error, self._point_to_line_error(xy, start, end))
-        return max_error
-
-    def _adaptive_binary_line_points(self, start, end, ppr, depth=0):
-        """按关节脉冲量化误差递归拆分直线，确保下位机关节插补后仍贴近笛卡尔直线。"""
-        length = math.hypot(float(end[0]) - float(start[0]), float(end[1]) - float(start[1]))
-        error = self._joint_linearized_line_error(start, end, ppr)
-        if (
-            depth >= 12
-            or length <= 0.10
-            or (length <= self.BINARY_LINE_MAX_SEGMENT_MM and error <= self.BINARY_LINE_TOLERANCE_MM)
-        ):
-            return [end]
-        mid = ((float(start[0]) + float(end[0])) * 0.5, (float(start[1]) + float(end[1])) * 0.5)
-        return (
-            self._adaptive_binary_line_points(start, mid, ppr, depth + 1)
-            + self._adaptive_binary_line_points(mid, end, ppr, depth + 1)
-        )
-
-    def generate_binary_line_targets(self, start, end, speed_max, silent=False):
-        """生成一条直线的二进制关键点；实际插补在下位机 10kHz 控制周期内完成。"""
-        keypoints = [(float(end[0]), float(end[1]))]
-        if not self.validate_trajectory_points(keypoints, "二进制直线关键点"):
-            return []
-        feed_mm_min = float(speed_max) * 60.0
-        flags = self.BINARY_FLAG_CARTESIAN_LINE | self.BINARY_FLAG_EXACT_STOP
-        return [(float(x), float(y), feed_mm_min, silent, flags) for x, y in keypoints]
-
     def start_recording(self):
-        self.teach_data = [] 
-        self.is_recording = True 
+        self.teach_data = []
+        self.is_recording = True
         self.log_display.append("<font color='green'>录制开始</font>")
-        
-    def stop_recording(self): 
-        self.is_recording = False 
+
+    def stop_recording(self):
+        self.is_recording = False
         self.log_display.append(f"录制结束")
-        
+
+    def _teach_mode(self):
+        widget = getattr(self, "teach_mode_combo", None)
+        return widget.currentText() if widget is not None else "直线模式"
+
+    def _append_teach_point(self, point, source):
+        point = (float(point[0]), float(point[1]))
+        if not self.validate_trajectory_points([point], f"{source}"):
+            return False
+        if self.teach_points and math.hypot(point[0] - self.teach_points[-1][0], point[1] - self.teach_points[-1][1]) < 0.001:
+            self.log_error(f"{source}与上一个目标点重合；请修改 X 或 Y 后再添加")
+            return False
+        self.teach_points.append(point)
+        self.teach_step_index = 0
+        self.log_display.append(
+            f"<font color='cyan'>{source} P{len(self.teach_points)}: ({point[0]:.2f}, {point[1]:.2f})</font>"
+        )
+        self.update_teach_status()
+        return True
+
+    def add_teach_target_point(self):
+        try:
+            x = self._read_float(self.teach_target_x, "示教目标 X")
+            y = self._read_float(self.teach_target_y, "示教目标 Y")
+            self._append_teach_point((x, y), "添加目标点")
+        except ValueError as exc:
+            self.log_error(f"示教目标点参数错误: {exc}")
+
     def record_single_point(self):
-        if self.inverse_kinematics(self.cur_x, self.cur_y)[0] is not None:
-            self.teach_points.append((self.cur_x,self.cur_y))
-            self.log_display.append(f"<font color='cyan'>手动记录点: ({self.cur_x:.1f}, {self.cur_y:.1f})</font>")
-                
-    def clear_teach_points(self): 
+        self._append_teach_point((self.cur_x, self.cur_y), "记录当前位置")
+
+    def remove_last_teach_point(self):
+        if not self.teach_points:
+            self.log_error("没有可撤销的示教目标点")
+            return
+        point = self.teach_points.pop()
+        self.teach_step_index = 0
+        self.log_display.append(f"已撤销目标点: ({point[0]:.2f}, {point[1]:.2f})")
+        self.update_teach_status()
+
+    def clear_teach_points(self):
         self.teach_points = []
         self.teach_data = []
-        self.log_display.append("轨迹已清空")
-    
+        self.teach_step_index = 0
+        self.log_display.append("示教目标点已清空")
+        self.update_teach_status()
+
+    def _teach_run_mode(self):
+        widget = getattr(self, "teach_run_mode_combo", None)
+        return widget.currentText() if widget is not None else "连续"
+
+    def _teach_primitive_count(self, mode, n):
+        """示教段数：直线=N-1 段；圆弧三点共端点链式=N//2 段(N 达到最小点数时)。"""
+        is_arc = str(mode).startswith("圆弧")
+        need = 3 if is_arc else 2
+        if n < need:
+            return 0
+        return n // 2 if is_arc else n - 1
+
+    def update_teach_status(self, *_):
+        label = getattr(self, "teach_points_label", None)
+        if label is None:
+            return
+        mode = self._teach_mode()
+        run_mode = self._teach_run_mode()
+        is_arc = mode.startswith("圆弧")
+        need = 3 if is_arc else 2
+        points = list(self.teach_points)
+        n = len(points)
+        summary_points = points[:4]
+        summary = " -> ".join(
+            f"P{index}({point[0]:.1f},{point[1]:.1f})"
+            for index, point in enumerate(summary_points, start=1)
+        )
+        if n > 4:
+            summary += f" -> ... -> P{n}({points[-1][0]:.1f},{points[-1][1]:.1f})"
+        total = self._teach_primitive_count(mode, n)
+        requirement = "圆弧需≥3点(每段3点,共端点串联)" if is_arc else "直线需≥2点(每段2点)"
+        text = f"{mode} / {run_mode}: 已记录 {n} 点，{requirement}"
+        if total:
+            text += f"，共 {total} 段"
+            if run_mode.startswith("单步"):
+                cur = (self.teach_step_index % total) + 1
+                text += f"，下一步执行 第 {cur}/{total} 段"
+        elif n > 0:
+            text += f"（点数不足，至少 {need} 点）"
+        if summary:
+            text += f"\n{summary}"
+        label.setText(text)
+
+    def on_teach_mode_changed(self, *_):
+        self.teach_step_index = 0
+        self.update_teach_status()
+
+    def on_teach_run_mode_changed(self, *_):
+        self.teach_step_index = 0
+        self.update_teach_status()
+
+    def _teach_line_chain(self, points):
+        if len(points) < 2:
+            raise ValueError(f"直线示教至少需要 2 个点，当前为 {len(points)} 个")
+        segments = []
+        for index, (start, end) in enumerate(zip(points, points[1:]), start=1):
+            segment = self._make_line_segment(start, end)
+            if segment is None:
+                raise ValueError(f"直线 P{index} 与 P{index + 1} 重合；请删除或修改其中一个点")
+            segments.append(segment)
+        return segments
+
+    def _teach_arc_chain(self, points):
+        """三点圆弧共端点链式：弧1=(P1,P2,P3),弧2=(P3,P4,P5)...；
+        点数凑不齐最后一段时循环借用开头的点，确保最后一个示教点被经过。"""
+        n = len(points)
+        if n < 3:
+            raise ValueError(f"圆弧示教至少需要 3 个点，当前为 {n} 个")
+        segments = []
+        s = 0
+        guard = 0
+        while True:
+            a = points[s % n]
+            b = points[(s + 1) % n]
+            c = points[(s + 2) % n]
+            try:
+                segments.append(self.path_planner.arc_segment_3pt(a, b, c))
+            except ValueError as exc:
+                raise ValueError(
+                    f"第 {len(segments) + 1} 段圆弧(P{s % n + 1},P{(s + 1) % n + 1},P{(s + 2) % n + 1}): {exc}"
+                )
+            if s + 2 >= n - 1:  # 本段窗口已覆盖最后一个示教点
+                break
+            s += 2
+            guard += 1
+            if guard > n:  # 安全兜底，避免异常情况下死循环
+                break
+        return segments
+
+    def _teach_primitive_segments(self, mode, points):
+        """按运动模式构造有序基元段：直线=逐段折线；圆弧=三点共端点链式(不足循环补齐)。"""
+        if str(mode).startswith("圆弧"):
+            return self._teach_arc_chain(points)
+        return self._teach_line_chain(points)
+
+    def build_teach_motion(self, mode, run_mode, points, speed_max, step_index=0):
+        if float(speed_max) <= 0.0:
+            raise ValueError(f"运行速度必须大于 0，当前为 {float(speed_max):g}")
+        clean_points = [(float(point[0]), float(point[1])) for point in points]
+        primitives = self._teach_primitive_segments(mode, clean_points)
+        if not primitives:
+            raise ValueError("没有可执行的示教段")
+        base = "示教圆弧" if str(mode).startswith("圆弧") else "示教直线"
+        total = len(primitives)
+        if str(run_mode).startswith("单步"):
+            idx = step_index % total
+            segments = [primitives[idx]]
+            label = f"{base}·单步 第{idx + 1}/{total}段"
+        else:
+            segments = primitives
+            label = f"{base}·连续 共{total}段"
+        path, send_path = self.generate_geometry_motion(segments, float(speed_max), label=label)
+        if not path or not send_path:
+            raise ValueError(f"{label}未生成可发送轨迹；请根据终端超限提示修改目标点")
+        return path, send_path, label, total
+
+    def _read_teach_motion_config(self):
+        mode = self._teach_mode()
+        run_mode = self._teach_run_mode()
+        speed = self._read_float(self.hw_speed_input, "运行速度", positive=True)
+        return mode, run_mode, speed
+
+    def preview_teach_path(self):
+        try:
+            mode, run_mode, speed = self._read_teach_motion_config()
+            # 预览始终展开整条示教轨迹(连续)，便于查看完整形状。
+            path, send_path, label, total = self.build_teach_motion(mode, "连续", self.teach_points, speed)
+            self.preview_planned_path(path, f"{label}(预览)")
+            self.log_display.append(
+                f"<font color='cyan'>示教预览完成: {len(self.teach_points)} 点 / {total} 段，"
+                f"预览 {len(path)} 采样点</font>"
+            )
+        except ValueError as exc:
+            self.log_error(f"示教轨迹参数错误: {exc}")
+        except Exception as exc:
+            self.log_error(f"示教轨迹预览错误: {exc}")
+
     def start_playback(self):
-        v = float(self.hw_speed_input.text())
-        if self.teach_points:
-            pts = [(self.cur_x, self.cur_y)] + self.teach_points
-            path = self.generate_polyline_path(pts, v, silent_first=True)
-            self.preview_planned_path(path, "示教复现")
-            send_path = self.generate_binary_send_from_path(path, v)
-            self.load_motion_queue(path, send_path=send_path)
+        try:
+            mode, run_mode, speed = self._read_teach_motion_config()
+            single = run_mode.startswith("单步")
+            idx = self.teach_step_index if single else 0
+            path, send_path, label, total = self.build_teach_motion(
+                mode, run_mode, self.teach_points, speed, step_index=idx
+            )
+            self.preview_planned_path(path, label)
+            loaded = self.load_motion_gcode_job(send_path, preview_path=path)
+            if not loaded:
+                return
+            if single:
+                ran = idx % total
+                self.teach_step_index = (ran + 1) % total
+                tail = "（已到最后一段，下次从第 1 段重新开始）" if self.teach_step_index == 0 else ""
+                self.log_display.append(f"<font color='cyan'>{label} 已装载{tail}</font>")
+                self.update_teach_status()
+            else:
+                self.log_display.append(
+                    f"<font color='cyan'>{label}已装载: 依次走完 {total} 段并停止</font>"
+                )
+        except ValueError as exc:
+            self.log_error(f"示教轨迹参数错误: {exc}")
+        except Exception as exc:
+            self.log_error(f"示教轨迹执行错误: {exc}")
 
     def preview_planned_path(self, path, label):
         if hasattr(self, "set_planned_preview"):
@@ -595,7 +667,7 @@ class ScaraMotionMixin:
 
             if mode.startswith("G1"):
                 path = self.generate_linear_path(self.cur_x, self.cur_y, tx, ty, v, silent=silent)
-                send_path = self.generate_binary_line_targets(start, end, v, silent=silent)
+                send_path = self.generate_geometry_gcode([self._make_line_segment(start, end)], v, start=start)
                 label = "G1 直线"
             elif mode.startswith("G2") or mode.startswith("G3"):
                 radius = self._read_float(self.radius_r, "圆弧半径", positive=True)
@@ -610,7 +682,11 @@ class ScaraMotionMixin:
                     speed_max=v,
                     silent=silent,
                 )
-                send_path = self.generate_binary_arc_targets(start, end, radius, clockwise, v, silent=silent)
+                send_path = self.generate_geometry_gcode(
+                    [self._make_arc_segment(start, end, radius, clockwise)],
+                    v,
+                    start=start,
+                )
                 label = "G2 顺圆" if mode.startswith("G2") else "G3 逆圆"
             else:
                 raise ValueError(f"不支持的轨迹模式: {mode}")
@@ -619,7 +695,7 @@ class ScaraMotionMixin:
                 self.log_error(f"{label}未生成可发送轨迹")
                 return
             self.preview_planned_path(path, label)
-            self.load_motion_queue(path, send_path=send_path)
+            self.load_motion_gcode_job(send_path, preview_path=path)
             self.log_display.append(
                 f"<font color='cyan'>{label}规划完成: 预览 {len(path)} 点，下发关键点 {len(send_path)} 点，目标 X={tx:.1f}, Y={ty:.1f}</font>"
             )
@@ -700,11 +776,16 @@ class ScaraMotionMixin:
             x0 = self._read_float(self.car_start_x, "小车起始X")
             y0 = self._read_float(self.car_start_y, "小车起始Y")
             v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            path, send_path = self.generate_geometry_motion(self.build_car1_segments(x0, y0), v, label="小车轨迹1")
+            path, send_path = self.generate_geometry_motion(
+                self.build_car1_segments(x0, y0),
+                v,
+                label="小车轨迹1",
+                exact_stop_dwell_ms=self.CAR_EXACT_STOP_DWELL_MS,
+            )
             if not path or not send_path:
                 return
             self.preview_planned_path(path, "小车轨迹1")
-            self.load_motion_queue(path, send_path=send_path)
+            self.load_motion_gcode_job(send_path, preview_path=path)
             self.log_display.append(
                 f"<font color='cyan'>小车轨迹1规划完成: 预览 {len(path)} 点，下发关键点 {len(send_path)} 点</font>"
             )
@@ -718,11 +799,16 @@ class ScaraMotionMixin:
             x0 = self._read_float(self.car_start_x, "小车起始X")
             y0 = self._read_float(self.car_start_y, "小车起始Y")
             v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            path, send_path = self.generate_geometry_motion(self.build_car2_segments(x0, y0), v, label="小车轨迹2")
+            path, send_path = self.generate_geometry_motion(
+                self.build_car2_segments(x0, y0),
+                v,
+                label="小车轨迹2",
+                exact_stop_dwell_ms=self.CAR_EXACT_STOP_DWELL_MS,
+            )
             if not path or not send_path:
                 return
             self.preview_planned_path(path, "小车轨迹2")
-            self.load_motion_queue(path, send_path=send_path)
+            self.load_motion_gcode_job(send_path, preview_path=path)
             self.log_display.append(
                 f"<font color='cyan'>小车轨迹2规划完成: 预览 {len(path)} 点，下发关键点 {len(send_path)} 点</font>"
             )
@@ -730,6 +816,129 @@ class ScaraMotionMixin:
             self.log_error(f"小车轨迹2参数错误: {e}")
         except Exception as e:
             self.log_error(f"小车轨迹2规划错误: {e}")
+
+    def _stroke_geometry_groups(
+        self,
+        strokes,
+        label="writing path",
+        simplify_tolerance=None,
+        min_spacing=None,
+        corner_radius_mm=None,
+        optimize_closed_start=False,
+    ):
+        """Convert writing strokes into true sharp-corner line groups."""
+        self._sync_preview_planner_profile()
+        simplify_tolerance = self.PATH_SIMPLIFY_TOLERANCE_MM if simplify_tolerance is None else simplify_tolerance
+        min_spacing = self.PATH_MIN_POINT_SPACING_MM if min_spacing is None else min_spacing
+        current = (float(self.cur_x), float(self.cur_y))
+        groups = []
+
+        for raw_stroke in strokes:
+            was_closed = self._is_closed_stroke(raw_stroke, threshold=max(0.01, min_spacing * 1.5))
+            stroke = self.preprocess_control_points(
+                raw_stroke,
+                simplify_tolerance=simplify_tolerance,
+                min_spacing=min_spacing,
+            )
+            if was_closed and len(stroke) >= 3 and not self._is_closed_stroke(
+                stroke, threshold=max(0.01, min_spacing * 1.5)
+            ):
+                stroke.append(stroke[0])
+            if len(stroke) < 2:
+                continue
+            if optimize_closed_start and self._is_closed_stroke(stroke, threshold=max(0.01, min_spacing * 1.5)):
+                stroke = self._rotate_closed_stroke_near_current(stroke, current)
+            elif math.hypot(stroke[-1][0] - current[0], stroke[-1][1] - current[1]) < math.hypot(
+                stroke[0][0] - current[0], stroke[0][1] - current[1]
+            ):
+                stroke = list(reversed(stroke))
+            if not self.validate_trajectory_points(stroke, f"{label} control points"):
+                return []
+            # Do not replace a writing corner with a fillet. Every retained
+            # endpoint is reached exactly, while GRBL junction deviation selects
+            # a safe non-zero transition speed from the real corner angle.
+            segments = self.path_planner.rounded_polyline_segments(stroke, corner_radius_mm=0.0)
+            if segments:
+                groups.append(segments)
+                current = tuple(segments[-1].end)
+
+        if not groups:
+            self.log_error(f"{label} has no valid geometry.")
+        return groups
+
+    def _iter_stroke_geometry_gcode(self, groups, speed_max, start=None):
+        """Yield sharp-corner writing geometry for GRBL junction planning."""
+        cursor = tuple(start or (self.cur_x, self.cur_y))
+        for index, segments in enumerate(groups):
+            first = tuple(segments[0].start)
+            connector_needed = math.hypot(first[0] - cursor[0], first[1] - cursor[1]) > 0.01
+            if index > 0:
+                yield "G4 P0.001"
+            if connector_needed:
+                x, y = self.ui_to_mcu_xy(float(first[0]), float(first[1]))
+                yield f"G0 X{x:.3f} Y{y:.3f}"
+                yield "G4 P0.001"
+            yield from self._iter_geometry_gcode(segments, speed_max, start=first)
+            cursor = tuple(segments[-1].end)
+
+    def _stroke_geometry_command_count(self, groups, start=None):
+        cursor = tuple(start or (self.cur_x, self.cur_y))
+        count = 0
+        for index, segments in enumerate(groups):
+            first = tuple(segments[0].start)
+            if index > 0:
+                count += 1
+            if math.hypot(first[0] - cursor[0], first[1] - cursor[1]) > 0.01:
+                count += 2
+            count += len(segments)
+            cursor = tuple(segments[-1].end)
+        return count
+
+    def generate_stroke_motion(
+        self,
+        strokes,
+        speed_max,
+        label="writing path",
+        simplify_tolerance=None,
+        min_spacing=None,
+        corner_radius_mm=None,
+        optimize_closed_start=False,
+    ):
+        """Build a sampled preview and a compact GRBL geometry stream."""
+        groups = self._stroke_geometry_groups(
+            strokes,
+            label=label,
+            simplify_tolerance=simplify_tolerance,
+            min_spacing=min_spacing,
+            corner_radius_mm=corner_radius_mm,
+            optimize_closed_start=optimize_closed_start,
+        )
+        if not groups:
+            return [], (), 0
+
+        preview = []
+        cursor = (float(self.cur_x), float(self.cur_y))
+        for segments in groups:
+            first = tuple(segments[0].start)
+            if math.hypot(first[0] - cursor[0], first[1] - cursor[1]) > 0.01:
+                connector = self.generate_linear_path(cursor[0], cursor[1], first[0], first[1], speed_max, silent=True)
+                if not connector:
+                    return [], (), 0
+                preview.extend(connector)
+            body = self.generate_geometry_path(segments, speed_max, silent_first=False, label=label)
+            if not body:
+                return [], (), 0
+            preview.extend(body)
+            cursor = tuple(segments[-1].end)
+
+        from ..communication.motion_senders import CountedCommandStream
+
+        command_count = self._stroke_geometry_command_count(groups, start=(self.cur_x, self.cur_y))
+        command_source = CountedCommandStream(
+            self._iter_stroke_geometry_gcode(groups, speed_max),
+            command_count,
+        )
+        return preview, command_source, command_count
 
     def generate_stroke_path(
         self,
@@ -741,57 +950,16 @@ class ScaraMotionMixin:
         corner_radius_mm=None,
         optimize_closed_start=False,
     ):
-        path = []
-        current = (self.cur_x, self.cur_y)
-        valid_strokes = []
-        simplify_tolerance = self.PATH_SIMPLIFY_TOLERANCE_MM if simplify_tolerance is None else simplify_tolerance
-        min_spacing = self.PATH_MIN_POINT_SPACING_MM if min_spacing is None else min_spacing
-        corner_radius_mm = self.DEFAULT_CORNER_RADIUS_MM if corner_radius_mm is None else corner_radius_mm
-        for stroke in strokes:
-            was_closed = self._is_closed_stroke(stroke, threshold=max(0.01, min_spacing * 1.5))
-            clean = self.preprocess_control_points(
-                stroke,
-                simplify_tolerance=simplify_tolerance,
-                min_spacing=min_spacing,
-            )
-            if was_closed and len(clean) >= 3 and not self._is_closed_stroke(clean, threshold=max(0.01, min_spacing * 1.5)):
-                clean.append(clean[0])
-            if len(clean) >= 2:
-                valid_strokes.append(clean)
-
-        if not valid_strokes:
-            self.log_error(f"{label}没有足够的有效笔画")
-            return []
-
-        for stroke in valid_strokes:
-            if optimize_closed_start and self._is_closed_stroke(stroke, threshold=max(0.01, min_spacing * 1.5)):
-                stroke = self._rotate_closed_stroke_near_current(stroke, current)
-            elif math.hypot(stroke[-1][0] - current[0], stroke[-1][1] - current[1]) < math.hypot(
-                stroke[0][0] - current[0], stroke[0][1] - current[1]
-            ):
-                stroke = list(reversed(stroke))
-            first = stroke[0]
-            if math.hypot(first[0] - current[0], first[1] - current[1]) > 0.01:
-                connector = self.generate_linear_path(current[0], current[1], first[0], first[1], speed_max, silent=True)
-                if not connector:
-                    return []
-                path.extend(connector)
-
-            if not self.validate_trajectory_points(stroke, f"{label}控制点"):
-                return []
-            planned = self.path_planner.plan_rounded_polyline(
-                stroke,
-                feed_mm_s=speed_max,
-                corner_radius_mm=corner_radius_mm,
-                silent_first=False,
-            )
-            stroke_path = [(p.x, p.y, p.feed_mm_min, p.silent) for p in planned]
-            if stroke_path and not self.validate_trajectory_points(stroke_path, f"{label}采样点"):
-                return []
-            path.extend(stroke_path)
-            current = stroke[-1]
-
-        return path
+        preview, _, _ = self.generate_stroke_motion(
+            strokes,
+            speed_max,
+            label=label,
+            simplify_tolerance=simplify_tolerance,
+            min_spacing=min_spacing,
+            corner_radius_mm=corner_radius_mm,
+            optimize_closed_start=optimize_closed_start,
+        )
+        return preview
 
     def _is_closed_stroke(self, stroke, threshold=0.35):
         if len(stroke) < 3:
@@ -880,10 +1048,13 @@ class ScaraMotionMixin:
         try:
             strokes = self.handwriting_strokes_to_robot(self.handwriting_pad.normalized_strokes())
             v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            path = self.generate_stroke_path(strokes, v, label="手写轨迹")
+            path, _, command_count = self.generate_stroke_motion(strokes, v, label="handwriting")
             if path:
                 self.preview_planned_path(path, "手写轨迹")
-                self.log_display.append(f"<font color='cyan'>手写轨迹预览完成: {len(path)} 点</font>")
+                self.log_display.append(
+                    f"<font color='cyan'>Handwriting preview: {len(path)} preview points, "
+                    f"{command_count} geometry commands.</font>"
+                )
         except Exception as e:
             self.log_error(f"手写轨迹预览错误: {e}")
 
@@ -891,12 +1062,14 @@ class ScaraMotionMixin:
         try:
             strokes = self.handwriting_strokes_to_robot(self.handwriting_pad.normalized_strokes())
             v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
-            path = self.generate_stroke_path(strokes, v, label="手写轨迹")
+            path, commands, command_count = self.generate_stroke_motion(strokes, v, label="handwriting")
             if path:
                 self.preview_planned_path(path, "手写轨迹")
-                send_path = self.generate_binary_send_from_path(path, v)
-                self.load_motion_queue(path, send_path=send_path)
-                self.log_display.append(f"<font color='cyan'>手写轨迹已装载: {len(path)} 点</font>")
+                self.load_motion_gcode_job(commands, preview_path=path)
+                self.log_display.append(
+                    f"<font color='cyan'>Handwriting loaded: {len(path)} preview points, "
+                    f"{command_count} geometry commands.</font>"
+                )
         except Exception as e:
             self.log_error(f"手写轨迹规划错误: {e}")
 
@@ -907,6 +1080,71 @@ class ScaraMotionMixin:
         self.preview_label = ""
         self.update_plot()
 
+    @staticmethod
+    def _point_line_distance(point, start, end):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-12:
+            return math.hypot(point[0] - start[0], point[1] - start[1])
+        return abs(dy * point[0] - dx * point[1] + end[0] * start[1] - end[1] * start[0]) / length
+
+    def _flatten_cubic_bezier(self, p0, p1, p2, p3, tolerance):
+        """Adaptively flatten one real font curve without crossing its endpoints."""
+        tolerance = max(0.001, float(tolerance))
+        points = []
+        pending = [(p0, p1, p2, p3, 0)]
+        while pending:
+            a, b, c, d, depth = pending.pop()
+            flatness = max(self._point_line_distance(b, a, d), self._point_line_distance(c, a, d))
+            if flatness <= tolerance or depth >= 12:
+                points.append(d)
+                continue
+            ab = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+            bc = ((b[0] + c[0]) * 0.5, (b[1] + c[1]) * 0.5)
+            cd = ((c[0] + d[0]) * 0.5, (c[1] + d[1]) * 0.5)
+            abc = ((ab[0] + bc[0]) * 0.5, (ab[1] + bc[1]) * 0.5)
+            bcd = ((bc[0] + cd[0]) * 0.5, (bc[1] + cd[1]) * 0.5)
+            mid = ((abc[0] + bcd[0]) * 0.5, (abc[1] + bcd[1]) * 0.5)
+            pending.append((mid, bcd, cd, d, depth + 1))
+            pending.append((a, ab, abc, mid, depth + 1))
+        return points
+
+    def _qt_path_contours(self, painter_path, transform):
+        """Extract semantic font contours, preserving every true LineTo corner."""
+        contours = []
+        contour = []
+        current = None
+        index = 0
+        while index < painter_path.elementCount():
+            element = painter_path.elementAt(index)
+            point = transform(float(element.x), float(element.y))
+            if element.isMoveTo():
+                if len(contour) >= 2:
+                    contours.append(contour)
+                contour = [point]
+                current = point
+            elif element.isLineTo():
+                if current is None:
+                    contour = [point]
+                elif math.hypot(point[0] - current[0], point[1] - current[1]) > 0.001:
+                    contour.append(point)
+                current = point
+            elif element.isCurveTo() and current is not None and index + 2 < painter_path.elementCount():
+                control2 = painter_path.elementAt(index + 1)
+                endpoint = painter_path.elementAt(index + 2)
+                p2 = transform(float(control2.x), float(control2.y))
+                p3 = transform(float(endpoint.x), float(endpoint.y))
+                contour.extend(
+                    self._flatten_cubic_bezier(current, point, p2, p3, self.TEXT_CURVE_TOLERANCE_MM)
+                )
+                current = p3
+                index += 2
+            index += 1
+        if len(contour) >= 2:
+            contours.append(contour)
+        return contours
+
     def build_text_outline_strokes(
         self,
         text,
@@ -915,7 +1153,7 @@ class ScaraMotionMixin:
         max_width_mm=135.0,
         max_height_mm=85.0,
     ):
-        from PySide6.QtGui import QFont, QFontDatabase, QFontMetricsF, QPainterPath, QTransform
+        from PySide6.QtGui import QFont, QFontDatabase, QFontMetricsF, QPainterPath
         from PySide6.QtWidgets import QApplication
 
         if QApplication.instance() is None:
@@ -938,7 +1176,7 @@ class ScaraMotionMixin:
         metrics = QFontMetricsF(font)
         line_step = max(110.0, metrics.lineSpacing() * 1.15)
         raw_items = []
-        all_points = []
+        bounds_list = []
 
         for line_index, line in enumerate(text.splitlines() or [text]):
             x_cursor = 0.0
@@ -950,19 +1188,10 @@ class ScaraMotionMixin:
 
                 painter_path = QPainterPath()
                 painter_path.addText(x_cursor, y_offset, font, char)
-                polygons = painter_path.toSubpathPolygons(QTransform())
-                char_strokes = []
-                for polygon in polygons:
-                    points = [(float(point.x()), float(point.y())) for point in polygon]
-                    if len(points) < 3:
-                        continue
-                    if math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1]) > 0.01:
-                        points.append(points[0])
-                    char_strokes.append(points)
-                    all_points.extend(points)
-
-                if char_strokes:
-                    raw_items.append({"line": line_index, "char": char_index, "strokes": char_strokes})
+                if not painter_path.isEmpty():
+                    bounds = painter_path.boundingRect()
+                    bounds_list.append(bounds)
+                    raw_items.append({"line": line_index, "char": char_index, "path": painter_path})
 
                 advance = metrics.horizontalAdvance(char)
                 if advance <= 1.0:
@@ -970,13 +1199,13 @@ class ScaraMotionMixin:
                     advance = bounds.width() + 8.0
                 x_cursor += max(advance, 24.0)
 
-        if not all_points:
+        if not bounds_list:
             return []
 
-        min_x = min(p[0] for p in all_points)
-        max_x = max(p[0] for p in all_points)
-        min_y = min(p[1] for p in all_points)
-        max_y = max(p[1] for p in all_points)
+        min_x = min(bounds.left() for bounds in bounds_list)
+        max_x = max(bounds.right() for bounds in bounds_list)
+        min_y = min(bounds.top() for bounds in bounds_list)
+        max_y = max(bounds.bottom() for bounds in bounds_list)
         text_w = max(1.0, max_x - min_x)
         text_h = max(1.0, max_y - min_y)
         target_h = min(float(height_mm), float(max_height_mm))
@@ -989,16 +1218,12 @@ class ScaraMotionMixin:
         strokes = []
         for item in sorted(raw_items, key=lambda value: (value["line"], value["char"])):
             converted_strokes = []
-            for raw in item["strokes"]:
-                converted = []
-                for x, y in raw:
-                    rx = left + (x - min_x) * scale
-                    ry = bottom + (max_y - y) * scale
-                    converted.append((rx, ry))
+            transform = lambda x, y: (left + (x - min_x) * scale, bottom + (max_y - y) * scale)
+            for converted in self._qt_path_contours(item["path"], transform):
                 clean = self.preprocess_control_points(
                     converted,
-                    simplify_tolerance=self.TEXT_SIMPLIFY_TOLERANCE_MM,
-                    min_spacing=self.TEXT_MIN_POINT_SPACING_MM,
+                    simplify_tolerance=0.0,
+                    min_spacing=0.001,
                 )
                 if len(clean) >= 3:
                     if not self._is_closed_stroke(clean, threshold=self.TEXT_MIN_POINT_SPACING_MM * 1.5):
@@ -1038,7 +1263,7 @@ class ScaraMotionMixin:
         v = self._read_float(self.hw_speed_input, "运行速度", positive=True)
         text, font_family, height_mm = self._read_text_outline_options(text)
         strokes = self.build_text_outline_strokes(text, font_family=font_family, height_mm=height_mm)
-        path = self.generate_stroke_path(
+        path, commands, command_count = self.generate_stroke_motion(
             strokes,
             v,
             label=f"空心字{text}",
@@ -1050,11 +1275,16 @@ class ScaraMotionMixin:
         if path:
             self.preview_planned_path(path, f"空心字{text}")
             if load:
-                send_path = self.generate_binary_send_from_path(path, v)
-                self.load_motion_queue(path, send_path=send_path)
-                self.log_display.append(f"<font color='cyan'>空心字{text}已装载: {len(path)} 点</font>")
+                self.load_motion_gcode_job(commands, preview_path=path)
+                self.log_display.append(
+                    f"<font color='cyan'>Text outline loaded: {len(path)} preview points, "
+                    f"{command_count} geometry commands.</font>"
+                )
             else:
-                self.log_display.append(f"<font color='cyan'>空心字{text}预览完成: {len(path)} 点</font>")
+                self.log_display.append(
+                    f"<font color='cyan'>Text outline preview: {len(path)} preview points, "
+                    f"{command_count} geometry commands.</font>"
+                )
 
     def preview_text_outline_path(self):
         try:
@@ -1074,8 +1304,196 @@ class ScaraMotionMixin:
         except Exception as e:
             self.log_error(f"空心字{text}规划错误: {e}")
 
+    def build_svg_outline_strokes(self, svg_path):
+        """解析 SVG 矢量线条 → 等比缩放居中到画布 → 折线笔画列表。
+
+        复用空心字的 ``_qt_path_contours`` 轮廓→折线管线：SVG 与字体同为 Y 向下，
+        机器人 Y 向上，故 transform 对 y 做 (max_y - y) 翻转。
+        """
+        from ..trajectory.svg_loader import load_svg_paths
+
+        painter_paths = load_svg_paths(svg_path)
+        if not painter_paths:
+            return []
+        rects = [p.boundingRect() for p in painter_paths]
+        min_x = min(r.left() for r in rects)
+        max_x = max(r.right() for r in rects)
+        min_y = min(r.top() for r in rects)
+        max_y = max(r.bottom() for r in rects)
+        src_w = max(1e-6, max_x - min_x)
+        src_h = max(1e-6, max_y - min_y)
+        scale = min(self.PATTERN_MAX_WIDTH_MM / src_w, self.PATTERN_MAX_HEIGHT_MM / src_h)
+        out_w, out_h = src_w * scale, src_h * scale
+        left = self.DRAW_CENTER_X - out_w * 0.5
+        bottom = self.DRAW_CENTER_Y - out_h * 0.5
+        transform = lambda x, y: (left + (x - min_x) * scale, bottom + (max_y - y) * scale)
+
+        strokes = []
+        for painter_path in painter_paths:
+            for contour in self._qt_path_contours(painter_path, transform):
+                clean = self.preprocess_control_points(
+                    contour,
+                    simplify_tolerance=self.TEXT_SIMPLIFY_TOLERANCE_MM,
+                    min_spacing=self.TEXT_MIN_POINT_SPACING_MM,
+                )
+                if len(clean) >= 2:
+                    strokes.append(clean)
+        return strokes
+
+    def plan_svg_pattern(self, svg_path):
+        """运行 SVG 线条图案：解析→规划→预览→下发。出光与否跟随“激光开启”开关。"""
+        name = os.path.splitext(os.path.basename(svg_path))[0]
+        try:
+            v = self._read_run_speed_mm_s()
+            strokes = self.build_svg_outline_strokes(svg_path)
+            if not strokes:
+                self.log_error(f"SVG 图案“{name}”未解析出有效线条")
+                return
+            path, commands, command_count = self.generate_stroke_motion(
+                strokes,
+                v,
+                label=f"SVG:{name}",
+                simplify_tolerance=self.TEXT_SIMPLIFY_TOLERANCE_MM,
+                min_spacing=self.TEXT_MIN_POINT_SPACING_MM,
+            )
+            if not path:
+                return
+            self.preview_planned_path(path, f"SVG:{name}")
+            self.load_motion_gcode_job(commands, preview_path=path)
+            self.log_display.append(
+                f"<font color='cyan'>SVG 图案“{name}”规划完成: 预览 {len(path)} 点，"
+                f"几何指令 {command_count} 条</font>"
+            )
+        except Exception as e:
+            self.log_error(f"SVG 图案“{name}”规划错误: {e}")
+
+    def build_halftone_dots(self, image_path):
+        """图片 → 灰度 → 网格采样 → 暗格打点（UI 坐标，居中缩放，蛇形排序）。"""
+        import cv2
+
+        # np.fromfile 兼容中文路径（cv2.imread 在中文 Windows 路径上会失败）。
+        img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError("无法解码图片（格式不支持或文件损坏）")
+        src_h, src_w = img.shape[:2]
+        if src_w < 1 or src_h < 1:
+            return []
+        # 按安全框与点间距决定网格列/行数，并保持图像宽高比。
+        cols = max(1, int(self.HALFTONE_MAX_WIDTH_MM / self.HALFTONE_SPACING_MM))
+        rows = max(1, int(self.HALFTONE_MAX_HEIGHT_MM / self.HALFTONE_SPACING_MM))
+        aspect = src_w / float(src_h)
+        if cols / float(rows) > aspect:
+            cols = max(1, int(round(rows * aspect)))
+        else:
+            rows = max(1, int(round(cols / aspect)))
+        grid = cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)
+        out_w = (cols - 1) * self.HALFTONE_SPACING_MM if cols > 1 else 0.0
+        out_h = (rows - 1) * self.HALFTONE_SPACING_MM if rows > 1 else 0.0
+        left = self.DRAW_CENTER_X - out_w * 0.5
+        bottom = self.DRAW_CENTER_Y - out_h * 0.5
+        dots = []
+        for row in range(rows):
+            # 图片顶行(row=0)对应机器人上方 → Y 翻转。
+            y = bottom + (rows - 1 - row) * self.HALFTONE_SPACING_MM
+            # 蛇形：偶数行从左到右，奇数行反向，减少行间空程。
+            col_iter = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
+            for col in col_iter:
+                if int(grid[row, col]) < self.HALFTONE_THRESHOLD:
+                    dots.append((left + col * self.HALFTONE_SPACING_MM, y))
+        return dots
+
+    def _halftone_commands(self, dots):
+        """逐点激光点阵 G-code：移到点(不出光)→出光→驻点停留→关光。
+
+        首条 ``M5`` 抵消任务级 preamble 自动加的 ``M4``，确保移到首点时不出光。
+        真正出光需用户先开“激光开启”(LASER ARM)；未 ARM 时固件不出光，等同安全空走。
+        """
+        power = int(self._laser_s_word())
+        dwell_s = self.HALFTONE_DWELL_MS / 1000.0
+        yield "M5"
+        for x, y in dots:
+            mx, my = self.ui_to_mcu_xy(float(x), float(y))
+            yield f"G0 X{mx:.3f} Y{my:.3f}"
+            yield f"M4 S{power}"
+            yield f"G4 P{dwell_s:.3f}"
+            yield "M5"
+
+    def plan_halftone_pattern(self, image_path):
+        """运行图片激光点阵：解析→预览点位→下发。出光受激光安全链路控制。"""
+        from ..communication.motion_senders import CountedCommandStream
+
+        name = os.path.splitext(os.path.basename(image_path))[0]
+        try:
+            dots = self.build_halftone_dots(image_path)
+            if not dots:
+                self.log_error(f"点阵图案“{name}”无打点（图片过浅或阈值过低）")
+                return
+            if not self.validate_trajectory_points(dots, f"点阵“{name}”"):
+                return
+            preview = [(x, y, 0.0, False, True) for x, y in dots]
+            commands = CountedCommandStream(self._halftone_commands(dots), len(dots) * 4 + 1)
+            self.preview_planned_path(preview, f"点阵:{name}")
+            self.load_motion_gcode_job(commands, preview_path=preview)
+            self.log_display.append(
+                f"<font color='cyan'>点阵图案“{name}”规划完成: {len(dots)} 个打点"
+                f"（间距 {self.HALFTONE_SPACING_MM:.1f}mm，停留 {self.HALFTONE_DWELL_MS:.0f}ms）；"
+                f"出光需开启“激光开启”。</font>"
+            )
+        except Exception as e:
+            self.log_error(f"点阵图案“{name}”规划错误: {e}")
+
+    def preset_trajectory_registry(self):
+        """预设轨迹注册表：(显示名, 运行函数) 有序列表。
+
+        固定项之外，自动扫描 ``trajectory/patterns/`` 目录：``.svg`` 作为矢量线条图案、
+        ``.png/.jpg/.jpeg/.bmp`` 作为激光点阵图案，文件名即下拉框显示名——
+        往该目录丢文件即可新增选项，无需改动代码。以 ``.``/``_`` 开头者忽略。
+        """
+        items = [
+            ("福州大学", lambda: self.plan_fixed_text_path("福州大学")),
+            ("FZU", lambda: self.plan_fixed_text_path("FZU")),
+        ]
+        pattern_dir = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "trajectory", "patterns")
+        )
+        if os.path.isdir(pattern_dir):
+            for filename in sorted(os.listdir(pattern_dir)):
+                if filename.startswith((".", "_")):
+                    continue
+                full = os.path.join(pattern_dir, filename)
+                if not os.path.isfile(full):
+                    continue
+                name, ext = os.path.splitext(filename)
+                ext = ext.lower()
+                if ext == ".svg":
+                    items.append((f"✏{name}", lambda p=full: self.plan_svg_pattern(p)))
+                elif ext in (".png", ".jpg", ".jpeg", ".bmp"):
+                    items.append((f"🔥{name}", lambda p=full: self.plan_halftone_pattern(p)))
+        return items
+
+    def preset_trajectory_names(self):
+        """返回预设轨迹显示名列表，用于填充下拉框。"""
+        return [name for name, _ in self.preset_trajectory_registry()]
+
+    def run_selected_preset_trajectory(self):
+        """运行下拉框当前选中的预设轨迹。"""
+        registry = self.preset_trajectory_registry()
+        idx = self.preset_traj_combo.currentIndex()
+        if 0 <= idx < len(registry):
+            # 按下拉框顺序索引分发：combo 与注册表同源同序，名称/handler 永不错位。
+            registry[idx][1]()
+        else:
+            self.log_error("请先选择一个有效的预设轨迹")
+
     def system_reset_simulated(self):
-        """仿真回零：不播放 UI 本地动画，只让下位机 HOME_SIM 运动并回传 M:x,y。"""
+        """仿真回零：不播放 UI 本地动画，只让下位机 HOME_SIM 运动并回传 MPos:x,y。"""
+        if self.waiting_for_ack or self.point_queue or getattr(self, "inflight_lines", None):
+            self.log_error("当前流式任务尚未结束，不能开始回零；请先停止任务。")
+            return
+        if hasattr(self, "_force_laser_disarm"):
+            self._force_laser_disarm()
+        elif hasattr(self, "_reset_laser_task_ui"):
+            self._reset_laser_task_ui()
 
         # 如果之前启动过 UI 本地回零动画，必须停止，避免和回传轨迹叠加。
         timer = getattr(self, "_home_anim_timer", None)
@@ -1087,7 +1505,7 @@ class ScaraMotionMixin:
 
         # 清理上位机运动队列，避免回零时继续发送轨迹。
         self.point_queue = []
-        self.waiting_for_ack = False
+        self._clear_text_sender_state()
         self.last_sent_motion = None
         self.stream_waiting_buffer = False
         self.timeout_timer.stop()
@@ -1099,7 +1517,7 @@ class ScaraMotionMixin:
         self.preview_label = ""
         self.history_x, self.history_y = [self.cur_x], [self.cur_y]
 
-        # 进入回零反馈跟随模式：状态帧 M:x,y 将驱动当前机械臂姿态。
+        # 进入回零反馈跟随模式：状态帧 MPos:x,y 将驱动当前机械臂姿态。
         self.home_feedback_active = True
         self.is_homed = False
         self.home_sensor_triggered = False
@@ -1118,19 +1536,25 @@ class ScaraMotionMixin:
             "<font color='cyan'>启动仿真回零：UI 不播放本地动画，只显示下位机 HOME_SIM 回传轨迹。</font>"
         )
 
-        self.send_ascii_line("$X", "HOME_SIM_PREP")
-        self.send_ascii_line("M17", "HOME_SIM_PREP")
-        self.send_ascii_line("$H S", "HOME_SIM")
+        self.motion_preamble_needed = True
+        self.load_gcode_job(["$HS"])
 
     def system_reset_real(self):
-        """实机回零：真实 HOME 开关，UI 只跟随下位机 M:x,y 回传。"""
+        """实机回零：真实 HOME 开关，UI 只跟随下位机 MPos:x,y 回传。"""
+        if self.waiting_for_ack or self.point_queue or getattr(self, "inflight_lines", None):
+            self.log_error("当前流式任务尚未结束，不能开始回零；请先停止任务。")
+            return
+        if hasattr(self, "_force_laser_disarm"):
+            self._force_laser_disarm()
+        elif hasattr(self, "_reset_laser_task_ui"):
+            self._reset_laser_task_ui()
 
         timer = getattr(self, "_home_anim_timer", None)
         if timer is not None and timer.isActive():
             timer.stop()
 
         self.point_queue = []
-        self.waiting_for_ack = False
+        self._clear_text_sender_state()
         self.last_sent_motion = None
         self.stream_waiting_buffer = False
         self.timeout_timer.stop()
@@ -1158,44 +1582,17 @@ class ScaraMotionMixin:
             "<font color='cyan'>启动实机回零：UI 只显示下位机 HOME_REAL 回传轨迹。</font>"
         )
 
-        self.send_ascii_line("$X", "HOME_REAL_PREP")
-        self.send_ascii_line("M17", "HOME_REAL_PREP")
-        self.send_ascii_line("$H", "HOME_REAL")
+        self.motion_preamble_needed = True
+        self.load_gcode_job(["$H"])
 
-    def system_reset(self, simulated=None): 
+    def system_reset(self, simulated=None):
         if simulated is None:
             simulated = bool(getattr(self, "board_only_debug", False))
-        if False and self.board_only_debug:
-            # 当前仅连接控制板，没有接 HOME 微动开关与电机，先用软件零点完成串口和队列调试。
-            # 后续接入真实硬件后，将 board_only_debug 改为 False，即恢复发送 $H 的真实回零流程。
-            self.is_homed = True
-            self.home_sensor_triggered = False
-            self.point_queue = []
-            self.waiting_for_ack = False
-            self.motion_preamble_needed = True
-            self.cur_x, self.cur_y = self.HOME_X, self.HOME_Y
-            self.history_x, self.history_y = [self.cur_x], [self.cur_y]
-            self.update_plot()
-            self.timeout_timer.stop()
-            self.log_display.append(
-                "<font color='yellow'>BOARD_ONLY_DEBUG: 未接 HOME 开关，跳过真实 $H，发送 ZERO 作为软件零点。</font>"
-            )
-            self.send_ascii_line("G92 A0 B0", "SOFT_ZERO")
-            return
-        if self.ser and self.ser.is_open:
-            ts = self.get_timestamp(); cmd = "$H S" if simulated else "$H"; self.is_homed = False
-            self.last_sent_cs = self.calculate_checksum(cmd); self.last_sent_package = cmd
-            self.log_display.append(f"<font color='#ffffff'>TX {ts} [HOME] {cmd}</font>")
-            self.ser.write((cmd + "\n").encode('ascii')); self.waiting_for_ack = True; self.timeout_timer.start(30000) 
-        else: self.log_error("串口未连接")
+        if simulated:
+            return self.system_reset_simulated()
+        return self.system_reset_real()
         
     def stop_motion(self):
-        if hasattr(self, "_stop_binary_stream"):
-            self._stop_binary_stream()
-        if hasattr(self, "_finish_binary_motion"):
-            self._finish_binary_motion("Stopped")
-        else:
-            self.binary_motion_active = False
         self.point_queue = []
         if hasattr(self, "_clear_text_sender_state"):
             self._clear_text_sender_state()
@@ -1203,8 +1600,6 @@ class ScaraMotionMixin:
             self.waiting_for_ack = False
         self.stream_waiting_buffer = False
         self.last_sent_motion = None
-        self.emergency_resume_path = []
-        self.active_binary_send_path = []
         self.active_preview_path = []
         self.emergency_paused = False
         if hasattr(self, "_reset_jog_anchor"):
@@ -1212,77 +1607,38 @@ class ScaraMotionMixin:
         if hasattr(self, "_set_emergency_button_paused"):
             self._set_emergency_button_paused(False)
         self.motion_preamble_needed = True
+        if hasattr(self, "_begin_controller_reset"):
+            self._begin_controller_reset("Stop requested by UI")
+        if hasattr(self, "_force_laser_disarm"):
+            self._force_laser_disarm()
+        elif hasattr(self, "_reset_laser_task_ui"):
+            self._reset_laser_task_ui()
         self.timeout_timer.stop()
         ts = self.get_timestamp()
         self.log_display.append(
-            f"<font color='#f39c12'>TX {ts} STOP (\u505c\u6b62\uff1a\u6e05\u9664\u4e0a\u4f4d\u673a\u961f\u5217)</font>"
+            f"<font color='#f39c12'>TX {ts} Ctrl-X (reset and clear GRBL stream)</font>"
         )
         if self.ser and self.ser.is_open:
-            self.ser.write(b"STOP\n")
+            self.ser.write(b"\x18")
+            self.ser.write(b"?")
 
     def emergency_stop(self):
         if getattr(self, "emergency_paused", False):
-            self._resume_emergency_motion()
-            return
-
-        if self.last_sent_motion is not None:
-            self.point_queue.insert(0, self.last_sent_motion)
-            self.last_sent_motion = None
-            self.sent_point_id = max(0, self.sent_point_id - 1)
-        self.emergency_resume_path = self._capture_emergency_resume_path()
-        if hasattr(self, "_stop_binary_stream"):
-            self._stop_binary_stream()
-        self.binary_motion_active = False
-        self.waiting_for_ack = False
-        self.stream_waiting_buffer = False
-        if hasattr(self, "_reset_jog_anchor"):
-            self._reset_jog_anchor()
-        self.motion_preamble_needed = True
-        self.timeout_timer.stop()
-        self.emergency_paused = True
-        if hasattr(self, "_set_emergency_button_paused"):
-            self._set_emergency_button_paused(True)
-        ts = self.get_timestamp()
-        self.log_display.append(
-            f"<font color='#e74c3c'>TX {ts} ESTOP (pause and keep remaining queue)</font>"
-        )
-        if self.ser and self.ser.is_open:
-            self.ser.write(b"M112\n")
-
-    def _capture_emergency_resume_path(self):
-        if getattr(self, "point_queue", None):
-            return list(self.point_queue)
-        send_path = list(getattr(self, "active_binary_send_path", []) or [])
-        if not send_path:
-            return []
-        cx, cy = float(self.cur_x), float(self.cur_y)
-        best_index = 0
-        best_dist = float("inf")
-        for index, point in enumerate(send_path):
-            dist = math.hypot(float(point[0]) - cx, float(point[1]) - cy)
-            if dist < best_dist:
-                best_dist = dist
-                best_index = index
-        remaining = send_path[min(best_index + 1, len(send_path)) :]
-        return list(remaining)
-
-    def _resume_emergency_motion(self):
-        remaining = list(getattr(self, "emergency_resume_path", []) or [])
-        self.emergency_paused = False
-        if hasattr(self, "_set_emergency_button_paused"):
+            self.emergency_paused = False
             self._set_emergency_button_paused(False)
-        self.motion_preamble_needed = True
-        if self.ser and self.ser.is_open:
-            self.ser.write(b"$X\n")
-            self.ser.write(b"M17\n")
-        if not remaining:
-            self.log_display.append("<font color='orange'>RESUME: no remaining motion queue.</font>")
+            if self.ser and self.ser.is_open:
+                self.ser.write(b"~")
+            self.process_queue()
             return
+        self.emergency_paused = True
+        self._set_emergency_button_paused(True)
+        if hasattr(self, "_force_laser_disarm"):
+            self._force_laser_disarm()
+        if self.ser and self.ser.is_open:
+            self.ser.write(b"!")
         self.log_display.append(
-            f"<font color='#2ecc71'>RESUME: reloading {len(remaining)} remaining keypoints.</font>"
+            f"<font color='#e74c3c'>TX {self.get_timestamp()} ! (feed hold, keep GRBL stream)</font>"
         )
-        self.emergency_resume_path = []
-        self.load_motion_queue(remaining, send_path=remaining)
 
     def _set_emergency_button_paused(self, paused):
         button = getattr(self, "btn_emergency_stop", None)
@@ -1295,18 +1651,15 @@ class ScaraMotionMixin:
             button.setText("急停 (保留队列)")
             button.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
 
-    def _binary_host_segment_class(self):
-        return HostTimedSegment
-
     def _joint_deg_to_pulse(self, q1, q2):
         p1, p2 = self._joint_deg_to_pulse_float(q1, q2)
         return int(round(p1)), int(round(p2))
 
     def _joint_deg_to_pulse_float(self, q1, q2):
-        ppr = float(int(getattr(self, "current_ppr", 3200) or 3200))
-        scale = ppr / self.BINARY_RAD_PER_REV
-        p1 = (math.radians(float(q1)) - self.BINARY_ZERO_RAD[0]) * scale
-        p2 = (math.radians(float(q2)) - self.BINARY_ZERO_RAD[1]) * scale
+        ppr = float(int(getattr(self, "current_ppr", 6400) or 6400))
+        scale = ppr / self.RAD_PER_REV
+        p1 = (math.radians(float(q1)) - self.JOINT_ZERO_RAD[0]) * scale
+        p2 = (math.radians(float(q2)) - self.JOINT_ZERO_RAD[1]) * scale
         return p1, p2
 
     def _current_feedback_pulses(self):
@@ -1316,92 +1669,19 @@ class ScaraMotionMixin:
             return int(p1), int(p2)
         q1, q2 = self.inverse_kinematics(float(self.cur_x), float(self.cur_y))
         if q1 is None or q2 is None:
-            raise ValueError("Current pose has no valid IK; cannot plan host segments.")
+            raise ValueError("Current feedback pose has no valid IK.")
         return self._joint_deg_to_pulse(q1, q2)
 
     def _feedback_xy_from_pulses(self, pulses=None):
         p1, p2 = pulses if pulses is not None else self._current_feedback_pulses()
-        ppr = int(getattr(self, "current_ppr", 3200) or 3200)
-        xy = self._binary_xy_from_pulse(int(p1), int(p2), ppr)
+        ppr = int(getattr(self, "current_ppr", 6400) or 6400)
+        xy = self._xy_from_pulse(int(p1), int(p2), ppr)
         if xy[0] is None or xy[1] is None:
             raise ValueError(f"Feedback pulses have no valid FK: P={int(p1)},{int(p2)}")
         return float(xy[0]), float(xy[1])
 
     def _reset_jog_anchor(self):
         self.jog_target_xy = None
-        self.jog_target_pulses = None
-        self.jog_pending_start_pulses = None
-        self.jog_pending_target_pulses = None
-        self.jog_roundtrip_origin_pulses = None
-
-    def _ensure_jog_anchor(self):
-        feedback_pulses = tuple(int(value) for value in self._current_feedback_pulses())
-        target_pulses = getattr(self, "jog_target_pulses", None)
-        if target_pulses is None or tuple(target_pulses) != feedback_pulses:
-            self.jog_target_pulses = feedback_pulses
-            self.jog_target_xy = self._feedback_xy_from_pulses(feedback_pulses)
-            self.jog_roundtrip_origin_pulses = feedback_pulses
-        return tuple(self.jog_target_xy), tuple(self.jog_target_pulses)
-
-    def _commit_jog_target(self, target_xy, target_pulses, start_pulses):
-        self.jog_target_xy = (float(target_xy[0]), float(target_xy[1]))
-        self.jog_target_pulses = (int(target_pulses[0]), int(target_pulses[1]))
-        self.jog_pending_start_pulses = (int(start_pulses[0]), int(start_pulses[1]))
-        self.jog_pending_target_pulses = self.jog_target_pulses
-        if getattr(self, "jog_roundtrip_origin_pulses", None) is None:
-            self.jog_roundtrip_origin_pulses = self.jog_pending_start_pulses
-
-    def _check_jog_completion_from_feedback(self):
-        target = getattr(self, "jog_pending_target_pulses", None)
-        if target is None or getattr(self, "binary_motion_active", False):
-            return
-        actual = tuple(int(value) for value in self._current_feedback_pulses())
-        target = tuple(int(value) for value in target)
-        start = tuple(int(value) for value in getattr(self, "jog_pending_start_pulses", actual))
-        if actual == target:
-            color = "#00ff99"
-            result = "CLOSED"
-        else:
-            color = "orange"
-            result = f"MISMATCH dP={actual[0] - target[0]},{actual[1] - target[1]}"
-            self.jog_target_xy = self._feedback_xy_from_pulses(actual)
-            self.jog_target_pulses = actual
-        self.log_display.append(
-            f"<font color='{color}'>JOG_DONE startP={start[0]},{start[1]} "
-            f"targetP={target[0]},{target[1]} actualP={actual[0]},{actual[1]} {result}</font>"
-        )
-        origin = getattr(self, "jog_roundtrip_origin_pulses", None)
-        if origin is not None and actual == tuple(origin) and start != actual:
-            self.log_display.append(
-                f"<font color='#00ff99'>JOG_ROUNDTRIP_CLOSED P={actual[0]},{actual[1]}</font>"
-            )
-            self.jog_roundtrip_origin_pulses = actual
-        self.jog_pending_start_pulses = None
-        self.jog_pending_target_pulses = None
-
-    def _trapezoid_distance_at(self, distance, vmax, accel, t):
-        distance = max(0.0, float(distance))
-        vmax = max(1e-6, float(vmax))
-        accel = max(1e-6, float(accel))
-        t_accel = vmax / accel
-        d_accel = 0.5 * accel * t_accel * t_accel
-        if 2.0 * d_accel >= distance:
-            t_accel = math.sqrt(distance / accel)
-            total_time = 2.0 * t_accel
-            if t <= t_accel:
-                return 0.5 * accel * t * t, total_time
-            td = max(0.0, t - t_accel)
-            peak = accel * t_accel
-            return min(distance, 0.5 * distance + peak * td - 0.5 * accel * td * td), total_time
-        d_flat = distance - 2.0 * d_accel
-        t_flat = d_flat / vmax
-        total_time = 2.0 * t_accel + t_flat
-        if t <= t_accel:
-            return 0.5 * accel * t * t, total_time
-        if t <= t_accel + t_flat:
-            return d_accel + vmax * (t - t_accel), total_time
-        td = max(0.0, t - t_accel - t_flat)
-        return min(distance, d_accel + d_flat + vmax * td - 0.5 * accel * td * td), total_time
 
     def _trapezoid_profile(self, distance, vmax, accel):
         distance = float(distance)
@@ -1451,27 +1731,8 @@ class ScaraMotionMixin:
             "limited": False,
         }
 
-    def _trapezoid_time_at_distance(self, scalar, profile):
-        distance = profile["distance"]
-        if scalar <= 0.0:
-            return 0.0
-        if scalar >= distance:
-            return profile["total_time"]
-        accel = profile["accel"]
-        t_accel = profile["t_accel"]
-        d_accel = profile["d_accel"]
-        t_flat = profile["t_flat"]
-        vmax = profile["peak"] if t_flat <= 0.0 else profile["vmax"]
-        if scalar <= d_accel:
-            return math.sqrt((2.0 * scalar) / accel)
-        flat_end = distance - d_accel
-        if t_flat > 0.0 and scalar <= flat_end:
-            return t_accel + (scalar - d_accel) / vmax
-        remain = max(0.0, distance - scalar)
-        return profile["total_time"] - math.sqrt((2.0 * remain) / accel)
-
-    def _set_host_motion_status(self, stats):
-        self._last_host_plan_stats = dict(stats)
+    def _set_jog_motion_status(self, stats):
+        self._last_jog_plan_stats = dict(stats)
         label = getattr(self, "jog_pps_label", None)
         if label is None:
             return
@@ -1479,7 +1740,7 @@ class ScaraMotionMixin:
         target = float(stats.get("target_pps", 0.0))
         period = 1000.0 / peak if peak > 1e-9 else 0.0
         limited = bool(stats.get("limited", False))
-        low = peak < self.HOST_MIN_SMOOTH_PPS
+        low = peak < self.JOG_MIN_SMOOTH_PPS
         text = f"目标PPS {target:.1f}  峰值PPS {peak:.1f}  周期 {period:.2f}ms"
         if limited:
             text += "  受加速度限制"
@@ -1498,11 +1759,11 @@ class ScaraMotionMixin:
         return 2.0 * math.pi * arm_mm
 
     def _speed_mm_s_to_pps(self, speed_mm_s, motor_id=1):
-        ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+        ppr = int(getattr(self, "current_ppr", 6400) or 6400)
         return float(speed_mm_s) * ppr / self._axis_circumference_mm(motor_id)
 
     def _accel_mm_s2_to_pps2(self, accel_mm_s2, motor_id=1):
-        ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+        ppr = int(getattr(self, "current_ppr", 6400) or 6400)
         return float(accel_mm_s2) * ppr / self._axis_circumference_mm(motor_id)
 
     def update_jog_pps_preview(self):
@@ -1512,10 +1773,10 @@ class ScaraMotionMixin:
             step = self._read_jog_step_mm()
             target_pps = self._speed_mm_s_to_pps(speed)
             accel_pps2 = self._accel_mm_s2_to_pps2(accel)
-            ppr = int(getattr(self, "current_ppr", 3200) or 3200)
+            ppr = int(getattr(self, "current_ppr", 6400) or 6400)
             pulses = max(1.0, abs(step) * ppr / self._axis_circumference_mm())
             profile = self._trapezoid_profile(pulses, target_pps, accel_pps2)
-            self._set_host_motion_status(
+            self._set_jog_motion_status(
                 {
                     "target_pps": target_pps,
                     "peak_pps": profile["peak"],
@@ -1528,359 +1789,9 @@ class ScaraMotionMixin:
                 label.setText("目标PPS --  峰值PPS --  周期 --")
                 label.setStyleSheet("color: #aaaaaa;")
 
-    def _build_joint_host_segments(self, start_pulses, end_pulses, vmax_pps, accel_pps2, sample_ticks=None):
-        BinaryHostSegment = self._binary_host_segment_class()
-        start1, start2 = int(start_pulses[0]), int(start_pulses[1])
-        end1, end2 = int(end_pulses[0]), int(end_pulses[1])
-        d1 = end1 - start1
-        d2 = end2 - start2
-        dom = max(abs(d1), abs(d2))
-        if dom == 0:
-            return []
-        vmax_pps = float(vmax_pps)
-        accel_pps2 = float(accel_pps2)
-        if vmax_pps > self.HOST_DDA_MAX_PPS:
-            raise ValueError(
-                f"目标 {vmax_pps:.1f}pps 超过当前 10kHz DDA 稳定上限 {self.HOST_DDA_MAX_PPS}pps；请降低速度或改用硬件定时器脉冲。"
-            )
-        profile = self._trapezoid_profile(dom, vmax_pps, accel_pps2)
-        if profile["peak"] > self.HOST_DDA_MAX_PPS:
-            raise ValueError(
-                f"峰值 {profile['peak']:.1f}pps 超过当前 10kHz DDA 稳定上限 {self.HOST_DDA_MAX_PPS}pps。"
-            )
-        self._set_host_motion_status(
-            {
-                "target_pps": vmax_pps,
-                "peak_pps": profile["peak"],
-                "limited": profile["limited"],
-            }
-        )
-
-        segments = []
-        last_tick = 0
-        last1, last2 = start1, start2
-
-        for event in range(1, dom + 1):
-            t = self._trapezoid_time_at_distance(event, profile)
-            tick = int(round(t * self.HOST_DDA_HZ))
-            if tick <= last_tick:
-                raise ValueError(
-                    f"规划段要求一个 100us tick 内输出多个脉冲: event={event}, tick={tick}, last={last_tick}"
-                )
-            duration = tick - last_tick
-            if duration > 65535:
-                raise ValueError(
-                    f"相邻脉冲间隔 {duration} ticks 超过协议上限；请提高速度或加速度。"
-                )
-            if event == dom:
-                target1, target2 = end1, end2
-            else:
-                target1 = start1 + int(round(d1 * event / dom))
-                target2 = start2 + int(round(d2 * event / dom))
-            if target1 == last1 and target2 == last2:
-                last_tick = tick
-                continue
-            segments.append(BinaryHostSegment(target1, target2, duration))
-            last1, last2 = target1, target2
-            last_tick = tick
-        return segments
-
-    def _build_cartesian_host_segments(
-        self,
-        start_xy,
-        end_xy,
-        speed_mm_s,
-        accel_mm_s2=None,
-        sample_ticks=None,
-        start_pulses=None,
-    ):
-        """Plan timed joint targets sampled from the requested Cartesian line."""
-        sx, sy = float(start_xy[0]), float(start_xy[1])
-        ex, ey = float(end_xy[0]), float(end_xy[1])
-        dx, dy = ex - sx, ey - sy
-        distance = math.hypot(dx, dy)
-        if distance <= 1e-6:
-            return []
-
-        speed_mm_s = float(speed_mm_s)
-        accel_mm_s2 = float(accel_mm_s2 or self.HOST_DEFAULT_ACCEL_MM_S2)
-        if speed_mm_s <= 0.0 or accel_mm_s2 <= 0.0:
-            raise ValueError("Jog speed and acceleration must be greater than zero.")
-        start_pulses = tuple(int(value) for value in (start_pulses or self._current_feedback_pulses()))
-        profile = self._trapezoid_profile(distance, speed_mm_s, accel_mm_s2)
-        total_ticks = max(1, int(round(profile["total_time"] * self.HOST_DDA_HZ)))
-        if sample_ticks is None:
-            spacing_ticks = int(
-                math.floor(self.JOG_CARTESIAN_SAMPLE_MM * self.HOST_DDA_HZ / max(speed_mm_s, 1e-6))
-            )
-            sample_ticks = min(self.HOST_TRAJECTORY_SLICE_TICKS, max(1, spacing_ticks))
-        else:
-            sample_ticks = max(1, int(sample_ticks))
-
-        BinaryHostSegment = self._binary_host_segment_class()
-        segments = []
-        last_tick = 0
-        last_pulses = start_pulses
-        tick = sample_ticks
-        peak_pps = 0.0
-        while True:
-            is_final = tick >= total_ticks
-            target_tick = total_ticks if is_final else tick
-            scalar, _ = self._trapezoid_distance_at(
-                distance,
-                speed_mm_s,
-                accel_mm_s2,
-                target_tick / self.HOST_DDA_HZ,
-            )
-            ratio = max(0.0, min(1.0, scalar / distance))
-            x = ex if is_final else sx + dx * ratio
-            y = ey if is_final else sy + dy * ratio
-            q1, q2 = self.inverse_kinematics(x, y)
-            if q1 is None or q2 is None:
-                raise ValueError(f"Cartesian jog IK failed at X={x:.3f}, Y={y:.3f}")
-            target = self._joint_deg_to_pulse(q1, q2)
-            duration = target_tick - last_tick
-            dominant = max(abs(target[0] - last_pulses[0]), abs(target[1] - last_pulses[1]))
-            if dominant > duration:
-                requested_pps = dominant * self.HOST_DDA_HZ / max(1, duration)
-                raise ValueError(
-                    f"Cartesian jog requests {requested_pps:.1f}pps; reduce speed or increase PPR."
-                )
-            if target != last_pulses:
-                flags = self.BINARY_FLAG_EXACT_STOP if is_final else 0
-                segments.append(BinaryHostSegment(target[0], target[1], duration, flags=flags))
-                peak_pps = max(peak_pps, dominant * self.HOST_DDA_HZ / max(1, duration))
-                last_pulses = target
-                last_tick = target_tick
-            if is_final:
-                break
-            tick += sample_ticks
-
-        if segments and (segments[-1].flags & self.BINARY_FLAG_EXACT_STOP) == 0:
-            segments[-1].flags |= self.BINARY_FLAG_EXACT_STOP
-        self._set_host_motion_status(
-            {
-                "target_pps": peak_pps,
-                "peak_pps": peak_pps,
-                "limited": profile["limited"],
-            }
-        )
-        return segments
-
-    def build_host_segments_from_path(self, path, start_xy=None, label="host trajectory"):
-        """Convert a planned UI XY path into smoothed timed joint DDA segments."""
-        BinaryHostSegment = self._binary_host_segment_class()
-        if not path:
-            return []
-
-        start_xy = (float(start_xy[0]), float(start_xy[1])) if start_xy is not None else (float(self.cur_x), float(self.cur_y))
-        q1_start, q2_start = self.inverse_kinematics(start_xy[0], start_xy[1])
-        if q1_start is None or q2_start is None:
-            start_i = self._current_feedback_pulses()
-            start_f = (float(start_i[0]), float(start_i[1]))
-        else:
-            start_f = self._joint_deg_to_pulse_float(q1_start, q2_start)
-            start_i = (int(round(start_f[0])), int(round(start_f[1])))
-
-        samples = [{"u": 0.0, "t": 0.0, "p1": start_f[0], "p2": start_f[1], "flags": 0}]
-        last_xy = start_xy
-        last_pulse_f = start_f
-        last_speed = 0.0
-
-        def point_feed_mm_s(point):
-            if len(point) > 2:
-                return max(0.0, float(point[2]) / 60.0)
-            return max(0.0, self._read_run_speed_mm_s())
-
-        def point_flags(point):
-            return int(point[4]) if len(point) > 4 else 0
-
-        for index, point in enumerate(path):
-            x = float(point[0])
-            y = float(point[1])
-            speed = point_feed_mm_s(point)
-            ds = math.hypot(x - last_xy[0], y - last_xy[1])
-            if ds <= 1e-6:
-                last_speed = speed
-                last_xy = (x, y)
-                continue
-            q1, q2 = self.inverse_kinematics(x, y)
-            if q1 is None or q2 is None:
-                raise ValueError(f"{label}: IK failed at index={index} X={x:.3f}, Y={y:.3f}")
-            pulse_f = self._joint_deg_to_pulse_float(q1, q2)
-            avg_speed = 0.5 * (max(0.0, last_speed) + max(0.0, speed))
-            if avg_speed <= 1e-6:
-                avg_speed = max(0.1, speed, last_speed)
-            dt = ds / avg_speed
-            du = max(abs(pulse_f[0] - last_pulse_f[0]), abs(pulse_f[1] - last_pulse_f[1]))
-            samples.append(
-                {
-                    "u": samples[-1]["u"] + max(0.0, du),
-                    "t": samples[-1]["t"] + max(0.0, dt),
-                    "p1": float(pulse_f[0]),
-                    "p2": float(pulse_f[1]),
-                    "flags": point_flags(point),
-                }
-            )
-            last_xy = (x, y)
-            last_pulse_f = pulse_f
-            last_speed = speed
-
-        if len(samples) <= 1 or samples[-1]["u"] <= 1e-9:
-            return []
-
-        segments = []
-        sample_index = 1
-        last_tick = 0
-        last_pulse = (int(start_i[0]), int(start_i[1]))
-        peak_pps = 0.0
-        target_pps = 0.0
-
-        def interpolate_at_time(target_time):
-            nonlocal sample_index
-            target_time = max(0.0, min(float(target_time), samples[-1]["t"]))
-            while sample_index < len(samples) - 1 and samples[sample_index]["t"] < target_time:
-                sample_index += 1
-            prev = samples[sample_index - 1]
-            cur = samples[sample_index]
-            span = cur["t"] - prev["t"]
-            ratio = 1.0 if span <= 1e-9 else max(0.0, min(1.0, (target_time - prev["t"]) / span))
-            return {
-                "p1": prev["p1"] + (cur["p1"] - prev["p1"]) * ratio,
-                "p2": prev["p2"] + (cur["p2"] - prev["p2"]) * ratio,
-                "flags": cur["flags"],
-            }
-
-        def append_one(target, duration, flags=0):
-            nonlocal last_pulse, peak_pps, target_pps
-            target = (int(target[0]), int(target[1]))
-            d1 = target[0] - last_pulse[0]
-            d2 = target[1] - last_pulse[1]
-            dom = max(abs(d1), abs(d2))
-            if dom == 0:
-                return
-            duration = int(duration)
-            if duration > 65535:
-                raise ValueError(f"{label}: segment interval {duration} ticks exceeds protocol limit; increase speed/accel or PPR.")
-            if dom > duration:
-                requested_pps = dom * self.HOST_DDA_HZ / max(1, duration)
-                raise ValueError(f"{label}: requested {requested_pps:.1f}pps exceeds 10kHz DDA execution; reduce speed or use hardware timer.")
-            segment_flags = self.BINARY_FLAG_HOST_SEGMENT | (int(flags) & self.BINARY_FLAG_EXACT_STOP)
-            segments.append(BinaryHostSegment(target[0], target[1], duration, flags=segment_flags))
-            pps = dom * self.HOST_DDA_HZ / max(1, duration)
-            peak_pps = max(peak_pps, pps)
-            target_pps = max(target_pps, pps)
-            last_pulse = target
-
-        total_tick = max(1, int(round(samples[-1]["t"] * self.HOST_DDA_HZ)))
-        final_target = (int(round(samples[-1]["p1"])), int(round(samples[-1]["p2"])))
-        slice_ticks = max(10, int(self.HOST_TRAJECTORY_SLICE_TICKS))
-        tick = slice_ticks
-        while tick <= total_tick:
-            interp = interpolate_at_time(tick / self.HOST_DDA_HZ)
-            is_final = tick >= total_tick
-            target = final_target if is_final else (int(round(interp["p1"])), int(round(interp["p2"])))
-            flags = (interp["flags"] | self.BINARY_FLAG_EXACT_STOP) if is_final else interp["flags"]
-            before_count = len(segments)
-            append_one(target, tick - last_tick, flags)
-            if len(segments) != before_count:
-                last_tick = tick
-            tick += slice_ticks
-
-        if last_tick < total_tick:
-            interp = interpolate_at_time(samples[-1]["t"])
-            before_count = len(segments)
-            append_one(final_target, total_tick - last_tick, interp["flags"] | self.BINARY_FLAG_EXACT_STOP)
-            if len(segments) != before_count:
-                last_tick = total_tick
-
-        if segments and (segments[-1].p1_abs, segments[-1].p2_abs) != final_target:
-            append_one(final_target, max(1, total_tick - last_tick), self.BINARY_FLAG_EXACT_STOP)
-        if not segments:
-            return []
-        if (segments[-1].flags & self.BINARY_FLAG_EXACT_STOP) == 0:
-            segments[-1].flags |= self.BINARY_FLAG_EXACT_STOP
-        self._set_host_motion_status(
-            {
-                "target_pps": target_pps,
-                "peak_pps": peak_pps,
-                "limited": peak_pps < self.HOST_MIN_SMOOTH_PPS,
-            }
-        )
-        return segments
-
-    def binary_points_from_host_segments(self, segments):
-        return [
-            HostTimedBinaryPoint(segment, self.BINARY_FLAG_HOST_SEGMENT, self.BINARY_FLAG_EXACT_STOP)
-            for segment in segments
-        ]
-
-    def _upload_host_segments(self, segments, label):
-        if not segments:
-            self.log_error("Host segment planner produced no motion.")
-            return False
-        if not (self.ser and self.ser.is_open):
-            self.log_error("Serial is not connected; host segments require the controller.")
-            return False
-        if self.waiting_for_ack or self.point_queue or getattr(self, "binary_motion_active", False):
-            self.log_error("Motion is busy; wait or stop before host-planned jog.")
-            return False
-        if bool(getattr(self, "host_timed_segment_mode", False)) and hasattr(self, "_queue_gcode_segments"):
-            return self._queue_gcode_segments(segments, label=label)
-        if hasattr(self, "_upload_binary_points"):
-            try:
-                points = self.binary_points_from_host_segments(segments)
-            except Exception as exc:
-                self.log_error(f"Timed binary segment conversion failed: {exc}")
-                return False
-            self._publish_commanded_segments(segments)
-            return self._upload_binary_points(points, label=f"{label} timed binary")
-        self.log_error("Buffered timed segment uploader is unavailable.")
-        return False
-
-    def _publish_commanded_segments(self, segments):
-        monitor = getattr(self, "velocity_monitor", None)
-        if monitor is None or not hasattr(monitor, "process_commanded_pps"):
-            return
-        try:
-            last1, last2 = self._current_feedback_pulses()
-            ppr = int(getattr(self, "current_ppr", 3200) or 3200)
-            for segment in segments:
-                ticks = max(1, int(segment.duration_ticks))
-                pps1 = (int(segment.p1_abs) - last1) * 10000.0 / ticks
-                pps2 = (int(segment.p2_abs) - last2) * 10000.0 / ticks
-                monitor.process_commanded_pps(pps1, pps2, ticks, ppr)
-                last1, last2 = int(segment.p1_abs), int(segment.p2_abs)
-        except Exception:
-            return
-
     def motor_jog_direct(self, motor_id, direction):
-        """Direct single-axis pulse jog for motor bring-up."""
-        try:
-            if motor_id not in (1, 2):
-                self.log_error(f"Unknown motor id: {motor_id}")
-                return
-            start = self._current_feedback_pulses()
-            ppr = int(getattr(self, "current_ppr", 3200) or 3200)
-            step_mm = self._read_jog_step_mm()
-            v_mm_s = self._read_run_speed_mm_s()
-            accel_mm_s2 = self._read_run_accel_mm_s2()
-            delta = int(round(direction * step_mm * ppr / self._axis_circumference_mm(motor_id)))
-            if delta == 0:
-                self.log_error("点动步长换算后小于 1 脉冲，请增大步长或拨码 PPR。")
-                return
-            end = [int(start[0]), int(start[1])]
-            end[motor_id - 1] += delta
-            v_pps = self._speed_mm_s_to_pps(v_mm_s, motor_id)
-            accel_pps2 = self._accel_mm_s2_to_pps2(accel_mm_s2, motor_id)
-            segments = self._build_joint_host_segments(start, tuple(end), v_pps, accel_pps2)
-            if self._upload_host_segments(segments, f"host axis jog M{motor_id}"):
-                stats = getattr(self, "_last_host_plan_stats", {})
-                self.log_display.append(
-                    f"<font color='#ffffff'>HOST_JOG M{motor_id} step={step_mm:g}mm delta={delta} segments={len(segments)} target={v_pps:.1f}pps peak={float(stats.get('peak_pps', 0.0)):.1f}pps</font>"
-                )
-        except Exception as e:
-            self.log_error(f"Single-axis jog error: {e}")
+        """Map the motor bring-up button onto the formal Cartesian G-code path."""
+        return self.motor_jog(motor_id, direction)
 
     def add_jog_step(self, ux, uy):
         try:
@@ -1892,64 +1803,34 @@ class ScaraMotionMixin:
     def add_jog(self, dx, dy):
         """Plan an exact-stop Cartesian jog from the authoritative pulse anchor."""
         try:
+            if self.waiting_for_ack or self.point_queue:
+                self.log_error("The current motion must stop before starting a jog.")
+                return
             v_max = self._read_run_speed_mm_s()
-            busy = bool(
-                getattr(self, "binary_stream_active", False)
-                or getattr(self, "binary_motion_active", False)
-                or self.waiting_for_ack
-                or self.point_queue
-            )
-            if busy:
-                self.log_error("当前运动尚未完全停止，点动命令未发送")
-                return
-
-            (sx, sy), start_pulses = self._ensure_jog_anchor()
-            if not self.check_workspace_safety(sx, sy):
-                self._reset_jog_anchor()
-                self.log_error(
-                    f"当前 P: 脉冲对应位置不可达，点动命令未发送: X={sx:.3f}, Y={sy:.3f}"
-                )
-                return
-
+            sx, sy = float(self.cur_x), float(self.cur_y)
             tx, ty = sx + float(dx), sy + float(dy)
             if not self.check_workspace_safety(tx, ty):
-                self.log_error(f"不可达区域: X={tx:.3f}, Y={ty:.3f}")
+                self.log_error(f"Jog target is unreachable: X={tx:.3f}, Y={ty:.3f}")
                 return
-
             path = self.generate_linear_path(sx, sy, tx, ty, v_max)
             if not path:
-                self.log_error("点动距离过短，未生成轨迹")
+                self.log_error("Jog distance is too short.")
                 return
-            self.preview_planned_path(path, "点动")
-            accel = self._read_run_accel_mm_s2()
-            segments = self._build_cartesian_host_segments(
-                (sx, sy),
-                (tx, ty),
-                v_max,
-                accel,
-                start_pulses=start_pulses,
+            self.preview_planned_path(path, "GRBL jog")
+            command = f"$J=G91 X{float(dx):.3f} Y{float(dy):.3f} F{v_max * 60.0:.0f}"
+            self.jog_target_xy = (tx, ty)
+            self.load_motion_gcode_job([command], preview_path=path)
+            self.log_display.append(
+                f"<font color='#ffffff'>GRBL_JOG XY dx={dx:g} dy={dy:g} F={v_max * 60.0:.0f}</font>"
             )
-            if not segments:
-                self.log_error("点动未产生脉冲变化")
-                return
-
-            target_pulses = (int(segments[-1].p1_abs), int(segments[-1].p2_abs))
-            if self._upload_host_segments(segments, "host cartesian jog"):
-                self._commit_jog_target((tx, ty), target_pulses, start_pulses)
-                stats = getattr(self, "_last_host_plan_stats", {})
-                self.log_display.append(
-                    f"<font color='#ffffff'>HOST_JOG XY dx={dx:g} dy={dy:g} "
-                    f"startP={start_pulses[0]},{start_pulses[1]} "
-                    f"targetP={target_pulses[0]},{target_pulses[1]} "
-                    f"segments={len(segments)} peak={float(stats.get('peak_pps', 0.0)):.1f}pps</font>"
-                )
+            return
         except Exception as e:
             self.log_error(f"点动错误: {e}")
     
     def motor_jog(self, motor_id, direction):
         """单电机点动。
 
-        空闲时：把单关节转动采样成若干末端点，再以二进制关节目标上传，由下位机插补。
+        空闲时：把单关节转动采样成若干末端点，再走正式 G-code 流式链路。
         队列中：保留旧的 ASCII 追加行为，避免中途打断当前运动。
 
         参数：
@@ -1959,14 +1840,10 @@ class ScaraMotionMixin:
         - num_steps：关节点采样数；调大更贴近单关节曲线，但上传点更多。
         """
         try:
-            if getattr(self, "binary_stream_active", False):
-                self.log_error("二进制轨迹续传中，暂不追加电机点动；请等待当前轨迹完成或先停止")
-                return
-            # 若 ASCII 队列正在运行，则以队列尾点作为下一段起点；否则使用当前反馈/仿真坐标。
             if self.waiting_for_ack or self.point_queue:
-                sx, sy = self.point_queue[-1][0], self.point_queue[-1][1]
-            else:
-                sx, sy = self.cur_x, self.cur_y
+                self.log_error("当前运动尚未停止，单电机点动未发送")
+                return
+            sx, sy = self.cur_x, self.cur_y
             current_angles = self.inverse_kinematics(sx, sy)
             if current_angles[0] is None or current_angles[1] is None:
                 self.log_error("无法获取当前关节角度")
@@ -2013,7 +1890,7 @@ class ScaraMotionMixin:
                     return
                 joint_points.append((px, py))
 
-            # send_path 直接使用这组采样点；下位机会在相邻关节目标之间做 10kHz 插补。
+            # send_path 直接使用这组采样点；下位机会在相邻 G-code 段之间做 planner/segment 衔接。
             path = []
             for i in range(1, len(joint_points)):
                 x0, y0 = joint_points[i - 1]
@@ -2025,8 +1902,7 @@ class ScaraMotionMixin:
                 return
 
             self.preview_planned_path(path, f"电机{motor_id}点动")
-            moving = bool(self.waiting_for_ack or self.point_queue)
-            self.load_motion_queue(path, append=moving, send_path=None if moving else path)
+            self.load_motion_queue(path, append=False)
             self.log_display.append(
                 f"<font color='cyan'>电机{motor_id} {'正向' if direction > 0 else '反向'}点动: ({sx:.1f},{sy:.1f}) -> ({new_x:.1f},{new_y:.1f})</font>"
             )

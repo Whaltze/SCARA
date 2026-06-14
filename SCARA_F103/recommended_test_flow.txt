@@ -1,55 +1,49 @@
-SCARA_F103 v0.26.3 recommended validation flow
+SCARA_F103 v0.29.9 GRBL-SCARA validation flow
 
 Safety:
-1. Keep the mechanism clear.
-2. Disconnect motor-driver power before flashing. The firmware enables ENA on boot.
-3. Do not treat MCU P:/M: status as physical position feedback. It is derived from
-   commanded software pulse counts and cannot detect lost steps.
+1. Keep the mechanism clear and disconnect laser power during initial checks.
+2. Disconnect motor-driver power before flashing; firmware enables ENA on boot.
+3. Software pulse closure does not prove that the mechanism did not lose steps.
 
-Stage 1 - offline checks:
+Stage 1 - offline:
   cmake --build --preset Debug
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_project.ps1
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\simulate_binary_interpolator.ps1 -Count 3000
+  C:\Users\22602\.conda\envs\Robot\python.exe ..\SCARA_UI\tests\sender_strategy_check.py
+  C:\Users\22602\.conda\envs\Robot\python.exe ..\SCARA_UI\tests\sender_benchmark_check.py
+  C:\Users\22602\.conda\envs\Robot\python.exe ..\SCARA_UI\tests\trajectory_planner_check.py
+  C:\Users\22602\.conda\envs\Robot\python.exe ..\SCARA_UI\tests\ui_home_gate_check.py
 
-Stage 2 - flash with motor-driver power disconnected:
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\flash_and_verify_buffered.ps1 -Port AUTO -ConfirmMotorPowerOff
+Expected offline result:
+  Flash <= 61 KB
+  RAM leaves at least 4 KB
+  100000-command sender benchmark peak_pending=64
+  Text/handwriting short-block planner capacity=48 with at least 12 blocks prefetched when available
 
-Confirm that VERSION reports 0.26.3 before motion testing.
+Stage 2 - flash with motor and laser power disconnected:
+1. Confirm VERSION reports 0.29.9-grbl-scara.
+2. Send `?`; require `<Idle|MPos:...|JPos:...|FS:...|Bf:...|Q:...|E:...|Seg:...|Pf:...|Rl:...|Pg:...|H:...|HS:...|A1:...|A2:...|Lz:...>`.
+3. Burst mixed G0/G1/G2/G3 while polling `?`; require no RX overflow.
+   During a 100000-line stream require `Pf` and segment underrun to remain
+   unchanged; `Rl` may increase, and `Pg` must remain below the buffered margin.
+4. Verify `$H` does not return `ok` until status reaches `HS:Done`.
+5. Verify `!`, `~`, Ctrl-X and Jog Cancel 0x85 bypass the ordinary RX stream.
 
-Stage 3 - no-motion communication checks:
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\serial_link_check.ps1 -Port AUTO -Repeat 2
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\buffered_stream_capability_check.ps1 -Port AUTO
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\gcode_burst_no_motion_check.ps1 -Port AUTO -BurstLines 6
-  powershell -NoProfile -ExecutionPolicy Bypass -File tools\binary_joint_traj_stress.ps1 -Port AUTO -Count 1000 -HostTimed -TimedTicks 100 -ZeroBeforeRun -EnableMotion
+Stage 3 - oscilloscope:
+1. Verify TIM1/TIM4 STEP pulses are 3 us active-low with at least 3 us recovery.
+2. Verify DIR setup is at least 6 us before the next STEP.
+3. Verify acceleration/deceleration event spacing is continuous.
+4. Verify laser PWM is absent while idle, rapid, stopped, held or faulted.
 
-Expected idle status:
-  E:0
-  Q:0
-  Sq:0,4
-  Hz:10000
-  IC:<7200
-
-Recorded v0.26.3 disconnected-motor baseline on COM12:
-  idle IC=682
-  1000-point HOST_TIMED IC=3907, underrun=0, max_gap=1, min_buffer=92
-  final software pulse endpoint=(0,800)
-
-Stage 4 - low-speed motion:
-1. Restore motor-driver power and verify the mechanism is near its known home pose.
-2. Run homing and confirm both switches behave correctly.
-3. Start with a short line or jog at low speed.
-4. Confirm binary diagnostics remain:
-   underrun_ticks=0
-   max_dispatch_gap_ticks<=1
-   min_buffer>=4
-   IC<7200
-
-Stage 5 - repeat-position measurement:
-1. Attach a dial indicator, camera fiducial, or external encoder at the test pose.
-2. Run at least 30 A-B-A round trips at low speed, then repeat at normal speed.
-3. Record the physical A-position error after every return.
-4. Compare max, mean, and RMS physical error before and after v0.26.3.
-
-Only physical measurement can prove repeat-position improvement. MCU software
-position returning to the same pulse count proves command consistency, not that
-the mechanism followed every pulse.
+Stage 4 - motion:
+1. Home, then run low-speed short G1 and G2/G3 moves.
+2. Run at 20 mm/s and 100 mm/s^2, then repeat at the intended high speed.
+3. Run at least 30 left/right 30 mm exact-stop jog round trips.
+4. Run handwriting and text outlines with at least 30 stroke transitions;
+   require each G4 barrier to hold its stroke endpoint, with no JPos rewind and
+   no increase in the Seg underrun counter. Require every input sharp corner to
+   appear as a true G1 endpoint with no deleted point or generated corner arc.
+5. Run a mixed line/arc car outline. Require every declared car-body point to
+   appear as an exact G1 endpoint, while the two wheel curves remain true G2/G3
+   arcs and line-to-arc transitions do not visibly pause.
+6. Require software pulse endpoint closure, no accumulated physical drift, no
+   segment underrun, and physical return error <= 0.3 mm.

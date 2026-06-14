@@ -5,10 +5,10 @@
 #include "app_config.h"
 #include "app_main.h"
 #include "app_params.h"
-#include "binary_traj.h"
 #include "gcode_stream.h"
 #include "home_controller.h"
 #include "home_sensor.h"
+#include "laser_control.h"
 #include "motion_planner.h"
 #include "serial_dma.h"
 #include "stepper_driver.h"
@@ -24,6 +24,14 @@ static uint32_t s_watchdog_timeout_ms;
 static uint32_t s_watchdog_last_rx_ms;
 static uint32_t s_protocol_tick_ms;
 static bool s_watchdog_tripped;
+
+#define HOME_ERR_SWITCH_ACTIVE_CODE 4u
+
+static void send_protocol_error(const char *message)
+{
+    LaserControl_Disarm();
+    SerialDma_Send(message);
+}
 
 static void upper_token(char *text)
 {
@@ -51,15 +59,18 @@ void Protocol_SendStatus(void)
     /* STATUS 是人工调试用长状态；自动 UI 状态主要由 gcode_stream.c 的 <...> 推送提供。 */
     StepperState s;
     HomeSensorState home;
-    BinaryTrajSnapshot traj;
+    MotionPlannerSnapshot planner;
+    LaserControlState laser;
     Stepper_GetStateSnapshot(&s);
     HomeSensor_GetState(&home);
-    BinaryTraj_GetSnapshot(&traj);
+    MotionPlanner_GetSnapshot(&planner);
+    LaserControl_GetState(&laser);
 
     SerialDma_SendFormat("STAT t=%lu m=%s e=%lu p=%ld,%ld "
                          "r=%u,%u en=%u,%u pps=%ld,%ld tgt=%ld,%ld wd=%u idle=%lu "
                          "rxov=%lu txd=%lu txq=%lu h=%u,%u hs=%s he=%u "
-                         "bf=%u,%u q=%u sq=%u,%u jt=%s,%lu,%lu,%u,%u hz=%lu ic=%lu\r\n",
+                         "bf=%u,%u q=%u sq=%u,%u low=%u und=%lu pf=%lu rl=%lu gap=%lu prep=%lu done=%lu hz=%lu ic=%lu "
+                         "laser=%u,%u,%u,%u\r\n",
                          (unsigned long)s.tick_ms,
                          Stepper_ModeName(s.axis[0].mode != STEPPER_MODE_IDLE ? s.axis[0].mode : s.axis[1].mode),
                          (unsigned long)(s.axis[0].error | s.axis[1].error),
@@ -87,13 +98,19 @@ void Protocol_SendStatus(void)
                          (unsigned int)GcodeStream_PlannerCount(),
                          (unsigned int)Stepper_TimedSegmentCount(),
                          (unsigned int)Stepper_TimedSegmentFree(),
-                         BinaryTraj_StateName(traj.state),
-                         (unsigned long)traj.accepted_count,
-                         (unsigned long)traj.executed_count,
-                         (unsigned int)traj.buffer_count,
-                         (unsigned int)traj.buffer_free,
+                         (unsigned int)planner.segment_low_water,
+                         (unsigned long)planner.segment_underrun_count,
+                         (unsigned long)planner.preparation_fault_count,
+                         (unsigned long)planner.rate_limited_segment_count,
+                         (unsigned long)planner.max_refill_gap_ms,
+                         (unsigned long)planner.prepared_segments,
+                         (unsigned long)planner.completed_blocks,
                          (unsigned long)APP_CONTROL_HZ,
-                         (unsigned long)App_MaxTickCycles());
+                         (unsigned long)App_MaxTickCycles(),
+                         laser.armed ? 1u : 0u,
+                         laser.relay_ready ? 1u : 0u,
+                         laser.marking ? 1u : 0u,
+                         (unsigned int)laser.power_permille);
 }
 
 static void send_errors(void)
@@ -139,9 +156,12 @@ void Protocol_ProcessLine(const char *line)
                              APP_FW_VERSION,
                              (unsigned long)APP_SERIAL_BAUDRATE);
     } else if (strcmp(cmd, "HOSTCAP") == 0) {
-        /* 告诉上位机：当前固件定位为“上位机规划、下位机执行”的脉冲控制器。 */
+        /* 告诉上位机：UI 发送 G-code，MCU 负责 planner、segment preparation 和 STEP 输出。 */
         const AppParams *p = AppParams_Get();
-        SerialDma_SendFormat("OK HOSTCAP host_plan=1 gcode_abt=1 binary_traj=1 binary_timed=1 ptest=0 jogp=0 dda=1 hz=%lu ppr1=%ld ppr2=%ld\r\n",
+        SerialDma_SendFormat("OK HOSTCAP grbl_stream=1 char_count=1 scara_plan=1 planner=%u segments=%u gcode_arc=1 jog=1 laser=%u laser_m3m4m5=1 dda=1 hz=%lu ppr1=%ld ppr2=%ld\r\n",
+                             (unsigned int)APP_GCODE_PLANNER_BLOCKS,
+                             (unsigned int)APP_STEPPER_TIMED_SEGMENTS,
+                             (unsigned int)APP_LASER_COMMISSIONED,
                              (unsigned long)APP_CONTROL_HZ,
                              (long)p->pulses_per_rev[0],
                              (long)p->pulses_per_rev[1]);
@@ -162,9 +182,9 @@ void Protocol_ProcessLine(const char *line)
             b = a;
         }
         if (a <= 0 || b <= 0) {
-            SerialDma_Send("ERR PPR_RANGE\r\n");
+            send_protocol_error("ERR PPR_RANGE\r\n");
         } else if (Stepper_IsBusy() || GcodeStream_PlannerCount() > 0u) {
-            SerialDma_Send("ERR PPR_BUSY\r\n");
+            send_protocol_error("ERR PPR_BUSY\r\n");
         } else {
             AppParams *p = AppParams_Mutable();
             p->pulses_per_rev[0] = (int32_t)a;
@@ -184,6 +204,38 @@ void Protocol_ProcessLine(const char *line)
                              (unsigned int)GcodeStream_PlannerCount());
     } else if (strcmp(cmd, "ERRORS") == 0) {
         send_errors();
+    } else if (strcmp(cmd, "LASER STATUS") == 0) {
+        LaserControlState laser;
+        LaserControl_GetState(&laser);
+        uint8_t safety = (laser.pwm_ready ? 1u : 0u) |
+                         (laser.boot_ready ? 2u : 0u) |
+                         (APP_LASER_COMMISSIONED ? 4u : 0u) |
+                         (APP_LASER_PWM_ACTIVE_HIGH ? 8u : 0u);
+        SerialDma_SendFormat("OK LASER armed=%u ready=%u marking=%u power_permille=%u safety=%u\r\n",
+                             laser.armed ? 1u : 0u,
+                             laser.relay_ready ? 1u : 0u,
+                             laser.marking ? 1u : 0u,
+                             (unsigned int)laser.power_permille,
+                             (unsigned int)safety);
+    } else if (sscanf(cmd, "LASER POWER %ld", &a) == 1) {
+        if (a < 0 || a > 65535 || !LaserControl_SetPowerPermille((uint16_t)a)) {
+            send_protocol_error("ERR LASER_POWER_RANGE\r\n");
+        } else {
+            SerialDma_SendFormat("OK LASER POWER %ld\r\n", a);
+        }
+    } else if (strcmp(cmd, "LASER ARM") == 0) {
+        HomeControllerState home_state = HomeController_GetState();
+        if (Stepper_IsBusy() || GcodeStream_PlannerCount() > 0u ||
+            (home_state != HOME_CTRL_IDLE && home_state != HOME_CTRL_DONE && home_state != HOME_CTRL_ERROR)) {
+            send_protocol_error("ERR LASER_BUSY\r\n");
+        } else if (!LaserControl_Arm()) {
+            send_protocol_error("ERR LASER_NOT_READY\r\n");
+        } else {
+            SerialDma_Send("OK LASER ARM\r\n");
+        }
+    } else if (strcmp(cmd, "LASER DISARM") == 0) {
+        LaserControl_Disarm();
+        SerialDma_Send("OK LASER DISARM\r\n");
     } else if (strcmp(cmd, "HOME_SENSOR") == 0) {
         HomeSensorState home;
         HomeSensor_GetState(&home);
@@ -193,16 +245,26 @@ void Protocol_ProcessLine(const char *line)
                              (unsigned int)home.active_mask,
                              (unsigned int)APP_HOME_SWITCH_ACTIVE_LEVEL);
     } else if (strcmp(cmd, "HOME") == 0 || strcmp(cmd, "HOME_REAL") == 0) {
-        if (HomeController_Start(false)) {
+        if (MotionPlanner_IsBusy()) {
+            send_protocol_error("ERR HOME_BUSY\r\n");
+        } else if (HomeController_Start(false)) {
+            MotionPlanner_Clear();
             SerialDma_Send("OK HOME_REAL\r\n");
+        } else if (HomeController_Error() == HOME_ERR_SWITCH_ACTIVE_CODE) {
+            send_protocol_error("ERR HOME_SWITCH_ACTIVE\r\n");
         } else {
-            SerialDma_Send("ERR HOME_BUSY\r\n");
+            send_protocol_error("ERR HOME_BUSY\r\n");
         }
     } else if (strcmp(cmd, "HOME_SIM") == 0) {
-        if (HomeController_Start(true)) {
+        if (MotionPlanner_IsBusy()) {
+            send_protocol_error("ERR HOME_BUSY\r\n");
+        } else if (HomeController_Start(true)) {
+            MotionPlanner_Clear();
             SerialDma_Send("OK HOME_SIM\r\n");
+        } else if (HomeController_Error() == HOME_ERR_SWITCH_ACTIVE_CODE) {
+            send_protocol_error("ERR HOME_SWITCH_ACTIVE\r\n");
         } else {
-            SerialDma_Send("ERR HOME_BUSY\r\n");
+            send_protocol_error("ERR HOME_BUSY\r\n");
         }
     } else if (strcmp(cmd, "WATCHDOG") == 0) {
         SerialDma_SendFormat("OK WATCHDOG enabled=%u timeout_ms=%lu idle_ms=%lu tripped=%u\r\n",
@@ -218,7 +280,7 @@ void Protocol_ProcessLine(const char *line)
             s_watchdog_tripped = false;
             SerialDma_Send("OK WATCHDOG ON\r\n");
         } else {
-            SerialDma_Send("ERR WATCHDOG\r\n");
+            send_protocol_error("ERR WATCHDOG\r\n");
         }
     } else if (strcmp(cmd, "WATCHDOG OFF") == 0) {
         s_watchdog_enabled = false;
@@ -226,17 +288,18 @@ void Protocol_ProcessLine(const char *line)
         SerialDma_Send("OK WATCHDOG OFF\r\n");
     } else if (strcmp(cmd, "STOP") == 0) {
         HomeController_Stop();
-        BinaryTraj_Stop();
         GcodeStream_Clear();
         MotionPlanner_Stop();
         SerialDma_Send("OK STOP\r\n");
     } else if (strcmp(cmd, "ESTOP") == 0) {
         HomeController_Stop();
-        BinaryTraj_Stop();
         GcodeStream_Clear();
         Stepper_EStopAll();
         SerialDma_Send("OK ESTOP\r\n");
     } else if (strcmp(cmd, "CLEAR_ERROR") == 0 || strcmp(cmd, "RESET") == 0) {
+        if (strcmp(cmd, "RESET") == 0) {
+            LaserControl_Disarm();
+        }
         Stepper_ClearError();
         HomeController_ClearError();
         s_watchdog_tripped = false;
@@ -245,13 +308,14 @@ void Protocol_ProcessLine(const char *line)
         MotionPlanner_Stop();
         Stepper_Zero();
         SerialDma_Send("OK ZERO\r\n");
-    } else if (strncmp(cmd, "JOGP", 4) == 0 || strncmp(cmd, "PTEST", 5) == 0) {
-        SerialDma_Send("ERR USE_G1_ABT\r\n");
     } else if (sscanf(cmd, "ENABLE %ld", &a) == 1) {
+        if (a == 0) {
+            LaserControl_Disarm();
+        }
         Stepper_EnableAll(a != 0);
         SerialDma_Send(a != 0 ? "OK ENABLE 1\r\n" : "OK ENABLE 0\r\n");
     } else {
-        SerialDma_Send("ERR BAD_CMD\r\n");
+        send_protocol_error("ERR BAD_CMD\r\n");
     }
 }
 

@@ -5,9 +5,10 @@
 #include "app_config.h"
 #include "board_pins.h"
 #include "app_params.h"
-#include "binary_traj.h"
 #include "gcode_stream.h"
 #include "home_controller.h"
+#include "laser_control.h"
+#include "motion_planner.h"
 #include "protocol.h"
 #include "scara_kinematics.h"
 #include "serial_dma.h"
@@ -17,12 +18,13 @@ static volatile uint32_t s_max_tick_cycles;
 
 void App_Init(void)
 {
+    LaserControl_Init();
     AppParams_Init();
     Stepper_Init();
     ScaraKinematics_Init();
     HomeController_Init();
+    MotionPlanner_Init();
     GcodeStream_Init();
-    BinaryTraj_Init();
     Protocol_Init();
     SerialDma_Init();
     HAL_TIM_Base_Start_IT(BOARD_TICK_TIM);
@@ -46,30 +48,38 @@ void App_Loop(void)
         line[1] = '\0';
         Protocol_ProcessLine(line);
     }
-    if (SerialDma_ReadLine(line, sizeof(line))) {
+    /*
+     * Match Grbl's planner backpressure and fill behavior: leave complete
+     * lines in the RX ring when planner/TX space is unavailable, otherwise
+     * drain all acceptable lines before preparing segments. Parsing only one
+     * line here lets a short block be consumed as an apparent program end
+     * before its successor reaches the planner.
+     */
+    for (;;) {
+        HomeControllerState home_state = HomeController_GetState();
+        bool homing_active = home_state != HOME_CTRL_IDLE &&
+                             home_state != HOME_CTRL_DONE &&
+                             home_state != HOME_CTRL_ERROR;
+        if (homing_active ||
+            GcodeStream_HomeAckPending() ||
+            GcodeStream_PlannerFree() == 0u ||
+            SerialDma_TxFreeCount() == 0u ||
+            !SerialDma_ReadLine(line, sizeof(line))) {
+            break;
+        }
         Protocol_ProcessLine(line);
     }
     HomeController_Loop();
-    BinaryTraj_Loop();
+    MotionPlanner_Loop();
     GcodeStream_Loop();
     Protocol_Loop();
 }
 
-void App_Tick10kHz(void)
+void App_StepEventIrq(void)
 {
-    static uint8_t low_rate_divider;
     uint32_t tick_start = DWT->CYCCNT;
 
-    Stepper_Tick10kHz();
-    BinaryTraj_Tick10kHz();
-
-    low_rate_divider++;
-    if (low_rate_divider >= 10u) {
-        low_rate_divider = 0;
-        HomeController_Tick1kHz();
-        GcodeStream_Tick1kHz();
-        Protocol_Tick1kHz();
-    }
+    Stepper_StepEventIrq();
 
     uint32_t tick_cycles = (uint32_t)(DWT->CYCCNT - tick_start);
     if (tick_cycles > s_max_tick_cycles) {
@@ -77,10 +87,28 @@ void App_Tick10kHz(void)
     }
 }
 
+void App_Tick1kHz(void)
+{
+    HomeController_Tick1kHz();
+    MotionPlanner_Tick1kHz();
+    GcodeStream_Tick1kHz();
+    Protocol_Tick1kHz();
+    StepperState stepper;
+    Stepper_GetStateSnapshot(&stepper);
+    uint32_t error = stepper.axis[0].error | stepper.axis[1].error;
+    if (error != 0u || HomeController_GetState() == HOME_CTRL_ERROR) {
+        LaserControl_Disarm();
+    } else {
+        bool controller_idle = !Stepper_IsBusy() &&
+                               GcodeStream_PlannerCount() == 0u;
+        LaserControl_Tick1kHz(controller_idle);
+    }
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim == BOARD_TICK_TIM) {
-        App_Tick10kHz();
+        App_StepEventIrq();
     }
 }
 

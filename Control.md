@@ -24,11 +24,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_project.ps1
 当前验证重点：
 
 ```text
-固件版本：0.24.1
+固件版本：0.29.0-grbl-scara
 串口波特率：115200 8N1
 通信看门狗：默认关闭
-正式轨迹限位：上位机负责
+正式运动入口：GRBL-style G-code stream
+运动职责边界：UI 生成真实 G-code；MCU 负责 look-ahead、SCARA segment preparation 和 STEP 输出
 ```
+
+当前项目计划以 `PROMPT.md` 中“2026-06-12 续接项目计划：GRBL-SCARA 四层流式运动内核”为准。旧 BinaryTraj、host-timed 点轨迹和实验文本链路不再作为正式调试入口。
 
 ## 3. 烧录
 
@@ -64,6 +67,65 @@ WATCHDOG OFF     关闭通信看门狗。
 WATCHDOG ON 3000 开启 3000 ms 通信看门狗。
 ```
 
+## 激光 PWM 与继电器
+
+激光加工接口使用：
+
+```text
+PA7 / TIM3_CH2   1 kHz PWM，经确认合适的电平转换后连接激光单根 PWM 控制线。
+PA2              继电器控制，高电平吸合，上电默认低电平。
+STM32 GND        与激光黑线/电源负极共地，作为单根 PWM 控制线的电压参考。
+```
+
+根据开发板引脚说明，`PA0` 与板载 `K1/WKUP` 复用，因此不用于激光；`PA2`、`PA7` 不与板载 LED 或按键冲突。继电器使用常开触点：
+
+```text
+12V+ -> 保险/实体急停 -> 继电器 COM -> NO -> 激光红线
+激光黑线 -> 12V-
+```
+
+当前实物只有正负极电源线和一根 PWM 控制线，因此该控制线必须以激光黑线/电源负极为参考。连接 `PA7` 前，必须先测量控制线对激光黑线的空载电压。若接近 12V，禁止直接连接 STM32，必须增加电平转换或光耦。
+
+激光正负极直接接电源且没有继电器/MOSFET 断电级时，固件无法保证复位、烧录、线缆脱落或 MCU 失电期间不出光。必须增加实体急停控制的继电器或常断功率 MOSFET。对常见“高电平有效”输入，还应在电平转换器的激光侧增加合适的下拉，使控制线悬空时保持关闭。
+
+上电安全状态必须是 `0%/关闭`，不是 `1.0%` 最低加工功率。当前固件默认：
+
+```text
+APP_LASER_COMMISSIONED = 1   已接入继电器断电通道，允许 LASER ARM。
+APP_LASER_PWM_ACTIVE_HIGH = 1   已验证行为：PA7 低电平关闭，高电平增加功率。
+上电后立即钳位 PA7 为低电平；空闲、抬笔、停止和故障时完全停止 TIM3，并将 PA7 保持为普通推挽 GPIO 低电平，不再依赖 0% PWM。
+启动后 1000 ms 内拒绝 LASER ARM。
+```
+
+STM32 复位释放到执行 `main()` 之前，PA7 仍会短暂处于悬空输入状态。对于已验证的高电平有效行为，应在确认控制线电压兼容后于激光输入侧增加合适的下拉，使悬空状态保持关闭；若控制线存在 12V 内部上拉，必须使用电平转换器，禁止直接接入 PA7。只有继电器或常断 MOSFET 才能覆盖 MCU 未运行、烧录和掉电状态。
+
+解除 commissioning 锁前必须断开激光 12V 电源并完成：
+
+```text
+1. 测量 PA7 对 STM32 GND：上电、复位和空闲时均为安全电平。
+2. 确认 STM32 GND 与激光黑线/电源负极可靠共地。
+3. 使用示波器或逻辑分析仪验证 ARM 前无脉冲，L1 时只有设定的低占空比。
+4. 确认控制线电压不会超过 STM32 允许范围。
+5. 确认输入极性、继电器高电平吸合和常开触点断电路径后，才能接入激光主电源。
+6. 最后通过继电器/MOSFET 断电级重新连接激光电源。
+```
+
+若确认模块为低电平有效，必须先设计“悬空时保持高电平关闭”的硬件，再将 `APP_LASER_PWM_ACTIVE_HIGH` 改为 `0`。禁止在激光通电状态下试改极性。软件控制不能替代实体急停、护目镜、防护罩和独立断电装置。
+
+```text
+LASER POWER 10   设置 1.0% 功率，允许 1..50（0.1%..5.0%）。
+LASER ARM        只授权激光加工，不立即吸合继电器，PWM 保持 0%。
+LASER DISARM     立即 PWM 归零并释放继电器。
+LASER STATUS     查询 armed/ready/marking/power_permille/safety。
+G1 ... L0        抬笔段，不出光。
+G1 ... L1        落笔段，按设置功率出光。
+G1 ... L2        继电器预吸合等待段，PWM 关闭。
+```
+
+UI 的“激光开启/关闭”按钮默认关闭。开启后，非 `silent` 轨迹段和手动点动可出光，`silent` 连接段不出光；从抬笔切换到落笔前会插入约 100 ms 的 `LASER_PREP` 等待段，使继电器先吸合。任务完成、停止、急停、回零、断连或错误后自动关闭。预览操作永不 ARM 激光。
+
+`LASER STATUS` 的 `safety` 位定义：bit0=PWM 输出路径已通过 commissioning、bit1=启动锁定已结束、bit2=已 commissioning、bit3=高电平有效。当前配置的 bit3 为 1；空闲时 TIM3 停止属于正常状态。
+
 推荐手动调试顺序：
 
 ```text
@@ -86,7 +148,7 @@ CLEAR_ERROR
 ENABLE 1
 ```
 
-这样可以避免刚烧录或刚急停后电机未使能，导致下位机在启动运动块时返回 `error:15`。`OK ENABLE 1`、`OK CLEAR_ERROR`、`OK ZERO` 只表示系统命令执行完成，不属于点动 G-code 的 `ok seq/cs/line` 回显，上位机不会用这些系统 OK 推进点动队列。
+这样可以避免刚烧录或刚急停后电机未使能，导致下位机在启动运动块时返回 `error:15`。`OK ENABLE 1`、`OK CLEAR_ERROR`、`OK ZERO` 只表示系统命令执行完成，不属于点动 G-code 的小写 `ok` ACK，上位机不会用这些系统 OK 推进点动队列。
 
 ### 坐标系与软件零点
 
@@ -109,35 +171,35 @@ MCU 坐标：双电机中点为 X=0，左电机约 X=-75，右电机约 X=75。
 ```text
 APP_MOTOR1_ZERO_MRAD = 2251
 APP_MOTOR2_ZERO_MRAD = 890
-APP_PARAM_FLASH_VERSION = 4
+APP_PARAM_FLASH_VERSION = 6
 ```
 
-状态帧的 `M:x,y` 会有少量脉冲量化误差。v0.24.1 起，`P:0,0` 在新对称非交叉构型下通常回报约 `M:0.053,219.966`，换算到 UI 约为 `X=75.053,Y=219.966`。注意：步进电机是开环系统，烧录或 `ZERO` 只改变软件坐标解释，不会自动把实体杆件移动到新对称零点；真实点动前必须确认机械姿态已经与 UI `X=75,Y=220` 对应。
+状态帧的 `MPos:x,y` 会有少量脉冲量化误差。v0.27.5 起，UI、固件和测试默认使用 `6400 PPR`；上位机按半脉冲穿越时刻规划并以固件 timed-DDA 精确回放校验压缩，可将轨迹波纹压到单微步物理分辨率附近，但无法消除机械间隙、杆件弹性或真实失步。`APP_PARAM_FLASH_VERSION=6` 会在首次运行时恢复全部当前源码默认参数。注意：步进电机是开环系统，烧录或 `ZERO` 只改变软件坐标解释，不会自动把实体杆件移动到新对称零点；真实点动前必须确认机械姿态已经与 UI `X=75,Y=220` 对应。
 
 ## 5. G-code 通信协议
 
-上位机逐行发送 G-code。下位机成功接收、解析并入队后，返回完整回显：
+上位机逐行发送 G-code。下位机成功接收、解析并入队后，返回：
 
 ```text
-ok seq=<n> cs=<hex> line=<原始接收行>
+ok
 ```
 
 示例：
 
 ```text
 TX: G1 X-34.900 Y145.000 F800 ;ID=0001 LIM=1
-RX: ok seq=12 cs=5A line=G1 X-34.900 Y145.000 F800 ;ID=0001 LIM=1
+RX: ok
 ```
 
 上位机必须检查：
 
 ```text
-seq   ACK 序号递增。
-cs    与发送行 ASCII 累加和低 8 位一致。
-line  与发送行完全一致。
+ok            本行 G-code 已被接收/入队。
+error:<code>  本行 G-code 未被正常接受，应停止继续发送轨迹。
+<...>/STAT    状态帧不是 ACK，不能推进发送队列。
 ```
 
-上位机必须等到 `ok seq/cs/line` 后才能发送下一条正式轨迹指令。
+上位机必须等到小写 `ok` 后才能发送下一条正式轨迹指令。
 
 ## 6. 支持的 G-code 子集
 
@@ -183,21 +245,24 @@ LIM    上位机已完成限位检查标记，建议 `LIM=1`。
 自动状态帧约 5 Hz 推送，也可以发送 `?` 立即查询：
 
 ```text
-<Idle|M:x,y|P:p1,p2|Bf:planner_free,rx_free|Q:planner_used|E:n|H:h1,h2|HS:home_state|A1:en,run,cur_pps,tgt_pps|A2:en,run,cur_pps,tgt_pps>
+<Idle|MPos:x,y|JPos:p1,p2|FS:feed_mm_min,spindle|Bf:planner_free,rx_free|Q:planner_used|E:n|Seg:count,free,low,underrun|H:h1,h2|HS:home_state|A1:en,run,cur_pps,tgt_pps|A2:en,run,cur_pps,tgt_pps|Lz:armed,ready,marking,power>
 ```
 
 字段含义：
 
 ```text
 Idle/Run 当前是否空闲或有运动/队列。
-M        MCU 根据软件脉冲正解估算的末端 XY。
-P        双电机软件脉冲计数。
+MPos     MCU 根据软件脉冲正解估算的末端 XY。
+JPos     双电机软件脉冲计数。
+FS       当前 G-code 进给和主轴/功率字。
 Bf       规划缓冲剩余、RX 行队列剩余。
 Q        规划缓冲已用段数。
 E        步进底层错误 bit。
+Seg      timed segment 缓冲计数、剩余、低水位和欠载次数。
 H        HOME1/HOME2 输入，1 表示触发。
 HS       回零状态机阶段。
 A1/A2    轴状态：使能、运行、当前 pps、目标 pps。
+Lz       激光状态：armed、relay_ready、marking、power_permille。
 ```
 
 状态帧不是某条 G-code 的 ACK，可能穿插在 `ok` 前后。上位机需要按行区分：
@@ -263,7 +328,7 @@ E:5      是底层错误位组合。
 
 ```text
 APP_HOST_OWNS_LIMIT_CHECKS = 1
-HOSTCAP ... host_limit=1 mcu_soft_limit=0
+HOSTCAP ... grbl_stream=1 scara_plan=1 gcode_arc=1 jog=1 binary_traj=0 dda=1
 ```
 
 上位机发送轨迹前必须遍历所有点，完成：
@@ -297,9 +362,9 @@ STOP/ESTOP。
 
 ```text
 HS:Axis1Search
-HS:Axis1Backoff
+HS:Axis1Return
 HS:Axis2Search
-HS:Axis2Backoff
+HS:Axis2Return
 ```
 
 此时第二次发送 `$H` 会返回：
@@ -350,7 +415,7 @@ G3 逆圆：当前点 -> 目标点，按半径选择逆时针圆弧
 
 发送前会遍历整条路径。若超限，会显示具体点、具体轴或结构和超出量，例如 M1/M2 角度超限、左右基座距离超限、主动臂交叉或主动臂低于基座线。
 
-脚本会显示每段 `PATH SAFE`、每 100 点进度、drain 状态和最终 `PATH PASS`。正式 ACK 仍逐条校验 `seq/cs/line`，但不会逐条刷屏。
+脚本会显示每段 `PATH SAFE`、每 100 点进度、drain 状态和最终 `PATH PASS`。正式 ACK 以小写 `ok` 为准，状态帧只用于 drain 判断，不会逐条刷屏。
 
 上位机离线规划检查：
 

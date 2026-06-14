@@ -2,15 +2,10 @@ import time
 
 import numpy as np
 
-from ..communication.serial_protocol import checksum as protocol_checksum
-
 
 class ScaraUtilityMixin:
     def get_timestamp(self):
         return time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
-
-    def calculate_checksum(self, line):
-        return protocol_checksum(line)
 
     def send_ascii_line(self, line, tag="manual"):
         if not self.ser or not self.ser.is_open:
@@ -19,9 +14,18 @@ class ScaraUtilityMixin:
         text = line.strip()
         if not text:
             return False
+        if text in ("?", "!", "~"):
+            self.ser.write(text.encode("ascii"))
+            return True
+        if hasattr(self, "_line_requires_homing") and self._line_requires_homing(text):
+            self.log_error("Manual motion G-code is blocked; use a formal motion action with a verified preview path.")
+            return False
+        if text[0].upper() in ("G", "M", "$") and hasattr(self, "load_gcode_job"):
+            append = bool(getattr(self, "waiting_for_ack", False) or getattr(self, "point_queue", None))
+            return self.load_gcode_job([text], append=append)
         self.ser.write((text + "\n").encode('ascii', errors='ignore'))
         self.log_display.append(
-            f"<font color='#ffffff'>TX {self.get_timestamp()} [{tag}] cs={self.calculate_checksum(text)} line={text}</font>"
+            f"<font color='#ffffff'>TX {self.get_timestamp()} [{tag}] line={text}</font>"
         )
         return True
 

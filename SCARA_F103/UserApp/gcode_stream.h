@@ -12,5 +12,6 @@ void GcodeStream_RequestStatus(void);
 void GcodeStream_Clear(void);
 uint8_t GcodeStream_PlannerFree(void);
 uint8_t GcodeStream_PlannerCount(void);
+bool GcodeStream_HomeAckPending(void);
 
 #endif

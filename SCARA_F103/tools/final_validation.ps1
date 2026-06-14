@@ -1,8 +1,7 @@
 param(
     [string]$Port = "AUTO",
     [int]$Count = 300,
-    [int]$ChunkPoints = 10,
-    [int]$FeedPps = 300,
+    [double]$FeedMmMin = 900.0,
     [double]$MaxErrorMm = 1.0,
     [double]$MaxRmsMm = 0.3,
     [string]$OutDir = "",
@@ -47,10 +46,6 @@ function Invoke-Step {
 Push-Location $projectRoot
 try {
     Invoke-Step -Name "Project Verify" -File (Join-Path $PSScriptRoot "verify_project.ps1") -StepArgs @()
-    Invoke-Step -Name "Binary Interpolator Simulation" -File (Join-Path $PSScriptRoot "simulate_binary_interpolator.ps1") -StepArgs @(
-        "-Count", ([string]$Count),
-        "-FeedPps", ([string]$FeedPps)
-    )
     Invoke-Step -Name "Serial Link" -File (Join-Path $PSScriptRoot "serial_link_check.ps1") -StepArgs @(
         "-Port", $Port,
         "-Repeat", "2"
@@ -62,18 +57,28 @@ try {
         "-Port", $Port,
         "-BurstLines", "6"
     )
+    Invoke-Step -Name "G-code Stream Check" -File (Join-Path $PSScriptRoot "gcode_stream_check.ps1") -StepArgs @(
+        "-Port", $Port
+    )
 
     if (-not $SkipMotion) {
-        $csvPath = Join-Path $OutDir "binary_final.csv"
-        $summaryPath = Join-Path $OutDir "binary_final_summary.csv"
-        Invoke-Step -Name "Binary Joint Trajectory Stress" -File (Join-Path $PSScriptRoot "binary_joint_traj_stress.ps1") -StepArgs @(
+        Invoke-Step -Name "UI Control Matrix" -File (Join-Path $PSScriptRoot "ui_control_matrix_check.ps1") -StepArgs @(
+            "-Port", $Port,
+            "-FeedMmMin", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0}", $FeedMmMin))
+        )
+        Invoke-Step -Name "UI Trajectory Stress" -File (Join-Path $PSScriptRoot "ui_trajectory_stress.ps1") -StepArgs @(
             "-Port", $Port,
             "-Count", ([string]$Count),
-            "-ChunkPoints", ([string]$ChunkPoints),
-            "-FeedPps", ([string]$FeedPps),
+            "-FeedMmMin", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0}", $FeedMmMin))
+        )
+        $csvPath = Join-Path $OutDir "gcode_feedback.csv"
+        $summaryPath = Join-Path $OutDir "gcode_feedback_summary.csv"
+        Invoke-Step -Name "G-code Feedback Error Stress" -File (Join-Path $PSScriptRoot "feedback_error_stress.ps1") -StepArgs @(
+            "-Port", $Port,
+            "-Count", ([string]$Count),
+            "-FeedMmMin", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0}", $FeedMmMin)),
             "-MaxErrorMm", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0}", $MaxErrorMm)),
             "-CsvPath", $csvPath,
-            "-ZeroBeforeRun",
             "-EnableMotion"
         )
         Invoke-Step -Name "Feedback CSV Analysis" -File (Join-Path $PSScriptRoot "analyze_feedback_error_csv.ps1") -StepArgs @(

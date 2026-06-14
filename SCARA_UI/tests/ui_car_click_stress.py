@@ -1,8 +1,8 @@
 """Run the car trajectory through the real Qt UI control path.
 
 This test intentionally instantiates the main window, fills the same widgets a
-user edits, clicks the same car button slots, and lets ``serial_mixin`` upload
-the binary trajectory. It is a UI-level stress test, not a hand-written
+user edits, clicks the same car button slots, and lets ``serial_mixin`` stream
+the generated GRBL/G-code job. It is a UI-level stress test, not a hand-written
 protocol sender.
 """
 
@@ -43,7 +43,7 @@ def pump(app, window, seconds: float, poll_status: bool = False) -> None:
         app.processEvents()
         if poll_status and window.ser and window.ser.is_open and time.monotonic() >= next_status:
             try:
-                window.ser.write(b"?\n")
+                window.ser.write(b"?")
             except Exception:
                 pass
             next_status = time.monotonic() + 0.12
@@ -66,11 +66,9 @@ def wait_for_motion_done(window, app, timeout_s: float) -> None:
     while time.monotonic() < deadline:
         pump(app, window, 0.08, poll_status=True)
         stats = window.feedback_error_tracker.stats()
-        stream_active = bool(getattr(window, "binary_stream_active", False))
-        motion_active = bool(getattr(window, "binary_motion_active", False))
         queued = bool(getattr(window, "point_queue", []))
         waiting = bool(getattr(window, "waiting_for_ack", False))
-        if stats.count >= 3 and not stream_active and not motion_active and not queued and not waiting:
+        if stats.count >= 3 and not queued and not waiting:
             if stable_idle_since is None:
                 stable_idle_since = time.monotonic()
             elif time.monotonic() - stable_idle_since >= 1.0:
@@ -161,11 +159,9 @@ def main() -> int:
         pump(app, window, 0.2)
 
         preview_count = len(getattr(window, "active_preview_path", []) or [])
-        send_count = len(getattr(window, "active_binary_send_path", []) or [])
+        send_count = int(getattr(window, "sent_point_id", 0))
         if preview_count == 0:
             preview_count = len(getattr(window, "preview_x", []) or [])
-        if send_count == 0:
-            send_count = len(getattr(window, "binary_stream_points", []) or [])
 
         wait_for_motion_done(window, app, args.timeout_s)
         stats = window.feedback_error_tracker.stats()
@@ -189,8 +185,8 @@ def main() -> int:
         if stats.max_norm > args.max_error_mm:
             print(f"UI_CAR_CLICK FAIL: max error {stats.max_norm:.4f}mm > {args.max_error_mm:.4f}mm")
             return 1
-        if "二进制轨迹上传错误" in window.log_display.toPlainText()[len(before_log) :]:
-            print("UI_CAR_CLICK FAIL: UI binary upload error logged")
+        if "控制器报警" in window.log_display.toPlainText()[len(before_log) :]:
+            print("UI_CAR_CLICK FAIL: controller error logged")
             return 1
         print("UI_CAR_CLICK PASS")
         return 0

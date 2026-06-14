@@ -98,7 +98,7 @@ function Export-FeedbackCsv {
 
 function Parse-Status {
     param([string]$Line)
-    if ($Line -match "M:([-0-9.]+),([-0-9.]+)") {
+    if ($Line -match "MPos:([-0-9.]+),([-0-9.]+)") {
         Add-FeedbackSample -X ([double]$Matches[1]) -Y ([double]$Matches[2])
     }
 }
@@ -129,7 +129,7 @@ function Send-Command {
         }
         foreach ($prefix in $AcceptPrefixes) {
             if ($rx.StartsWith($prefix)) {
-                if ($RequireEcho) {
+                if ($RequireEcho -and $rx.Trim().ToLowerInvariant() -ne "ok") {
                     if ($rx -notmatch "cs=$expectedCs") { throw "ACK checksum mismatch for $Name" }
                     if (-not $rx.EndsWith("line=$Line")) { throw "ACK line mismatch for $Name" }
                 }

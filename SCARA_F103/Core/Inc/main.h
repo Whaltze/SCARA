@@ -63,6 +63,10 @@ void Error_Handler(void);
 #define M1_ENA_GPIO_Port GPIOB
 #define M1_PUL_Pin GPIO_PIN_8
 #define M1_PUL_GPIO_Port GPIOA
+#define LASER_RELAY_Pin GPIO_PIN_2
+#define LASER_RELAY_GPIO_Port GPIOA
+#define LASER_PWM_Pin GPIO_PIN_7
+#define LASER_PWM_GPIO_Port GPIOA
 #define USART1_TX_Pin GPIO_PIN_9
 #define USART1_TX_GPIO_Port GPIOA
 #define USART1_RX_Pin GPIO_PIN_10

@@ -17,12 +17,15 @@ from PySide6.QtWidgets import (
     QSlider,
     QScrollArea,
     QCheckBox,
+    QDoubleSpinBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 
 
 class HandwritingPad(QWidget):
+    CAPTURE_MIN_DELTA = 0.001
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._strokes = []
@@ -56,16 +59,24 @@ class HandwritingPad(QWidget):
     def mouseMoveEvent(self, event):
         if not self._drawing or not self._strokes:
             return
-        point = self._event_point(event)
-        last = self._strokes[-1][-1]
-        if abs(point[0] - last[0]) + abs(point[1] - last[1]) >= 0.004:
-            self._strokes[-1].append(point)
+        if self._append_event_point(event):
             self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self._append_event_point(event)
             self._drawing = False
             self.update()
+
+    def _append_event_point(self, event):
+        if not self._strokes:
+            return False
+        point = self._event_point(event)
+        last = self._strokes[-1][-1]
+        if abs(point[0] - last[0]) + abs(point[1] - last[1]) < self.CAPTURE_MIN_DELTA:
+            return False
+        self._strokes[-1].append(point)
+        return True
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -150,8 +161,8 @@ class ScaraUiMixin:
         self.microstep_combo = QComboBox()
         self.microstep_combo.addItems(["400", "1600", "3200", "6400", "12800"])
         self.microstep_combo.setEditable(True)
-        # 默认 3200PPR：用于降低脉冲量化误差。若驱动器拨码不是 3200，必须同步修改。
-        self.microstep_combo.setCurrentText("3200")
+        # Default 6400 PPR matches firmware and the physical driver DIP switches.
+        self.microstep_combo.setCurrentText("6400")
         self.microstep_combo.setFixedSize(box_w, box_h)
         self.microstep_combo.activated.connect(lambda *_: self.on_microstep_changed())
         if self.microstep_combo.lineEdit() is not None:
@@ -170,12 +181,6 @@ class ScaraUiMixin:
         hw_layout.addWidget(self.jog_pps_label, 3, 0, 1, 2)
         self.hw_speed_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
         self.hw_accel_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
-        self.host_timed_mode_toggle = QCheckBox("文本 G1 A/B/T 实验模式")
-        self.host_timed_mode_toggle.setChecked(bool(getattr(self, "host_timed_segment_mode", False)))
-        self.host_timed_mode_toggle.toggled.connect(
-            lambda checked: setattr(self, "host_timed_segment_mode", bool(checked))
-        )
-        hw_layout.addWidget(self.host_timed_mode_toggle, 4, 0, 1, 2)
         hw_group.setLayout(hw_layout)
         left_panel.addWidget(hw_group)
 
@@ -278,48 +283,44 @@ class ScaraUiMixin:
         btn_car2.clicked.connect(self.plan_car2_path)
         ft_grid.addWidget(btn_car2, 2, 1)
 
-        btn_text_fdu = QPushButton("福州大学")
-        btn_text_fdu.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
-        btn_text_fdu.clicked.connect(lambda: self.plan_fixed_text_path("福州大学"))
-        ft_grid.addWidget(btn_text_fdu, 3, 0)
+        # 自定义轨迹：下拉选择预设轨迹 + 运行按钮（便于后续扩展画画等图案）
+        ft_grid.addWidget(QLabel("自定义轨迹:"), 3, 0)
+        self.preset_traj_combo = QComboBox()
+        self.preset_traj_combo.setFixedSize(box_w, box_h)
+        self.preset_traj_combo.addItems(self.preset_trajectory_names())
+        ft_grid.addWidget(self.preset_traj_combo, 3, 1)
 
-        btn_text_fzu = QPushButton("FZU")
-        btn_text_fzu.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
-        btn_text_fzu.clicked.connect(lambda: self.plan_fixed_text_path("FZU"))
-        ft_grid.addWidget(btn_text_fzu, 3, 1)
+        btn_preset_run = QPushButton("运行轨迹")
+        btn_preset_run.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
+        btn_preset_run.clicked.connect(self.run_selected_preset_trajectory)
+        # 跨两列铺满，避免单独占用第三列而向右突出，与本组其它行保持同一右边界。
+        ft_grid.addWidget(btn_preset_run, 4, 0, 1, 2)
 
-        btn_text_fdu.setText("福州大学")
-        try:
-            btn_text_fdu.clicked.disconnect()
-        except TypeError:
-            pass
-        btn_text_fdu.clicked.connect(lambda: self.plan_fixed_text_path("福州大学"))
-
-        ft_grid.addWidget(QLabel("空心字:"), 4, 0)
+        ft_grid.addWidget(QLabel("空心字:"), 5, 0)
         self.text_outline_input = QLineEdit("福州大学")
         self.text_outline_input.setFixedHeight(box_h)
-        ft_grid.addWidget(self.text_outline_input, 4, 1)
+        ft_grid.addWidget(self.text_outline_input, 5, 1)
 
-        ft_grid.addWidget(QLabel("字体:"), 5, 0)
+        ft_grid.addWidget(QLabel("字体:"), 6, 0)
         self.text_font_combo = QFontComboBox()
         self.text_font_combo.setFixedHeight(box_h)
         self.text_font_combo.setCurrentFont(QFont("Microsoft YaHei", 9))
-        ft_grid.addWidget(self.text_font_combo, 5, 1)
+        ft_grid.addWidget(self.text_font_combo, 6, 1)
 
-        ft_grid.addWidget(QLabel("高度(mm):"), 6, 0)
+        ft_grid.addWidget(QLabel("高度(mm):"), 7, 0)
         self.text_height_input = QLineEdit("80.0")
         self.text_height_input.setFixedSize(box_w, box_h)
-        ft_grid.addWidget(self.text_height_input, 6, 1)
+        ft_grid.addWidget(self.text_height_input, 7, 1)
 
         btn_text_preview = QPushButton("预览空心字")
         btn_text_preview.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold;")
         btn_text_preview.clicked.connect(self.preview_text_outline_path)
-        ft_grid.addWidget(btn_text_preview, 7, 0)
+        ft_grid.addWidget(btn_text_preview, 8, 0)
 
         btn_text_run = QPushButton("运行空心字")
         btn_text_run.setStyleSheet("background-color: #16a085; color: white; font-weight: bold;")
         btn_text_run.clicked.connect(self.plan_text_outline_path)
-        ft_grid.addWidget(btn_text_run, 7, 1)
+        ft_grid.addWidget(btn_text_run, 8, 1)
         
         ft_group.setLayout(ft_grid)
         left_panel.addWidget(ft_group)
@@ -383,7 +384,7 @@ class ScaraUiMixin:
         mcu_status_lay.setSpacing(8)
         self.lbl_mcu_err = QLabel("错误码: 0")
         self.lbl_mcu_tick = QLabel("MCU时间: 0 ms")
-        self.lbl_mcu_gbuf = QLabel("缓冲区占用: 0 / 32")
+        self.lbl_mcu_gbuf = QLabel("缓冲区占用: 0 / 48")
         self.lbl_mcu_queue = QLabel("队列负载(Q): 0")
         self.lbl_mcu_interp = QLabel("插补: --  已执行 0/0  队列 0")
         self.lbl_mcu_hz = QLabel("控制频率: -- Hz")
@@ -408,25 +409,54 @@ class ScaraUiMixin:
         mcu_status_group.setLayout(mcu_status_lay)
         mid_panel.addWidget(mcu_status_group)
         
-        teach_group = QGroupBox("示教")
-        t_lay = QVBoxLayout()
-        self.btn_start_rec = QPushButton("开始轨迹记录")
-        self.btn_end_rec = QPushButton("结束轨迹记录")
-        self.btn_rec_point = QPushButton("记录轨迹点")
-        self.btn_clear_point = QPushButton("清除轨迹点")
-        self.btn_replay = QPushButton("开始轨迹复现")
-        t_lay.addWidget(self.btn_start_rec)
-        t_lay.addWidget(self.btn_end_rec)
-        t_lay.addWidget(self.btn_rec_point)
-        t_lay.addWidget(self.btn_clear_point)
-        t_lay.addWidget(self.btn_replay)
-        teach_group.setLayout(t_lay)
+        teach_group = QGroupBox("示教模式")
+        t_grid = QGridLayout()
+        t_grid.addWidget(QLabel("运动模式:"), 0, 0)
+        self.teach_mode_combo = QComboBox()
+        self.teach_mode_combo.addItems(["直线模式", "圆弧模式"])
+        t_grid.addWidget(self.teach_mode_combo, 0, 1)
+
+        t_grid.addWidget(QLabel("运行方式:"), 1, 0)
+        self.teach_run_mode_combo = QComboBox()
+        self.teach_run_mode_combo.addItems(["连续", "单步"])
+        t_grid.addWidget(self.teach_run_mode_combo, 1, 1)
+
+        t_grid.addWidget(QLabel("目标 X:"), 2, 0)
+        self.teach_target_x = QLineEdit(f"{self.cur_x:.2f}")
+        t_grid.addWidget(self.teach_target_x, 2, 1)
+        t_grid.addWidget(QLabel("目标 Y:"), 3, 0)
+        self.teach_target_y = QLineEdit(f"{self.cur_y:.2f}")
+        t_grid.addWidget(self.teach_target_y, 3, 1)
+
+        self.teach_points_label = QLabel("已记录 0 个目标点")
+        self.teach_points_label.setWordWrap(True)
+        self.teach_points_label.setStyleSheet("color: #61afef;")
+        t_grid.addWidget(self.teach_points_label, 4, 0, 1, 2)
+
+        self.btn_add_teach_target = QPushButton("添加目标点")
+        self.btn_rec_point = QPushButton("记录当前位置")
+        self.btn_remove_teach_point = QPushButton("撤销最后点")
+        self.btn_clear_point = QPushButton("清空目标点")
+        self.btn_preview_teach = QPushButton("预览示教轨迹")
+        self.btn_replay = QPushButton("执行示教轨迹")
+        self.btn_replay.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+        t_grid.addWidget(self.btn_add_teach_target, 5, 0)
+        t_grid.addWidget(self.btn_rec_point, 5, 1)
+        t_grid.addWidget(self.btn_remove_teach_point, 6, 0)
+        t_grid.addWidget(self.btn_clear_point, 6, 1)
+        t_grid.addWidget(self.btn_preview_teach, 7, 0)
+        t_grid.addWidget(self.btn_replay, 7, 1)
+        teach_group.setLayout(t_grid)
         mid_panel.addWidget(teach_group)
-        self.btn_start_rec.clicked.connect(self.start_recording)
-        self.btn_end_rec.clicked.connect(self.stop_recording)
+        self.teach_mode_combo.currentTextChanged.connect(self.on_teach_mode_changed)
+        self.teach_run_mode_combo.currentTextChanged.connect(self.on_teach_run_mode_changed)
+        self.btn_add_teach_target.clicked.connect(self.add_teach_target_point)
         self.btn_rec_point.clicked.connect(self.record_single_point)
+        self.btn_remove_teach_point.clicked.connect(self.remove_last_teach_point)
         self.btn_clear_point.clicked.connect(self.clear_teach_points)
+        self.btn_preview_teach.clicked.connect(self.preview_teach_path)
         self.btn_replay.clicked.connect(self.start_playback)
+        self.on_teach_mode_changed()
 
         # 视觉识别组
         vision_group = QGroupBox("视觉识别")
@@ -497,6 +527,30 @@ class ScaraUiMixin:
         self.color_sel.currentTextChanged.connect(self.update_v_params)
         self.thresh_sel.currentTextChanged.connect(self.update_v_params)
         self.btn_vision_trace.clicked.connect(self.plan_vision_trajectory)
+
+        laser_group = QGroupBox("激光加工")
+        laser_grid = QGridLayout()
+        self.laser_enable_toggle = QPushButton("激光开启")
+        self.laser_enable_toggle.setCheckable(True)
+        self.laser_enable_toggle.setChecked(False)
+        self.laser_enable_toggle.setToolTip("开启后下一次轨迹或点动允许落笔出光；完成、停止、急停、回零或断连后自动关闭")
+        self.laser_enable_toggle.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
+        self.laser_enable_toggle.toggled.connect(self.on_laser_enable_toggled)
+        laser_grid.addWidget(self.laser_enable_toggle, 0, 0, 1, 2)
+        laser_grid.addWidget(QLabel("功率:"), 1, 0)
+        self.laser_power_input = QDoubleSpinBox()
+        self.laser_power_input.setRange(0.1, 5.0)
+        self.laser_power_input.setSingleStep(0.1)
+        self.laser_power_input.setDecimals(1)
+        self.laser_power_input.setValue(1.0)
+        self.laser_power_input.setSuffix("%")
+        self.laser_power_input.valueChanged.connect(self.on_laser_power_changed)
+        laser_grid.addWidget(self.laser_power_input, 1, 1)
+        self.laser_status_label = QLabel("下位机状态: 断开")
+        self.laser_status_label.setStyleSheet("color: #aaaaaa; font-weight: bold;")
+        laser_grid.addWidget(self.laser_status_label, 2, 0, 1, 2)
+        laser_group.setLayout(laser_grid)
+        mid_panel.addWidget(laser_group)
 
         task_group = QGroupBox("系统任务与安全")
         task_lay = QVBoxLayout()

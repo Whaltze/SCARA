@@ -5,6 +5,7 @@
 #include "app_config.h"
 #include "app_params.h"
 #include "board_pins.h"
+#include "laser_control.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +26,7 @@ typedef struct {
 
 typedef struct {
     bool active;
-    bool host_timed;
+    bool segmented;
     uint32_t step_event_count;
     uint32_t remaining_events;
     uint32_t steps[2];
@@ -39,12 +40,16 @@ typedef struct {
     int64_t event_accum;
     uint32_t duration_ticks;
     uint32_t elapsed_ticks;
+    uint32_t scheduled_ticks;
 } StepperDdaMove;
 
 typedef struct {
     int64_t pos1;
     int64_t pos2;
     uint32_t duration_ticks;
+    uint16_t laser_power_permille;
+    bool laser_mark;
+    bool laser_prep;
 } StepperTimedSegment;
 
 static StepperState s_state;
@@ -115,15 +120,6 @@ static GPIO_PinState ena_pin_state(bool enable)
 #endif
 }
 
-static inline __attribute__((always_inline)) GPIO_PinState step_pin_state(bool active)
-{
-#if APP_STEPPER_PUL_ACTIVE_LEVEL
-    return active ? GPIO_PIN_SET : GPIO_PIN_RESET;
-#else
-    return active ? GPIO_PIN_RESET : GPIO_PIN_SET;
-#endif
-}
-
 static GPIO_PinState dir_pin_state(uint32_t index, int8_t dir)
 {
     bool positive = dir > 0;
@@ -164,6 +160,16 @@ static void irq_restore(uint32_t primask)
     }
 }
 
+static void step_event_timer_set_ticks(uint32_t ticks)
+{
+    if (ticks == 0u) {
+        ticks = 1u;
+    }
+    uint32_t period_us = ticks * APP_CONTROL_PERIOD_US;
+    __HAL_TIM_SET_AUTORELOAD(BOARD_TICK_TIM, period_us - 1u);
+    __HAL_TIM_SET_COUNTER(BOARD_TICK_TIM, 0u);
+}
+
 static void pwm_apply(uint32_t index, int32_t pps)
 {
     /* pps 低于最小有效值或轴未使能时关闭 PWM，避免空闲状态继续输出脉冲。 */
@@ -185,28 +191,30 @@ static void pwm_apply(uint32_t index, int32_t pps)
     s_state.axis[index].running = true;
 }
 
-static inline __attribute__((always_inline)) void write_step_pin(uint32_t index, bool active)
+static void pulse_timer_init(uint32_t index)
 {
-    bool set_high = step_pin_state(active) == GPIO_PIN_SET;
-    s_hw[index].step_port->BSRR = set_high ? s_hw[index].step_pin : ((uint32_t)s_hw[index].step_pin << 16u);
+    TIM_TypeDef *tim = s_hw[index].tim->Instance;
+    tim->CR1 |= TIM_CR1_OPM;
+    tim->CCER |= TIM_CCER_CC1E;
+    if (tim == TIM1) {
+        tim->BDTR |= TIM_BDTR_MOE;
+    }
+    tim->CNT = 0u;
+    tim->SR = 0u;
 }
 
 static void __attribute__((optimize("Os"))) emit_step_mask(uint8_t step_mask)
 {
     if ((step_mask & (1u << 0)) != 0u) {
-        write_step_pin(0u, true);
+        TIM1->CNT = 0u;
+        TIM1->SR = 0u;
+        TIM1->CR1 |= TIM_CR1_CEN;
     }
     if ((step_mask & (1u << 1)) != 0u) {
-        write_step_pin(1u, true);
+        TIM4->CNT = 0u;
+        TIM4->SR = 0u;
+        TIM4->CR1 |= TIM_CR1_CEN;
     }
-    delay_us(APP_STEPPER_PULSE_HIGH_US);
-    if ((step_mask & (1u << 0)) != 0u) {
-        write_step_pin(0u, false);
-    }
-    if ((step_mask & (1u << 1)) != 0u) {
-        write_step_pin(1u, false);
-    }
-    delay_us(APP_STEPPER_PULSE_LOW_US);
 }
 
 static void set_dir_index(uint32_t index, int8_t dir)
@@ -296,12 +304,7 @@ void Stepper_Init(void)
         HAL_GPIO_Init(s_hw[i].dir_port, &gpio);
 
         // 2. STEP（脉冲）引脚：废除硬编码拉高，使用函数写入动态配置的【空闲无效电平】
-        write_step_pin(i, false);
-        gpio.Pin = s_hw[i].step_pin;
-        gpio.Mode = GPIO_MODE_OUTPUT_OD;
-        gpio.Pull = GPIO_NOPULL;
-        gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-        HAL_GPIO_Init(s_hw[i].step_port, &gpio);
+        pulse_timer_init(i);
 
         // 3. ENA（使能）引脚：提前写入使能状态电平，消除默认0输出导致的电机剧烈跳动
         HAL_GPIO_WritePin(s_hw[i].ena_port, s_hw[i].ena_pin, ena_pin_state(s_state.axis[i].enabled));
@@ -350,6 +353,7 @@ void Stepper_SetPps(StepperAxis axis, int32_t pps)
         return;
     }
     uint32_t i = (uint32_t)axis;
+    step_event_timer_set_ticks(1u);
     s_state.axis[i].mode = pps == 0 ? STEPPER_MODE_STOPPING : STEPPER_MODE_SPEED;
     axis_set_target_pps(i, pps);
 }
@@ -442,6 +446,18 @@ bool Stepper_MoveAbs(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2)
 
 bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, int32_t exit1, int32_t exit2)
 {
+    return Stepper_MoveAbsBlendLaser(pos1, pos2, v1, v2, exit1, exit2, false, false);
+}
+
+bool Stepper_MoveAbsBlendLaser(int64_t pos1,
+                               int64_t pos2,
+                               int32_t v1,
+                               int32_t v2,
+                               int32_t exit1,
+                               int32_t exit2,
+                               bool laser_mark,
+                               bool laser_prep)
+{
     StepperState snapshot;
     Stepper_GetStateSnapshot(&snapshot);
     int64_t cur1 = snapshot.axis[0].position_pulse;
@@ -511,8 +527,9 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
     dom_v = clamp_i32(dom_v, APP_INTERPOLATOR_MIN_PPS, APP_MAX_PPS_DEFAULT);
 
     uint32_t primask = irq_save();
+    LaserControl_BeginSegment(laser_mark, laser_prep);
     s_move.active = true;
-    s_move.host_timed = false;
+    s_move.segmented = false;
     s_move.step_event_count = events;
     s_move.remaining_events = events;
     s_move.steps[0] = (uint32_t)d1;
@@ -558,7 +575,10 @@ bool Stepper_MoveAbsBlend(int64_t pos1, int64_t pos2, int32_t v1, int32_t v2, in
 
 static bool __attribute__((optimize("Os"))) timed_move_start_locked(int64_t pos1,
                                                                     int64_t pos2,
-                                                                    uint32_t duration_ticks)
+                                                                    uint32_t duration_ticks,
+                                                                    bool laser_mark,
+                                                                    bool laser_prep,
+                                                                    uint16_t laser_power_permille)
 {
     if (duration_ticks == 0u) {
         return false;
@@ -587,17 +607,18 @@ static bool __attribute__((optimize("Os"))) timed_move_start_locked(int64_t pos1
     }
 
     uint32_t events = (uint32_t)(d1 > d2 ? d1 : d2);
-    if (events == 0u) {
-        return true;
-    }
     if (events > duration_ticks) {
         s_state.axis[0].error |= STEPPER_ERR_INVALID_ARG;
         s_state.axis[1].error |= STEPPER_ERR_INVALID_ARG;
         return false;
     }
 
+    if (laser_mark && laser_power_permille > 0u) {
+        (void)LaserControl_SetPowerPermille(laser_power_permille);
+    }
+    LaserControl_BeginSegment(laser_mark, laser_prep);
     s_move.active = true;
-    s_move.host_timed = true;
+    s_move.segmented = true;
     s_move.step_event_count = events;
     s_move.remaining_events = events;
     s_move.steps[0] = (uint32_t)d1;
@@ -617,6 +638,10 @@ static bool __attribute__((optimize("Os"))) timed_move_start_locked(int64_t pos1
     s_move.event_accum = 0;
     s_move.duration_ticks = duration_ticks;
     s_move.elapsed_ticks = 0;
+    s_move.scheduled_ticks = events > 0u ? duration_ticks / events : duration_ticks;
+    if (s_move.scheduled_ticks == 0u) {
+        s_move.scheduled_ticks = 1u;
+    }
 
     int64_t targets[2] = {pos1, pos2};
     for (uint32_t i = 0; i < 2u; ++i) {
@@ -641,10 +666,26 @@ static bool __attribute__((optimize("Os"))) timed_move_start_locked(int64_t pos1
         }
         pwm_apply(i, axis->current_pps);
     }
+    step_event_timer_set_ticks(s_move.scheduled_ticks);
     return true;
 }
 
 bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks)
+{
+    return Stepper_MoveAbsTicksLaser(pos1, pos2, duration_ticks, false, false);
+}
+
+bool Stepper_MoveAbsTicksLaser(int64_t pos1, int64_t pos2, uint32_t duration_ticks, bool laser_mark, bool laser_prep)
+{
+    return Stepper_MoveAbsTicksLaserPower(pos1, pos2, duration_ticks, laser_mark, laser_prep, 0u);
+}
+
+bool Stepper_MoveAbsTicksLaserPower(int64_t pos1,
+                                    int64_t pos2,
+                                    uint32_t duration_ticks,
+                                    bool laser_mark,
+                                    bool laser_prep,
+                                    uint16_t laser_power_permille)
 {
     if (duration_ticks == 0u) {
         return false;
@@ -652,7 +693,7 @@ bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks)
 
     uint32_t primask = irq_save();
     if (s_move.active) {
-        if (!s_move.host_timed || s_timed_count >= APP_STEPPER_TIMED_SEGMENTS) {
+        if (!s_move.segmented || s_timed_count >= APP_STEPPER_TIMED_SEGMENTS) {
             irq_restore(primask);
             return false;
         }
@@ -666,10 +707,6 @@ bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks)
         uint64_t d1 = (uint64_t)i64_abs(pos1 - base1);
         uint64_t d2 = (uint64_t)i64_abs(pos2 - base2);
         uint64_t events = d1 > d2 ? d1 : d2;
-        if (events == 0u) {
-            irq_restore(primask);
-            return true;
-        }
         if (events > duration_ticks || !target_in_range(pos1) || !target_in_range(pos2) ||
             (d1 > 0u && !s_state.axis[0].enabled) || (d2 > 0u && !s_state.axis[1].enabled)) {
             irq_restore(primask);
@@ -678,13 +715,16 @@ bool Stepper_MoveAbsTicks(int64_t pos1, int64_t pos2, uint32_t duration_ticks)
         s_timed_segments[s_timed_head].pos1 = pos1;
         s_timed_segments[s_timed_head].pos2 = pos2;
         s_timed_segments[s_timed_head].duration_ticks = duration_ticks;
+        s_timed_segments[s_timed_head].laser_power_permille = laser_power_permille;
+        s_timed_segments[s_timed_head].laser_mark = laser_mark;
+        s_timed_segments[s_timed_head].laser_prep = laser_prep;
         s_timed_head = timed_next_index(s_timed_head);
         s_timed_count++;
         irq_restore(primask);
         return true;
     }
 
-    bool started = timed_move_start_locked(pos1, pos2, duration_ticks);
+    bool started = timed_move_start_locked(pos1, pos2, duration_ticks, laser_mark, laser_prep, laser_power_permille);
     irq_restore(primask);
     return started;
 }
@@ -703,10 +743,12 @@ void Stepper_Stop(StepperAxis axis)
 
 void Stepper_StopAll(void)
 {
+    LaserControl_Disarm();
     uint32_t primask = irq_save();
     timed_queue_clear();
     s_move.active = false;
-    s_move.host_timed = false;
+    s_move.segmented = false;
+    step_event_timer_set_ticks(1u);
     irq_restore(primask);
     Stepper_Stop(STEPPER_AXIS_1);
     Stepper_Stop(STEPPER_AXIS_2);
@@ -714,6 +756,7 @@ void Stepper_StopAll(void)
 
 void Stepper_EStopAll(void)
 {
+    LaserControl_Disarm();
     uint32_t primask = irq_save();
     timed_queue_clear();
     for (uint32_t i = 0; i < 2u; ++i) {
@@ -760,6 +803,7 @@ void Stepper_SetPosition(StepperAxis axis, int64_t position_pulse)
 
 void Stepper_Zero(void)
 {
+    LaserControl_Disarm();
     uint32_t primask = irq_save();
     s_move.active = false;
     timed_queue_clear();
@@ -880,12 +924,10 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
         return;
     }
 
-    if (s_move.host_timed) {
-        s_move.elapsed_ticks++;
-        s_move.event_accum += s_move.step_event_count;
-        while (s_move.event_accum >= (int64_t)s_move.duration_ticks && s_move.remaining_events > 0u) {
+    if (s_move.segmented) {
+        s_move.elapsed_ticks += s_move.scheduled_ticks;
+        if (s_move.remaining_events > 0u) {
             uint8_t step_mask = 0u;
-            s_move.event_accum -= (int64_t)s_move.duration_ticks;
             for (uint32_t i = 0; i < 2u; ++i) {
                 if (s_move.steps[i] == 0u) {
                     continue;
@@ -908,7 +950,8 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
             s_move.remaining_events--;
         }
 
-        if (s_move.elapsed_ticks >= s_move.duration_ticks || s_move.remaining_events == 0u) {
+        if (s_move.elapsed_ticks >= s_move.duration_ticks ||
+            (s_move.step_event_count > 0u && s_move.remaining_events == 0u)) {
             for (uint32_t i = 0; i < 2u; ++i) {
                 s_state.axis[i].position_pulse = s_state.axis[i].target_position_pulse;
                 s_state.axis[i].remaining_pulse = 0;
@@ -919,13 +962,30 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
                 pwm_apply(i, 0);
             }
             s_move.active = false;
-            s_move.host_timed = false;
+            s_move.segmented = false;
             s_move.current_pps = 0;
             s_move.target_pps = 0;
             StepperTimedSegment next;
             if (timed_queue_pop(&next)) {
-                (void)timed_move_start_locked(next.pos1, next.pos2, next.duration_ticks);
+                (void)timed_move_start_locked(next.pos1,
+                                              next.pos2,
+                                              next.duration_ticks,
+                                              next.laser_mark,
+                                              next.laser_prep,
+                                              next.laser_power_permille);
+            } else {
+                step_event_timer_set_ticks(1u);
+                LaserControl_BeginSegment(false, false);
             }
+        } else {
+            uint32_t remaining_ticks = s_move.duration_ticks - s_move.elapsed_ticks;
+            s_move.scheduled_ticks = s_move.remaining_events > 0u
+                                         ? remaining_ticks / s_move.remaining_events
+                                         : remaining_ticks;
+            if (s_move.scheduled_ticks == 0u) {
+                s_move.scheduled_ticks = 1u;
+            }
+            step_event_timer_set_ticks(s_move.scheduled_ticks);
         }
         return;
     }
@@ -994,6 +1054,7 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
     }
 
     if (s_move.remaining_events == 0u) {
+        LaserControl_BeginSegment(false, false);
         int32_t completed_exit_pps = s_move.exit_pps;
         for (uint32_t i = 0; i < 2u; ++i) {
             s_state.axis[i].position_pulse = s_state.axis[i].target_position_pulse;
@@ -1010,7 +1071,7 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
     }
 }
 
-void Stepper_Tick10kHz(void)
+void Stepper_StepEventIrq(void)
 {
     static uint8_t tick_divider;
     tick_divider++;
@@ -1058,7 +1119,7 @@ bool Stepper_CanAcceptMove(void)
 bool Stepper_CanQueueTimedSegment(void)
 {
     if (s_move.active) {
-        return s_move.host_timed && s_timed_count < APP_STEPPER_TIMED_SEGMENTS;
+        return s_move.segmented && s_timed_count < APP_STEPPER_TIMED_SEGMENTS;
     }
     return Stepper_CanAcceptMove();
 }

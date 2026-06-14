@@ -163,7 +163,7 @@ function Send-Expect {
         }
         foreach ($prefix in $AcceptPrefixes) {
             if ($rx.StartsWith($prefix)) {
-                if ($RequireEcho) {
+                if ($RequireEcho -and $rx.Trim().ToLowerInvariant() -ne "ok") {
                     if ($rx -notmatch "cs=$expectedCs") { throw "控键 $Name ACK 校验和不匹配，期望 $expectedCs" }
                     if (-not $rx.EndsWith("line=$Line")) { throw "控键 $Name ACK line 回显不匹配" }
                 }

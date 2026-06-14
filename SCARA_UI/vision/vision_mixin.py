@@ -103,7 +103,6 @@ class ScaraVisionMixin:
             route_points.append((rx, ry))
 
         path = self.generate_polyline_path(route_points, spd, silent_first=True)
-        send_path = self.generate_binary_send_from_path(path, spd)
-        self.load_motion_queue(path, send_path=send_path)
+        self.load_motion_queue(path)
 
     # --- 核心算法 ---

@@ -12,6 +12,79 @@
 
 ---
 
+# 〇、2026-06-12 续接项目计划：GRBL-SCARA 四层流式运动内核
+
+本节根据 2026-06-11 至 2026-06-12 历史会话续写，是当前项目的优先计划。下面旧章节保留为早期分阶段背景；若旧章节与本节冲突，以本节为准。
+
+## 0.1 历史会话结论
+
+当前问题的根因不再按单点“解算错误”处理，而是按整条运动链路重构处理：旧链路在点动、反向点动和长轨迹发送时容易出现加减速不连续、同步等待、队列枯竭或上位机一次性展开大量轨迹点的问题。
+
+当前决策锁定为：
+
+- 正式运动入口统一为真实 G-code 流，`BinaryTraj`、host-timed 点轨迹、UI 二进制发送模式和实验文本链路不再作为正式路径。
+- 以 GRBL v1.1 的 parser、look-ahead planner、step segment preparation、realtime command 和 character-counting streaming 思路为参考，移植为适配五连杆 SCARA 的 STM32F103 轻量实现。
+- 不做整仓库回退，也不直接覆盖当前工程；保留已经验证的回零、限位、激光安全、400/6400 PPR 设置、UI 坐标转换和现场调试工具。
+- 点动统一使用 `$J=G91 ...`，单次点动必须 exact-stop，反向点动不得与前一次运动混合规划。
+
+## 0.2 当前实现基线
+
+当前 `v0.29.0` 已完成第一阶段骨架：
+
+- 上位机：`GcodeJob` 懒生成最多 64 条待发送命令，串口未确认窗口限制为 224 bytes，串口读写移入 `QThread`。
+- MCU RX：保留 256-byte DMA 环形接收，`?`、`!`、`~`、Ctrl-X 和 Jog Cancel 绕过普通 G-code 解析。
+- Planner：32 个笛卡尔规划块，支持 G0/G1/G2/G3、I/J 与 R 圆弧、junction deviation、reverse/forward look-ahead。
+- Segment：16 个 timed segment，每段目标 5 ms，主循环准备 segment，TIM2 只消费 step-event，TIM1/TIM4 用 one-pulse 输出固定脉宽 STEP。
+- SCARA：segment preparation 阶段做五连杆逆解，按关节 PPS 限制自适应缩短 segment。
+- Laser：M3/M4/M5 和 S0..1000 接入规划屏障，M4 可按实时速度缩放功率，停止、暂停、故障、空闲均应关断 PWM。
+
+已通过的离线验证：
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File SCARA_F103\tools\verify_project.ps1
+C:\Users\22602\.conda\envs\Robot\python.exe SCARA_UI\tests\sender_strategy_check.py
+C:\Users\22602\.conda\envs\Robot\python.exe SCARA_UI\tests\sender_benchmark_check.py
+C:\Users\22602\.conda\envs\Robot\python.exe SCARA_UI\tests\trajectory_planner_check.py
+```
+
+验证结果：固件构建通过，Flash 当前约 55536 bytes；100000-command sender benchmark 的 `peak_pending=64`。
+
+## 0.3 下一阶段必须完成
+
+### A. 文档与接口对齐
+
+- `Control.md`、`Work.md` 和测试流程必须统一到 v0.29.0：正式运动链路是 GRBL-style G-code stream，而不是旧的逐条 ACK G1、BinaryTraj 或 host-timed segment。
+- 状态帧以 `<Idle|MPos|JPos|FS|Bf|Seg...>` 为现场调试基准；旧 `Q:`、`M:`、`P:` 字段只作为兼容或历史说明。
+- 保留 GPLv3 来源声明：移植或改写自 GRBL 的 planner/stepper 思路必须在 `GRBL_LICENSE.md` 和源文件注释中说明。
+
+### B. 固件硬化
+
+- 审核 `motion_planner.c` 中关节加速度限制的单位：当前 segment 跳速约束使用旧 `APP_ACCEL_MAX` 脉冲参数，需要明确它是 `pps/s` 还是旧位置规划残留，并给 6400 PPR、DM556、当前机构的默认安全值。
+- 补齐 first-segment、exact-stop、dwell、laser barrier、Jog Cancel、hold/resume/reset 的边界测试，防止 `s_last_segment_*` 状态在停止、清空、换任务后继承旧速度。
+- 确认 TIM2 variable step-event 在零步、单轴步、双轴同步步、高 PPS 和方向翻转时不产生阻塞延迟或方向建立时间不足。
+- 对 G2/G3 圆弧在小半径、跨象限、R 正负、I/J 非法半径误差场景做 parser/planner 单元测试。
+
+### C. 上位机清理
+
+- UI 正式发送路径只能生成真实几何 G-code；预览点可以保留为显示数据，但发送时不得把整条轨迹转换成 `list(points)`。
+- 删除或隔离残留的 binary helper、binary stress 按钮、旧实验文本入口和旧模式切换文案；若函数暂时保留给回放/分析，必须从 UI 主流程断开。
+- 串口线程不得在 UI 主线程同步等待 ACK、状态查询或调用 `processEvents()` 来维持发送。
+
+### D. 实机验收
+
+- 烧录后先在电机和激光功率断开状态下验证 `VERSION`、`?`、`!`、`~`、Ctrl-X、Jog Cancel 和混合 G0/G1/G2/G3 burst。
+- 用示波器确认 TIM1/TIM4 STEP 脉宽、方向建立时间、加减速 step-event 间隔连续性和空闲/暂停/故障时无激光 PWM。
+- 低速、默认 `20 mm/s / 100 mm/s^2`、目标高速三档分别执行至少 30 次左右 30 mm exact-stop jog 往返。
+- 验收目标：无 RX overflow、planner starvation、segment underrun；软件脉冲闭合；物理回程误差不超过 0.3 mm；反向点动不再形成 1 mm 级垂直误差或扁平槽轨迹。
+
+## 0.4 后续版本建议
+
+- `v0.29.1`：文档同步、旧 UI 链路清理、segment 加速度单位校准、离线测试补齐。
+- `v0.29.2`：实机串口 burst、realtime、示波器检查和安全链路验收。
+- `v0.30.0`：完成 30 次往返与长任务流式加工验收后，冻结为 GRBL-SCARA baseline。
+
+---
+
 # 一、当前硬件与工程基础确认
 
 根据当前项目配置，下位机基础资源如下：

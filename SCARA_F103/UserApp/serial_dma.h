@@ -9,6 +9,7 @@ void SerialDma_Init(void);
 void SerialDma_Poll(void);
 bool SerialDma_ReadRealtime(char *out);
 bool SerialDma_ReadLine(char *out, size_t out_size);
+void SerialDma_FlushRxLines(void);
 bool SerialDma_Send(const char *text);
 bool SerialDma_SendBytes(const uint8_t *data, uint16_t len);
 bool SerialDma_SendFormat(const char *fmt, ...);
@@ -18,6 +19,7 @@ uint32_t SerialDma_RxFreeCount(void);
 uint32_t SerialDma_RxFreeBytes(void);
 uint32_t SerialDma_TxDropCount(void);
 uint32_t SerialDma_TxQueuedCount(void);
+uint32_t SerialDma_TxFreeCount(void);
 void SerialDma_TxCpltCallback(void);
 
 #endif

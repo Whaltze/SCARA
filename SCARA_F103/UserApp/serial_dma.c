@@ -3,7 +3,6 @@
 /* USART1 DMA 串口层：接收字节流、切成行队列，并用 TX 队列避免响应丢失。 */
 
 #include "app_config.h"
-#include "binary_traj.h"
 #include "board_pins.h"
 
 #include <stdarg.h>
@@ -13,12 +12,10 @@
 
 static uint8_t s_rx_dma[APP_SERIAL_RX_DMA_SIZE];
 static volatile uint16_t s_rx_old_pos;
-static char s_line[APP_SERIAL_LINE_SIZE];
-static uint16_t s_line_len;
-static char s_line_queue[APP_SERIAL_LINE_QUEUE_DEPTH][APP_SERIAL_LINE_SIZE];
-static volatile uint8_t s_line_head;
-static volatile uint8_t s_line_tail;
-static volatile uint8_t s_line_count;
+static char s_rx_queue[APP_SERIAL_RX_RING_SIZE];
+static volatile uint16_t s_rx_head;
+static volatile uint16_t s_rx_tail;
+static volatile uint16_t s_rx_count;
 static char s_realtime_queue[APP_SERIAL_REALTIME_QUEUE_DEPTH];
 static volatile uint8_t s_realtime_head;
 static volatile uint8_t s_realtime_tail;
@@ -55,20 +52,24 @@ static uint8_t queue_next(uint8_t index, uint8_t depth)
     return index;
 }
 
-static bool enqueue_rx_line(const char *line, uint16_t len)
+static uint16_t rx_next(uint16_t index)
+{
+    index++;
+    return index >= APP_SERIAL_RX_RING_SIZE ? 0u : index;
+}
+
+static bool enqueue_rx_byte(char byte)
 {
     bool queued = false;
     uint32_t primask = irq_save();
-
-    if (s_line_count < APP_SERIAL_LINE_QUEUE_DEPTH) {
-        memcpy(s_line_queue[s_line_head], line, len + 1u);
-        s_line_head = queue_next(s_line_head, APP_SERIAL_LINE_QUEUE_DEPTH);
-        s_line_count++;
+    if (s_rx_count < APP_SERIAL_RX_RING_SIZE) {
+        s_rx_queue[s_rx_head] = byte;
+        s_rx_head = rx_next(s_rx_head);
+        s_rx_count++;
         queued = true;
     } else {
         s_rx_overflow_count++;
     }
-
     irq_restore(primask);
     return queued;
 }
@@ -113,10 +114,9 @@ static bool tx_start_next_locked(void)
 void SerialDma_Init(void)
 {
     s_rx_old_pos = 0;
-    s_line_len = 0;
-    s_line_head = 0;
-    s_line_tail = 0;
-    s_line_count = 0;
+    s_rx_head = 0;
+    s_rx_tail = 0;
+    s_rx_count = 0;
     s_realtime_head = 0;
     s_realtime_tail = 0;
     s_realtime_count = 0;
@@ -131,33 +131,14 @@ void SerialDma_Init(void)
 
 static void feed_char(char ch)
 {
-    if (BinaryTraj_FeedByte((uint8_t)ch)) {
-        return;
-    }
-
     /* 实时字符 ?/!/~/Ctrl-X 单独成行；普通命令以换行结束。 */
-    if (ch == '?' || ch == '!' || ch == '~' || (uint8_t)ch == 0x18u) {
+    if (ch == '?' || ch == '!' || ch == '~' || (uint8_t)ch == 0x18u || (uint8_t)ch == 0x85u) {
         (void)enqueue_realtime(ch);
         return;
     }
 
-    if (ch == '\r') {
-        return;
-    }
-
-    if (ch == '\n') {
-        if (s_line_len > 0) {
-            s_line[s_line_len] = '\0';
-            (void)enqueue_rx_line(s_line, s_line_len);
-        }
-        s_line_len = 0;
-        return;
-    }
-
-    if (s_line_len < (APP_SERIAL_LINE_SIZE - 1u)) {
-        s_line[s_line_len++] = ch;
-    } else {
-        s_line_len = 0;
+    if (ch != '\r') {
+        (void)enqueue_rx_byte(ch);
     }
 }
 
@@ -195,6 +176,24 @@ bool SerialDma_ReadRealtime(char *out)
     return true;
 }
 
+void SerialDma_FlushRxLines(void)
+{
+    /*
+     * Discard buffered command bytes on soft reset / abort. Without this the tail
+     * of an aborted stream still sitting in the DMA buffer and line ring is parsed
+     * after the reset, re-planned, and can re-latch a preparation fault so the
+     * controller never reaches the Idle/Q:0/Seg:0 state the host waits for. Realtime
+     * characters (?/!/~) are intentionally left untouched. Mirrors Grbl's soft-reset
+     * flushing of the serial RX buffer.
+     */
+    uint32_t primask = irq_save();
+    s_rx_old_pos = (uint16_t)(APP_SERIAL_RX_DMA_SIZE - __HAL_DMA_GET_COUNTER(BOARD_UART->hdmarx));
+    s_rx_head = 0u;
+    s_rx_tail = 0u;
+    s_rx_count = 0u;
+    irq_restore(primask);
+}
+
 bool SerialDma_ReadLine(char *out, size_t out_size)
 {
     if (out == NULL || out_size == 0u) {
@@ -202,17 +201,39 @@ bool SerialDma_ReadLine(char *out, size_t out_size)
     }
 
     uint32_t primask = irq_save();
-    if (s_line_count == 0u) {
+    if (s_rx_count == 0u) {
         irq_restore(primask);
         return false;
     }
-
-    strncpy(out, s_line_queue[s_line_tail], out_size - 1u);
-    out[out_size - 1u] = '\0';
-    s_line_tail = queue_next(s_line_tail, APP_SERIAL_LINE_QUEUE_DEPTH);
-    s_line_count--;
+    uint16_t scan = s_rx_tail;
+    uint16_t available = s_rx_count;
+    bool complete = false;
+    for (uint16_t i = 0u; i < available; ++i) {
+        if (s_rx_queue[scan] == '\n') {
+            complete = true;
+            break;
+        }
+        scan = rx_next(scan);
+    }
+    if (!complete) {
+        irq_restore(primask);
+        return false;
+    }
+    size_t length = 0u;
+    while (s_rx_count > 0u) {
+        char ch = s_rx_queue[s_rx_tail];
+        s_rx_tail = rx_next(s_rx_tail);
+        s_rx_count--;
+        if (ch == '\n') {
+            break;
+        }
+        if (length + 1u < out_size) {
+            out[length++] = ch;
+        }
+    }
+    out[length] = '\0';
     irq_restore(primask);
-    return true;
+    return length > 0u;
 }
 
 bool SerialDma_Send(const char *text)
@@ -283,12 +304,12 @@ uint32_t SerialDma_RxOverflowCount(void)
 
 uint32_t SerialDma_RxFreeCount(void)
 {
-    return (uint32_t)(APP_SERIAL_LINE_QUEUE_DEPTH - s_line_count);
+    return (uint32_t)(APP_SERIAL_RX_RING_SIZE - s_rx_count);
 }
 
 uint32_t SerialDma_RxFreeBytes(void)
 {
-    return SerialDma_RxFreeCount() * APP_SERIAL_LINE_SIZE;
+    return SerialDma_RxFreeCount();
 }
 
 uint32_t SerialDma_TxDropCount(void)
@@ -299,6 +320,11 @@ uint32_t SerialDma_TxDropCount(void)
 uint32_t SerialDma_TxQueuedCount(void)
 {
     return s_tx_count;
+}
+
+uint32_t SerialDma_TxFreeCount(void)
+{
+    return (uint32_t)(APP_SERIAL_TX_QUEUE_DEPTH - s_tx_count);
 }
 
 void SerialDma_TxCpltCallback(void)

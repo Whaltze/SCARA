@@ -1,5 +1,219 @@
 # SCARA_F103 Version Log
 
+## 2026-06-14 Custom-pattern dropdown: SVG line art + image halftone (UI only)
+
+- "固定轨迹 → 自定义轨迹" dropdown now auto-scans `SCARA_UI/trajectory/patterns/`:
+  `.svg` files become vector line-art trajectories (✏), bitmap files (png/jpg/jpeg/bmp)
+  become laser halftone patterns (🔥). The filename is the dropdown label; dropping a
+  file in is enough — no code change.
+- Added `SCARA_UI/trajectory/svg_loader.py`: a dependency-free SVG→QPainterPath parser
+  (path `M/L/H/V/C/S/Q/T/Z/A`, basic shapes, transforms, nested `<g>`). SVG strokes reuse
+  the existing glyph-outline pipeline (`_qt_path_contours` → `generate_stroke_motion`), so
+  pen-drawing vs. laser engraving follows the existing "激光开启" switch.
+- Image halftone: OpenCV grayscale → grid sample → dark cells become dwell-marked dots,
+  streamed as `G0 → M4 S → G4 P → M5` per dot (firmware `G4` inherits the current laser
+  mode, so the dwell marks the spot). Reuses the `laser_task_active`/`LASER ARM` safety
+  chain — not armed = safe dry run. Spacing/dwell are `HALFTONE_*` constants; power reuses
+  the UI power box.
+- Firmware unchanged; `APP_FW_VERSION` stays `0.29.9-grbl-scara`.
+- Added `SCARA_UI/tests/pattern_check.py` offline regression check, plus example assets
+  `patterns/笑脸.svg` and `patterns/爱心.png`.
+
+## 2026-06-13 v0.29.9 Exact waypoint preservation
+
+- Removed the remaining 2 mm car-body corner fillets so every declared body
+  control point is emitted as an exact G1 endpoint.
+- Disabled default writing/polyline RDP simplification and 0.20 mm point
+  filtering. Input writing points are retained down to G-code's 0.001 mm
+  coordinate resolution, including the handwriting mouse-release endpoint.
+- True arcs are always streamed as G2/G3 rather than rewritten into short G1
+  chords.
+- A rapid connector now exact-stops at the declared geometry start before the
+  first drawing block; internal corners retain normal non-zero junction speed.
+- Preview downsampling now preserves every marked geometry endpoint, and MCU
+  segment preparation uses the original integer Cartesian endpoint for the
+  first and final sample of every planner block.
+
+## 2026-06-13 v0.29.8 Semantic text paths and short-block continuity
+
+- Replaced Qt `toSubpathPolygons()` text extraction with semantic
+  `MoveTo`/`LineTo`/`CurveTo` extraction. True font corners remain exact
+  junctions, while only real Bézier curves are adaptively flattened.
+- Increased the ARM planner from 32 to 48 blocks and starts continuous motion
+  after collecting up to 12 look-ahead blocks, increasing the combined distance
+  available for GRBL reverse/forward planning on short text-outline blocks.
+- Added a dynamic tail look-ahead holdback: while at least 8 step segments are
+  buffered, segment preparation retains the final unknown-successor planner
+  block so newly streamed text blocks can still form a continuous junction.
+- Extended junction-deviation limiting into physical SCARA joint space. Planner
+  blocks retain start/end IK slopes, so a mild Cartesian glyph corner that
+  reverses a motor is slowed before it can create an audible joint-speed shock.
+- The UI now derives planner capacity from live `Bf.free + Q.used` status rather
+  than relying on a fixed constant, keeping backpressure and Idle recovery
+  correct across future planner-size changes.
+
+## 2026-06-13 v0.29.7 Sharp-corner lazy writing stream
+
+- Removed handwriting and text-outline corner fillets. Every retained writing
+  control point is now emitted as a true `G1` endpoint. GRBL junction deviation
+  selects a safe non-zero transition speed from the real corner angle, so the
+  arm reaches the sharp point without replacing it with an arc or stopping.
+- Replaced recursive RDP simplification with an iterative implementation so
+  large handwriting/font contours cannot fail with Python recursion errors.
+- Replaced the fully materialized writing command tuple with a counted lazy
+  command stream. Only the normal 64-command sender window is generated ahead,
+  regardless of total writing point count.
+
+## 2026-06-13 v0.29.6 GRBL segment throughput and fault recovery
+
+- Moved SCARA pulse-rate and joint-acceleration limiting ahead of look-ahead, so
+  every planner block is constrained before reverse/forward recalculation.
+- Removed the post-planner adjacent-PPS rejection loop. Dense step candidates
+  are now shortened until the fixed-rate DDA can represent them without
+  discarding the planner or latching a recoverable throughput condition.
+- Restored tangent car, handwriting, and text fillets and removed the UI's
+  per-segment feed/whole-path acceleration workaround.
+- Restored a fixed 64-line/224-byte GRBL character-counting sender window.
+  Instantaneous `Bf` RX-free reports remain diagnostic and no longer collapse
+  long-stream throughput.
+- Added `Rl` adaptive-rate-limit and `Pg` maximum-refill-gap diagnostics. The UI
+  now establishes the cumulative `Pf` baseline and never clears an idle stream
+  because of an old controller fault count.
+
+## 2026-06-13 v0.29.5 Motion preflight and stream recovery
+
+- Routed every formal motion job through a reusable full-path workspace preflight before profile, laser, or G-code transmission. Invalid points are blocked and reported with point coordinates and limit excess.
+- Isolated `$H`/`$HS` as long-running commands: they are sent alone after `$X`/`M17` acknowledgements, polled without ordinary ACK timeout warnings, and protected from stale `error:15` replies.
+- Added state-aware ACK recovery. A running/full planner may wait normally, while a dead serial worker, silent controller, or Idle controller with empty planner/segments and a stuck ACK clears the stream and restores UI control.
+- Sampled routine TX/ACK terminal progress and immediately schedules another serial drain pass while RX data remains, preventing long jobs from starving the Qt event loop while preserving errors and periodic progress.
+- Prevented a new formal task from replacing a pending/Run/Hold stream, and blocked manual G0/G1/G2/G3/`$J` text commands from bypassing the verified-preview motion entry.
+- Added a latched planner segment-preparation fault counter (`Pf`) and increased adaptive segment retries so a rare IK/quantization failure can no longer silently clear motion without host diagnostics.
+
+## 2026-06-13 v0.29.4 Continuous multi-block segment preparation
+
+- Changed the MCU main loop to drain all currently acceptable G-code lines
+  before preparing step segments, so short blocks see their successors before
+  being planned as an apparent program end.
+- Preserved the fixed entry-speed anchor when a predecessor has already moved
+  from the planner into the step-segment FIFO.
+- Changed short final block tails from a forced 5 ms duration to a variable
+  duration of at most 5 ms, preserving the planned junction speed across line,
+  arc, car, and writing geometry boundaries.
+- Added small tangent G2/G3 fillets to decorative car, handwriting, and text
+  contours so GRBL does not need to nearly stop at every sampled sharp vertex;
+  ordinary explicit trajectory commands remain exact.
+
+## 2026-06-13 v0.29.3 GRBL handwriting geometry and profile sync
+
+- Changed handwriting and text-outline execution from sampled, per-point feed
+  streams to compact Cartesian G0/G1/G2/G3 geometry with a constant programmed
+  feed, leaving velocity planning to the MCU GRBL planner.
+- Synchronized each formal UI motion task's selected maximum speed,
+  acceleration, and junction deviation through `$110`, `$120`, and `$11`.
+- Corrected the UI preview junction half-angle model to match GRBL's direct
+  tangent convention.
+- Kept exact-stop barriers only at writing stroke transitions and fixed dwell
+  segment preparation to hold the last prepared endpoint instead of rewinding
+  toward the currently executing segment target.
+
+## 2026-06-12 v0.29.2 Formal homing and unified GRBL stream
+
+- Fixed the no-motion-after-homing regression caused by rejecting the first
+  quantized 5 ms joint segment against an impossible sub-pulse acceleration
+  threshold.
+- `$H` and `$HS` now remain unacknowledged until homing actually reaches
+  `Done`; normal G-code consumption pauses while homing is active.
+- Moved homing, PPR settings, unlock, enable, jog, and trajectory commands onto
+  the same bounded character-counting `GcodeJob` path, eliminating stale `ok`
+  replies from the removed out-of-band protocol.
+- Removed remaining HOST_TIMED/binary pulse planner code and obsolete binary
+  stress tools; long previews are decimated independently from the send stream.
+- Added a UI-level regression test that completes homing and then exercises
+  jog, G1/G2/G3, motor bring-up, and fixed trajectory controls.
+- Added MCU TX-queue backpressure so an accepted G-code line can never lose
+  its `ok/error` response when the eight-message DMA TX queue is full.
+- Kept ordinary G-code blocked until the final homing ACK is queued and reset
+  planner segment history on homing/coordinate resets.
+- Removed the remaining UI checksum ACK compatibility, stale `ok` fallback,
+  visual binary-path call, old host-segment queue alias, and pulse-motion
+  planner wrappers. UI stop now uses GRBL Ctrl-X.
+
+## 2026-06-12 v0.29.1 Homing command diagnostics
+
+- Fixed simulated homing command routing: the UI now sends `HOME_SIM`, and the
+  firmware also accepts `$H S` as simulated homing instead of treating it as
+  real switch homing.
+- Added real homing precheck for already-active HOME inputs; `$H` now refuses
+  to start when PB0/PB1 are active and `STATUS` exposes `he=4` for that case.
+- Added UI homing diagnostics: real homing requests `HOME_SENSOR` before `$H`,
+  both homing buttons request `HOME_SENSOR`, `STATUS`, and `?` afterward, and
+  the status panel displays `hs/he/en/pps/tgt/h`.
+- Improved UI serial logging so system-level `OK ...` responses and
+  `OK HOME_SENSOR ...` are not misreported as G-code ACK mismatches.
+- Extended `verify_project.ps1` with static checks for the homing protocol and
+  diagnostics path.
+
+## 2026-06-12 v0.29.0 GRBL-SCARA four-layer streaming core
+
+- Removed BinaryTraj, host-timed point upload, and the UI transport mode switch.
+- Added lazy 64-command/224-byte character-counting streaming on a serial QThread.
+- Added a 256-byte MCU RX ring, 32 Cartesian planner blocks, reverse/forward
+  look-ahead, junction deviation, and 16 five-millisecond step segments.
+- Added real G0/G1/G2/G3 geometry, I/J and R arcs, `$J` exact-stop jog, realtime
+  hold/resume/reset/Jog Cancel, standard `ok`/`error:n`, and GRBL-style status.
+- Moved SCARA inverse kinematics into segment preparation and added adaptive
+  segment shortening for joint PPS limits.
+- Replaced blocking STEP pulse delays with TIM1/TIM4 active-low one-pulse output.
+- Added M4 speed-scaled laser power and exact-stop laser mode barriers.
+
+## 2026-06-11 v0.28.0 Relay-cut laser lift and live power
+
+- Enabled commissioned laser capability for the JQC3F relay wiring: PA2 high energizes the relay, PA7 remains active-high PWM.
+- Changed laser control to OFF/PREP/MARK: ARM only authorizes machining, PREP energizes the relay with PWM off, and MARK keeps the relay on while applying the configured PWM duty.
+- Added binary `LASER_PREP=0x0010` and ASCII `L2` for relay pre-energize dwell segments.
+- Updated the UI laser control from a one-shot checkbox to a colored enable button, with live `LASER POWER` updates from the percentage input.
+
+## 2026-06-11 v0.27.5 6400-PPR Cartesian pulse-event planning
+
+- Replaced fixed 10 ms rounded joint targets with a shared Cartesian-error-aware pulse-event planner for connected jog, G1/G2/G3, teach, car and handwriting trajectories.
+- Added width-16 beam search at half-pulse crossing times, exact firmware timed-DDA replay compression, laser/stop/reversal boundaries, trajectory-error metrics and a 600 segments/s sustained-rate refusal gate.
+- Unified UI, firmware, monitor, test and stress-tool defaults at `6400 PPR`.
+- Raised `APP_PARAM_FLASH_VERSION` to `6`; the first run restores all current source defaults.
+
+## 2026-06-11 v0.27.4 Restore verified active-high laser PWM
+
+- Restored active-high laser PWM after the active-low diagnostic produced higher idle laser power.
+- Non-working states continue to stop TIM3 and clamp PA7 as a push-pull GPIO at 0V.
+- Kept `APP_LASER_COMMISSIONED=0`; the relay remains required as the physical power cutoff before enabling laser operation.
+
+## 2026-06-10 v0.27.3 Active-low laser PWM trial
+
+- Reversed the laser PWM polarity for hardware diagnosis: PA7 high is now the configured off state and low is the active state.
+- Kept `APP_LASER_COMMISSIONED=0`, so the diagnostic firmware cannot ARM or intentionally emit marking PWM.
+
+## 2026-06-10 v0.27.2 Laser idle GPIO clamp
+
+- Moved the first PA7/relay safe clamp before `HAL_Init()` and added the same clamp to the fatal-error handler.
+- PWM is now stopped and physically disconnected from PA7 whenever the laser is idle, silent, disarmed or faulted. PA7 remains a push-pull GPIO at the configured off level; TIM3 reaches PA7 only after a real marking segment starts.
+- Changed TIM3 post-initialization to leave PA7 in the safe GPIO mode, eliminating the previous alternate-function interval during startup.
+- Direct STM32F103 GPIO-register switching makes segment-boundary shutoff faster and keeps the safety hardening within the available Flash.
+
+## 2026-06-10 v0.27.1 Laser power-on fail-safe hardening
+
+- Added an early boot-safe GPIO clamp so PA7 and the relay output are driven to their configured inactive levels before normal peripheral initialization.
+- Added explicit active-high/active-low PWM mapping, a 1 second boot lockout, PWM-start readiness checks, and ARM rejection when the output is not ready.
+- Added `APP_LASER_COMMISSIONED=0` as the safe default. Laser ARM and UI laser capability remain disabled until wiring, common ground, voltage and polarity have been verified with laser power disconnected.
+- Clarified that power-on must be `0%/off`, not the 1.0% minimum marking power, and that direct-powered laser wiring cannot be made fail-safe by firmware alone.
+
+## 2026-06-10 v0.27.0 Laser PWM and relay safety control
+
+- Added 1 kHz laser PWM on `PA7/TIM3_CH2` and active-high relay control on `PA2`; both default off.
+- Added centralized armed/ready/marking state with 100 ms relay settling, 1.0% default power, 5.0% software maximum, and automatic idle disarm.
+- Added `LASER POWER`, `LASER ARM`, `LASER DISARM`, `LASER STATUS`, ASCII `L0/L1`, binary `LASER_MARK=0x0008`, and binary laser-status telemetry.
+- Laser state changes now occur only when a segment actually starts or at timed-DDA ISR handoff; prefetched segments cannot turn the laser on early.
+- STOP, ESTOP, reset, homing, G0 rapid moves, motion errors and completed tasks force PWM off and release the relay.
+- Added one-shot UI laser enable, power selection, actual lower-controller status, silent connector suppression, and automatic UI reset.
+
 ## 2026-06-10 v0.26.3 GRBL-style execution split and realtime command bypass
 
 - Removed integer-milliradian double rounding from host joint-to-pulse conversion. Motion targets now retain floating-point radians and use exact `2*pi` until the final absolute-pulse rounding.

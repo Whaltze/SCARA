@@ -206,7 +206,7 @@ class MonitorWindow(QMainWindow):
         self.last_time = now
 
     @Slot(str)
-    def process_mcu_status(self, raw_str, ppr=3200):
+    def process_mcu_status(self, raw_str, ppr=6400):
         if not self.is_running:
             return
 
@@ -227,7 +227,7 @@ class MonitorWindow(QMainWindow):
         try:
             ppr_value = max(1, int(ppr))
         except (TypeError, ValueError):
-            ppr_value = 3200
+            ppr_value = 6400
 
         now = time.perf_counter()
         dt = None
@@ -272,7 +272,7 @@ class MonitorWindow(QMainWindow):
         self._pps_last_velocity = velocity
         self._pps_last_time = now
 
-    def process_commanded_pps(self, pps1, pps2, duration_ticks, ppr=3200):
+    def process_commanded_pps(self, pps1, pps2, duration_ticks, ppr=6400):
         if not self.is_running:
             return
         try:

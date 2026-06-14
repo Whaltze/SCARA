@@ -308,7 +308,7 @@ function Send-Expect {
         }
         foreach ($prefix in $AcceptPrefixes) {
             if ($rx.StartsWith($prefix)) {
-                if ($RequireEcho) {
+                if ($RequireEcho -and $rx.Trim().ToLowerInvariant() -ne "ok") {
                     if ($rx -notmatch "cs=$expectedCs") { throw "$Name ACK checksum mismatch expected $expectedCs" }
                     if (-not $rx.EndsWith("line=$Line")) { throw "$Name ACK line mismatch" }
                 }

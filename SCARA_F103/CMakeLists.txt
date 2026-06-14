@@ -47,10 +47,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     UserApp/app_main.c
     UserApp/app_params.c
-    UserApp/binary_traj.c
     UserApp/gcode_stream.c
     UserApp/home_controller.c
     UserApp/home_sensor.c
+    UserApp/laser_control.c
     UserApp/motion_planner.c
     UserApp/protocol.c
     UserApp/scara_kinematics.c
@@ -59,8 +59,17 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 set_source_files_properties(
-    UserApp/binary_traj.c
+    UserApp/app_main.c
+    UserApp/app_params.c
     UserApp/gcode_stream.c
+    UserApp/home_controller.c
+    UserApp/home_sensor.c
+    UserApp/laser_control.c
+    UserApp/motion_planner.c
+    UserApp/protocol.c
+    UserApp/scara_kinematics.c
+    UserApp/serial_dma.c
+    UserApp/stepper_driver.c
     PROPERTIES COMPILE_OPTIONS "-Os"
 )
 

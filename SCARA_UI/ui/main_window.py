@@ -35,10 +35,9 @@ class FiveBarSerialGUI(
         self.A, self.B = np.array([0, 0]), np.array([self.L0, 0])
         self.HOME_X, self.HOME_Y = 75.0, 220.0
 
-        self.accel = 10.0
+        self.accel = 100.0
 
-        # self.junction_dev = 0.02
-        self.junction_dev = 0.1
+        self.junction_dev = 0.02
         
         self.dt = 0.02
 
@@ -79,13 +78,12 @@ class FiveBarSerialGUI(
         self.is_recording = False
         self.teach_data = []
         self.teach_points = []
+        self.teach_step_index = 0
         self.point_queue = []
-        self.current_ppr = 3200
+        self.current_ppr = 6400
         self.microstep_dirty = True
 
         self.waiting_for_ack = False
-        self.last_sent_package = ""
-        self.last_sent_cs = ""
         self.last_sent_motion = None
         self.sent_point_id = 0
         self.total_task_points = 0
@@ -93,25 +91,35 @@ class FiveBarSerialGUI(
         self.error_count = 0
         self.heartbeat_count = 0
         self.ack_timeout_count = 0
-        self.mcu_planner_free = 32
-        self.planner_free_hint = 32
-        self.planner_free_min = 32
+        self.idle_ack_stall_polls = 0
+        self.last_controller_rx_at = 0.0
+        self.last_controller_state = ""
+        self.last_segment_count = 0
+        # Cumulative MCU diagnostics establish a baseline on first status.
+        self.planner_fault_count = None
+        self.rate_limited_segment_count = 0
+        self.serial_failure_reported = False
+        self.mcu_planner_capacity = 48
+        self.mcu_planner_free = self.mcu_planner_capacity
+        self.planner_free_hint = self.mcu_planner_capacity
+        self.planner_free_min = self.mcu_planner_capacity
         self.rx_free_hint = 256
         self.stream_waiting_buffer = False
         self.motion_preamble_needed = True
-        self.binary_seq = 1
-        self.binary_motion_active = False
+        self.motion_profile_sync_requested = False
+        self.laser_task_active = False
+        self.laser_preamble_needed = False
+        self.laser_power_permille = 10
+        self.laser_arm_sent_at = 0.0
+        self.pending_laser_power_permille = None
         self.controller_capabilities = None
-        self.host_timed_segment_mode = False
+        self.controller_reset_pending = False
+        self.controller_reset_reason = ""
+        self.controller_reset_started_at = 0.0
+        self.controller_reset_generation = 0
         self.emergency_paused = False
-        self.emergency_resume_path = []
-        self.active_binary_send_path = []
         self.active_preview_path = []
         self.jog_target_xy = None
-        self.jog_target_pulses = None
-        self.jog_pending_start_pulses = None
-        self.jog_pending_target_pulses = None
-        self.jog_roundtrip_origin_pulses = None
 
         # 如果接了真实电机和 HOME 开关，应该改成：
         self.board_only_debug = False
@@ -126,7 +134,7 @@ class FiveBarSerialGUI(
         self.move_timer = QTimer()
         self.read_timer = QTimer()
         self.read_timer.timeout.connect(self.check_serial_feedback)
-        self.read_timer.start(10)
+        self.read_timer.start(2)
 
         self.timeout_timer = QTimer()
         self.timeout_timer.setSingleShot(True)

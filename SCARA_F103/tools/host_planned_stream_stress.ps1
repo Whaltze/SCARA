@@ -67,11 +67,11 @@ function Send-Command {
         if ($rx.StartsWith("<")) { continue }
         foreach ($prefix in $AcceptPrefixes) {
             if ($rx.StartsWith($prefix)) {
-                if ($RequireEcho) {
+                if ($RequireEcho -and $rx.Trim().ToLowerInvariant() -ne "ok") {
                     if ($rx -notmatch "cs=$expectedCs") { throw "ACK checksum mismatch for $Name expected cs=$expectedCs" }
                     if (-not $rx.EndsWith("line=$Line")) { throw "ACK line mismatch for $Name" }
                 }
-                if ($showLine) { Write-Host ("MATCH [{0}] cs={1} echo=OK" -f $Name, $expectedCs) }
+                if ($showLine) { Write-Host ("MATCH [{0}] ack={1} cs={2}" -f $Name, $rx, $expectedCs) }
                 return $rx
             }
         }
@@ -131,7 +131,7 @@ try {
     Write-Host "Opening $Port at $Baud 8N1 ..."
     Write-Host ("Host-planned stream: {0} points, host feed {1}-{2}, host limits X[{3},{4}] Y[{5},{6}]" -f $Count, $FeedMin, $FeedMax, $MinX, $MaxX, $MinY, $MaxY)
     Write-Host "Protocol line example: G1 X-8.000 Y118.000 F1150 ;ID=0001 LIM=1"
-    Write-Host "Expected ACK: ok seq=<n> cs=<hex> line=<exact transmitted line>"
+    Write-Host "Expected ACK: ok (legacy ok seq/cs/line is still accepted)"
     if ($QuietLines) {
         Write-Host "Line display: quiet. Remove -QuietLines to print every TX/RX pair."
     } else {

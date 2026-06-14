@@ -70,8 +70,10 @@ try {
 
     $version = Send-LineAndRead -Serial $serial -Command "VERSION" -Prefix "OK VERSION"
     $hostcap = Send-LineAndRead -Serial $serial -Command "HOSTCAP" -Prefix "OK HOSTCAP"
-    if ($hostcap -notmatch "binary_traj=1" -or $hostcap -notmatch "binary_timed=1" -or $hostcap -notmatch "gcode_abt=1") {
-        throw "Controller does not advertise binary trajectory, binary timed segments and G1 A/B/T support"
+    foreach ($cap in @("grbl_stream=1", "char_count=1", "scara_plan=1", "planner=48", "segments=16", "gcode_arc=1", "jog=1", "dda=1", "hz=10000")) {
+        if ($hostcap -notmatch [regex]::Escape($cap)) {
+            throw "Controller HOSTCAP is missing $cap"
+        }
     }
 
     Write-Host "TX ?"
@@ -83,23 +85,29 @@ try {
     }
     $plannerFree = [int]$Matches[1]
     $rxFreeBytes = [int]$Matches[2]
-    if ($plannerFree -lt 1 -or $rxFreeBytes -lt 256) {
+    if ($plannerFree -lt 1 -or $rxFreeBytes -lt 128) {
         throw "Old or insufficient buffer report: planner_free=$plannerFree rx_free_bytes=$rxFreeBytes"
+    }
+    foreach ($field in @("MPos:", "JPos:", "FS:", "E:", "H:", "HS:", "A1:", "A2:", "Lz:")) {
+        if (-not $status.Contains($field)) {
+            throw "Realtime status is missing $field"
+        }
     }
     if ($status -notmatch "\|Q:(\d+)\|") {
         throw "Status is missing planner queue count Q"
     }
-    if ($status -notmatch "\|Sq:(\d+),(\d+)\|") {
-        throw "Status is missing step segment queue occupancy Sq"
+    if ($status -notmatch "\|Seg:(\d+),(\d+),(\d+),(\d+)\|") {
+        throw "Status is missing step segment diagnostics Seg"
     }
-    if ($status -notmatch "\|JU:(\d+),(\d+),(\d+),(\d+)\|") {
-        throw "Status is missing four-field underrun diagnostics JU"
+
+    Write-Host "TX STATUS"
+    $serial.WriteLine("STATUS")
+    $longStatus = Read-MatchingLine -Serial $serial -Prefix "STAT " -WaitMs ([Math]::Max(2000, $TimeoutMs * 4))
+    if ($longStatus -notmatch "\bhz=10000\b") {
+        throw "Long STATUS is not reporting the required 10 kHz control tick"
     }
-    if ($status -notmatch "\|Hz:10000\|") {
-        throw "Controller is not reporting the required 10 kHz control tick"
-    }
-    if ($status -notmatch "\|IC:(\d+)\|") {
-        throw "Status is missing maximum control ISR cycle telemetry IC"
+    if ($longStatus -notmatch "\bic=(\d+)\b") {
+        throw "Long STATUS is missing maximum control ISR cycle telemetry ic"
     }
     $maxTickCycles = [int]$Matches[1]
     if ($maxTickCycles -ge 7200) {
@@ -107,8 +115,8 @@ try {
     }
 
     Write-Host "PASS version: $version"
-    Write-Host "PASS host capabilities: binary trajectory, binary timed segments and G1 A/B/T"
-    Write-Host "PASS three-layer status: Bf/Q/Sq/JU"
+    Write-Host "PASS host capabilities: GRBL stream, SCARA planner, arcs, jog, DDA"
+    Write-Host "PASS realtime status: MPos/JPos/Bf/Q/E/Seg/H/HS/A1/A2/Lz"
     Write-Host "PASS RX byte capacity: $rxFreeBytes"
     Write-Host "PASS control ISR cycle budget: $maxTickCycles < 7200"
     Write-Host "BUFFERED STREAM CAPABILITY CHECK PASS"

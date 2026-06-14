@@ -1,99 +1,133 @@
-"""Motion sender strategies.
+"""GRBL character-counting motion sender.
 
-The UI planner produces paths. These strategies decide how an already-planned
-path is transported without mixing transport-specific state into the dispatcher.
+The controller owns look-ahead and segment preparation. The UI only streams
+real Cartesian G-code and keeps at most the configured send window in flight.
 """
 
+from collections import deque
+from itertools import chain
 
-class MotionSender:
-    mode = "unknown"
+
+class CountedCommandStream:
+    """One-shot lazy command stream with a known total for UI progress."""
+
+    def __init__(self, commands, count):
+        self._commands = iter(commands)
+        self._count = max(0, int(count))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._commands)
+
+    def __len__(self):
+        return self._count
+
+
+class GcodeJob:
+    """Bounded lazy command source used by the GRBL sender."""
+
+    def __init__(self, commands=(), max_pending=64):
+        self._sources = deque([iter(commands)])
+        self._pending = deque()
+        self._max_pending = max(1, int(max_pending))
+        self._fill()
+
+    def _fill(self):
+        while len(self._pending) < self._max_pending and self._sources:
+            try:
+                self._pending.append(next(self._sources[0]))
+            except StopIteration:
+                self._sources.popleft()
+
+    def __bool__(self):
+        self._fill()
+        return bool(self._pending)
+
+    def __len__(self):
+        self._fill()
+        return len(self._pending)
+
+    def __getitem__(self, index):
+        self._fill()
+        if index == 0:
+            return self._pending[0]
+        if index == -1:
+            return self._pending[-1]
+        raise IndexError("GcodeJob only supports its buffered head and tail")
+
+    def pop(self, index=0):
+        if index != 0:
+            raise IndexError("GcodeJob only pops from the head")
+        self._fill()
+        item = self._pending.popleft()
+        self._fill()
+        return item
+
+    def insert(self, index, item):
+        if index != 0:
+            raise IndexError("GcodeJob only inserts at the head")
+        self._pending.appendleft(item)
+
+    def extend(self, commands):
+        self._sources.append(iter(commands))
+        self._fill()
+
+    def clear(self):
+        self._sources.clear()
+        self._pending.clear()
+
+
+def _job_commands(owner, source, include_preamble):
+    preamble = []
+    epilogue = []
+    if include_preamble and getattr(owner, "motion_preamble_needed", False):
+        preamble.extend(("$X", "M17"))
+        owner.motion_preamble_needed = False
+    if include_preamble and getattr(owner, "motion_profile_sync_requested", False):
+        preamble.extend(getattr(owner, "_motion_profile_preamble", lambda: ())())
+        owner.motion_profile_sync_requested = False
+    if include_preamble and getattr(owner, "laser_task_active", False):
+        power = int(getattr(owner, "_laser_s_word", lambda: 200)())
+        preamble.append(f"M4 S{power}")
+        epilogue.append("M5")
+        owner.laser_preamble_needed = False
+    return chain(preamble, source, epilogue)
+
+
+class GrblGcodeSender:
+    mode = "grbl_stream"
 
     def send(self, owner, path, *, append=False, send_path=None):
-        raise NotImplementedError
-
-
-class HostTimedSegmentSender(MotionSender):
-    mode = "host_timed_segment"
-
-    def send(self, owner, path, *, append=False, send_path=None):
-        if append or owner.waiting_for_ack or owner.point_queue:
-            owner.log_error("Motion queue is busy; stop or wait before loading a host-timed trajectory.")
-            return False
-        try:
-            segments = owner.build_host_segments_from_path(
-                path,
-                start_xy=(owner.cur_x, owner.cur_y),
-                label="host timed trajectory",
-            )
-        except Exception as exc:
-            owner.log_error(f"Host-timed segment planning failed: {exc}")
-            return False
-        owner.active_preview_path = list(path)
-        return bool(owner._queue_gcode_segments(segments, label="host timed trajectory"))
-
-
-class BufferedBinarySender(MotionSender):
-    mode = "binary_buffered"
-
-    def send(self, owner, path, *, append=False, send_path=None):
-        if append or not send_path:
-            return False
-        if owner.waiting_for_ack or owner.point_queue:
-            return False
-
-        start_x, start_y = owner.cur_x, owner.cur_y
-        owner.active_binary_send_path = list(send_path)
-        owner.active_preview_path = list(path)
-        if not owner._upload_binary_motion(send_path, preview_path=path):
-            owner.active_binary_send_path = []
-            return False
-
-        owner.sent_point_id = len(send_path)
-        owner.total_task_points = len(send_path)
-        owner.task_start_time = owner._sender_now()
-        owner.point_queue = []
-        owner._clear_text_sender_state()
-        if owner.plot_mode_combo.currentText() == "通讯发送内容":
-            owner.history_x = [float(start_x)]
-            owner.history_y = [float(start_y)]
-            owner.update_plot(force=True)
-        return True
-
-
-class AsciiLegacyG1Sender(MotionSender):
-    mode = "gcode_stream"
-
-    def send(self, owner, path, *, append=False, send_path=None):
+        source = path
         if append and (owner.waiting_for_ack or owner.point_queue):
-            owner.point_queue.extend(path)
-            owner.total_task_points += len(path)
+            include_preamble = bool(
+                getattr(owner, "motion_preamble_needed", False)
+                or getattr(owner, "laser_preamble_needed", False)
+                or getattr(owner, "motion_profile_sync_requested", False)
+            )
+            owner.point_queue.extend(_job_commands(owner, source, include_preamble=include_preamble))
+            try:
+                owner.total_task_points += len(source)
+            except TypeError:
+                pass
         else:
             owner.sent_point_id = 0
-            owner.total_task_points = len(path)
+            try:
+                owner.total_task_points = len(source)
+            except TypeError:
+                owner.total_task_points = 0
             owner.task_start_time = owner._sender_now()
             owner._clear_text_sender_state()
-            owner.point_queue = list(path)
-        owner.active_preview_path = list(path)
+            owner.point_queue = GcodeJob(_job_commands(owner, source, include_preamble=True))
         owner._set_sender_status(self.mode, queued_lines=len(owner.point_queue), inflight_lines=0)
         owner.process_queue()
         return True
 
 
-HOST_TIMED_SEGMENT_SENDER = HostTimedSegmentSender()
-BUFFERED_BINARY_SENDER = BufferedBinarySender()
-ASCII_LEGACY_G1_SENDER = AsciiLegacyG1Sender()
+GRBL_GCODE_SENDER = GrblGcodeSender()
 
 
 def select_motion_sender(owner, *, append=False, send_path=None):
-    serial_open = bool(owner.ser and owner.ser.is_open)
-    if serial_open and bool(getattr(owner, "host_timed_segment_mode", False)):
-        return HOST_TIMED_SEGMENT_SENDER
-    if (
-        serial_open
-        and send_path
-        and not append
-        and not owner.waiting_for_ack
-        and not owner.point_queue
-    ):
-        return BUFFERED_BINARY_SENDER
-    return ASCII_LEGACY_G1_SENDER
+    return GRBL_GCODE_SENDER

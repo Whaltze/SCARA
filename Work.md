@@ -2,13 +2,51 @@
 
 本文档说明当前 SCARA_F103 固件与上位机的职责边界、通信协议、轨迹规划要求、限位要求和错误处理。
 
+## 0.29.0 GRBL-SCARA 流式链路同步
+
+当前正式运动链路已经从旧的“上位机完整规划、MCU 执行点轨迹”切换为 GRBL-style 四层流式架构：
+
+```text
+UI 懒生成真实 G-code
+↓
+character-counting 串口发送窗口
+↓
+MCU 32-block look-ahead planner
+↓
+MCU 16 个 5 ms step segment + TIM2 step-event 输出
+```
+
+上位机现在负责：
+
+```text
+生成真实 G0/G1/G2/G3/$J/M3/M4/M5 G-code。
+维持最多 64 条待发送命令和 224 bytes 未确认窗口。
+用独立串口 QThread 收发，不在 UI 主线程等待 ACK。
+显示预览轨迹、反馈位置、planner/segment/RX 诊断。
+在发送前做用户层限位和可达性提示。
+```
+
+MCU 现在负责：
+
+```text
+G-code parser 与实时字符处理。
+32 block reverse/forward look-ahead。
+五连杆 SCARA segment 端点逆解。
+16 个 timed segment 预取。
+TIM2 可变周期 step-event 调度。
+TIM1/TIM4 one-pulse STEP 输出。
+STOP/ESTOP/hold/resume/reset/Jog Cancel、回零、激光安全和状态回传。
+```
+
+后续维护时，旧的 BinaryTraj、host-timed 点轨迹、实验文本按钮和 UI 模式切换只能作为历史参考，不得重新接入正式运动入口。下面 0.24.x 到 0.26.x 内容保留为演进记录；若与本节冲突，以本节为准。
+
 ## 0.24.5 上位机仿真视野
 
 主 UI 仿真图只在首次初始化时自动适配一次工作区。之后点动、前进/后退、轨迹预览、清空轨迹和运动刷新都不得自动改变坐标轴比例或范围；视野缩放和平移只由鼠标滚轮、左键拖动控制。
 
 ## 0.24.4 上位机显示与停止语义
 
-主 UI 右侧只保留轨迹仿真视图，坐标纸铺满绘图区，不再显示图注；鼠标滚轮和拖动只改变真实坐标轴范围，不自动添加平滑或美化轨迹。速度/加速度由 `SCARA_UI/V_monitor.py` 独立窗口显示，数据只来自状态帧 `M:x,y` 换算后的真实反馈坐标，按相邻反馈帧的实际时间差解算，不做低通滤波，横轴采用 10 s 滚动窗口。
+主 UI 右侧只保留轨迹仿真视图，坐标纸铺满绘图区，不再显示图注；鼠标滚轮和拖动只改变真实坐标轴范围，不自动添加平滑或美化轨迹。速度/加速度由 `SCARA_UI/V_monitor.py` 独立窗口显示，数据只来自状态帧 `MPos:x,y` 换算后的真实反馈坐标，按相邻反馈帧的实际时间差解算，不做低通滤波，横轴采用 10 s 滚动窗口。
 
 安全按钮拆分为两个语义：
 
@@ -96,17 +134,15 @@ G1 X120.050 Y80.010 F1200 ;ID=0123 LIM=1
 下位机成功接收、解析并入队后返回：
 
 ```text
-ok seq=<n> cs=<hex> line=<原始接收行>
+ok
 ```
 
 上位机必须：
 
 ```text
 1. 等待 ok 后再发送下一条正式轨迹。
-2. 检查 seq 是否递增。
-3. 检查 cs 是否正确。
-4. 检查 line 是否与发送内容完全一致。
-5. 收到 error:<code> 后停止继续发送轨迹。
+2. 收到 error:<code> 后停止继续发送轨迹。
+3. 按行区分状态帧、系统 OK 和 G-code ok，状态帧不推进发送队列。
 ```
 
 ## 3. 支持的 G-code
@@ -197,7 +233,7 @@ G2/G3 是真实圆弧段。
 圆弧内部不再按短折线拐角反复限速。
 ```
 
-从 `v0.24.3` 开始，主 UI 不再显示速度图像，只显示轨迹预览、已发送轨迹、下位机反馈轨迹和五连杆机构仿真。速度/加速度监控由 `SCARA_UI/V_monitor.py` 独立窗口负责，数据只来自状态帧 `M:x,y` 转换后的真实反馈坐标；ACK 回显的 `line=...` 只用于通信校验，不当作实际位置反馈。
+从 `v0.24.3` 开始，主 UI 不再显示速度图像，只显示轨迹预览、已发送轨迹、下位机反馈轨迹和五连杆机构仿真。速度/加速度监控由 `SCARA_UI/V_monitor.py` 独立窗口负责，数据只来自状态帧 `MPos:x,y` 转换后的真实反馈坐标；G-code 的 `ok` 只表示已接收/入队，不当作实际位置反馈。
 
 ## 6. 限位职责
 
@@ -205,7 +241,7 @@ G2/G3 是真实圆弧段。
 
 ```text
 APP_HOST_OWNS_LIMIT_CHECKS = 1
-HOSTCAP ... host_limit=1 mcu_soft_limit=0
+HOSTCAP ... grbl_stream=1 scara_plan=1 gcode_arc=1 jog=1 binary_traj=0 dda=1
 ```
 
 原因：
@@ -261,21 +297,24 @@ STOP/ESTOP。
 状态帧：
 
 ```text
-<Idle|M:x,y|P:p1,p2|Bf:planner_free,rx_free|Q:planner_used|E:n|H:h1,h2|HS:home_state|A1:en,run,cur_pps,tgt_pps|A2:en,run,cur_pps,tgt_pps>
+<Idle|MPos:x,y|JPos:p1,p2|FS:feed_mm_min,spindle|Bf:planner_free,rx_free|Q:planner_used|E:n|Seg:count,free,low,underrun|H:h1,h2|HS:home_state|A1:en,run,cur_pps,tgt_pps|A2:en,run,cur_pps,tgt_pps|Lz:armed,ready,marking,power>
 ```
 
 字段含义：
 
 ```text
 Idle/Run 当前是否还有运动或缓冲轨迹。
-M        MCU 根据软件脉冲正解估算的 XY。
-P        双轴软件脉冲计数。
+MPos     MCU 根据软件脉冲正解估算的 XY。
+JPos     双轴软件脉冲计数。
+FS       当前 G-code 进给和主轴/功率字。
 Bf       规划缓冲剩余、RX 行队列剩余。
 Q        规划缓冲已用段数。
 E        步进底层错误 bit。
+Seg      timed segment 缓冲计数、剩余、低水位和欠载次数。
 H        HOME1/HOME2 输入，1 表示触发。
 HS       回零状态。
 A1/A2    轴状态：使能、运行、当前 pps、目标 pps。
+Lz       激光状态：armed、relay_ready、marking、power_permille。
 ```
 
 上位机 UI 建议 5-10 Hz 发送：
@@ -301,7 +340,7 @@ $H
 MCU 自动流程：
 
 ```text
-IDLE -> AXIS1_SEARCH -> AXIS1_BACKOFF -> AXIS2_SEARCH -> AXIS2_BACKOFF -> SET_ZERO -> DONE
+Idle -> Axis1Search -> Axis1Return -> Axis2Search -> Axis2Return -> Done
 ```
 
 `$H` 返回 `ok` 只表示回零流程已启动，不表示回零完成。
@@ -396,69 +435,58 @@ MATCH ...
 -QuietLines
 ```
 
-### 10 kHz 反馈误差压测与分析
+### GRBL/G-code 反馈误差压测与分析
 
-烧录 `0.25.0` 固件后，先用 ASCII 回退路径确认状态帧、反馈坐标和误差统计链路：
+烧录当前 `0.29.0-grbl-scara` 固件后，先用正式 G-code 链路确认状态帧、反馈坐标和误差统计：
 
 ```powershell
 cd C:\Users\22602\Desktop\SCARA\SCARA_F103
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\feedback_error_stress.ps1 -Port COM13 -Count 1000 -FeedMmMin 900 -MaxErrorMm 1.0 -CsvPath .\logs\feedback_ascii.csv -EnableMotion
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\feedback_error_stress.ps1 -Port COM13 -Count 1000 -FeedMmMin 900 -MaxErrorMm 1.0 -CsvPath .\logs\feedback_gcode.csv -EnableMotion
 ```
 
-改动二进制插补或速度连续性策略前，先跑离线段级仿真：
+当前正式链路由 UI 懒生成 G-code，MCU 负责 parser、look-ahead planner、SCARA segment preparation 和 TIM2/TIM1/TIM4 STEP 输出。旧 BinaryTraj/host-timed 点轨迹脚本只作为历史参考，不再作为正式验收入口。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\simulate_binary_interpolator.ps1 -Count 3000 -FeedPps 600
-```
-
-当前二进制轨迹段派发由 `BinaryTraj_Tick10kHz()` 在 100 us 控制周期内推进；主循环只负责串口解析、协议响应和低频任务，避免段切换受主循环调度抖动影响。
-
-UI 正式运行 `G1/G2/G3` 时，预览轨迹和实际下发轨迹分离：
+UI 正式运行 `G1/G2/G3` 时，预览轨迹和实际 G-code 发送共用同一套限位、速度和回零门控：
 
 ```text
-G1 直线：界面仍按细采样显示预览；实际下发路径按关节空间插补后的 XY 偏差自适应生成关键点，默认目标是整条反馈轨迹误差不超过 1 mm。
-G2/G3 圆弧：界面保留细采样预览，实际按约 2 mm 弦长生成圆弧关键点；MCU 按下一段速度计算 exit_pps，避免段间速度固定掉到半速。
-ASCII G-code 点流保留为二进制上传失败或调试时的回退路径。
+G1 直线：UI 做工作空间和关节限位检查后发送真实 G1。
+G2/G3 圆弧：UI 保留预览，正式链路发送真实 G-code/或按当前规划器生成的 G1 流。
+点动和轨迹发送前必须已经收到 HS:Done 或 STAT hs=Done，UI 才解除 is_homed 门控。
+状态帧 MPos/JPos/Q/E/Seg/H/HS/A1/A2/Lz 是反馈和 drain 判断依据，ACK 只表示接收/入队。
 ```
 
-模拟 UI 的 `G1 直线` 按钮下发二进制关键点，并按整条 XY 直线统计反馈误差：
+模拟 UI 控键矩阵，覆盖方向点动、电机点动、轨迹按钮、急停和状态 drain：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui_binary_line_stress.ps1 -Port COM13 -StartX 75 -StartY 220 -EndX 150 -EndY 250 -FeedMmS 20 -MaxErrorMm 1.0 -CsvPath .\logs\ui_binary_line_latest.csv
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui_control_matrix_check.ps1 -Port COM13 -FeedMmMin 900
 ```
 
-再用二进制关节空间插补路径压测下位机 10 kHz 运动内核：
+模拟 UI 轨迹按钮，覆盖 G1、G2、G3 和两条小车轮廓：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\binary_joint_traj_stress.ps1 -Port COM13 -Count 3000 -ChunkPoints 20 -FeedPps 600 -MaxErrorMm 1.0 -CsvPath .\logs\feedback_binary.csv -EnableMotion
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\ui_trajectory_stress.ps1 -Port COM13 -Count 3000 -FeedMmMin 900
 ```
 
-离线分析 CSV，直接输出轴向峰值、轴向 RMS、范数峰值、范数 RMS 和最差样本位置：
+离线分析反馈 CSV，直接输出轴向峰值、轴向 RMS、范数峰值、范数 RMS 和最差样本位置：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\analyze_feedback_error_csv.ps1 -CsvPath .\logs\feedback_binary.csv -MaxErrorMm 1.0 -MaxRmsMm 0.5 -WorstCount 10
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\analyze_feedback_error_csv.ps1 -CsvPath .\logs\feedback_gcode.csv -MaxErrorMm 1.0 -MaxRmsMm 0.5 -WorstCount 10
 ```
 
-批量扫 `FeedPps / ChunkPoints` 参数组合，自动保存每组 CSV、分析结果和总汇总：
+一键执行项目自检、串口链路检查、GRBL 状态/ACK 检查、UI 控键矩阵、UI 轨迹压力测试和 CSV 误差分析：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\sweep_binary_feedback_error.ps1 -Port COM13 -Count 3000 -FeedPpsList 300,600,900 -ChunkPointsList 10,20,40 -MaxErrorMm 1.0 -MaxRmsMm 0.5 -OutDir .\logs\binary_sweep -EnableMotion -ContinueOnFail
-```
-
-一键执行项目自检、二进制插补仿真、串口链路检查、空载电机压力测试和 CSV 误差分析：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\final_validation.ps1 -Port COM13 -Count 300 -ChunkPoints 10 -FeedPps 300 -MaxErrorMm 1.0 -MaxRmsMm 0.3 -OutDir .\logs\final_validation_latest
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\final_validation.ps1 -Port COM13 -Count 300 -FeedMmMin 900 -MaxErrorMm 1.0 -MaxRmsMm 0.3 -OutDir .\logs\final_validation_latest
 ```
 
 验收重点：
 
 ```text
-HOSTCAP 包含 control_hz=10000 binary_traj=1 joint_interp=1
-状态帧包含 JT:<state>,accepted,executed,queued,free 和 Hz:10000
-状态帧包含 JU:underrun_ticks,max_dispatch_gap_ticks,min_buffer；稳定流式运行时 underrun_ticks 应为 0
+HOSTCAP 包含 grbl_stream=1 scara_plan=1 gcode_arc=1 jog=1 binary_traj=0 dda=1 hz=10000
+状态帧包含 MPos/JPos/Bf/Q/E/Seg/H/HS/A1/A2/Lz
+状态帧包含 HS:Done，回零完成后 UI 才解除运动门控
 压测结束为 Idle/Q:0/E:0
-FEEDBACK_ERROR 或 BINARY_FEEDBACK_ERROR 不超过设定阈值
+FEEDBACK_ERROR 不超过设定阈值
 CSV 分析的 max_x/max_y/rms_x/rms_y 用于定位单轴抖动和参数优化方向
 ```
 

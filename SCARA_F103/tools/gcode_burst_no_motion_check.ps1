@@ -61,17 +61,20 @@ try {
     $serial.Write($burst.ToString())
 
     $received = @{}
+    $pureOkCount = 0
     $firstProtocolResponse = $null
     $deadline = (Get-Date).AddMilliseconds([Math]::Max(3000, $TimeoutMs * ($BurstLines + 2)))
-    while ((Get-Date) -lt $deadline -and $received.Count -lt $BurstLines) {
+    while ((Get-Date) -lt $deadline -and (($received.Count + $pureOkCount) -lt $BurstLines)) {
         try {
             $rx = $serial.ReadLine().Trim()
             Write-Host "RX $rx"
             if ($null -eq $firstProtocolResponse -and
-                ($rx.StartsWith("<") -or $rx.Contains("|Bf:") -or $rx -match "^ok seq=")) {
+                ($rx.StartsWith("<") -or $rx.Contains("|Bf:") -or $rx -match "^ok(\s|$)")) {
                 $firstProtocolResponse = $rx
             }
-            if ($rx -match "^ok seq=\d+ cs=([0-9A-F]{2}) line=(.*)$") {
+            if ($rx.Trim().ToLowerInvariant() -eq "ok") {
+                $pureOkCount++
+            } elseif ($rx -match "^ok seq=\d+ cs=([0-9A-F]{2}) line=(.*)$") {
                 $cs = $Matches[1]
                 $line = $Matches[2]
                 if (-not $expected.ContainsKey($line)) {
@@ -85,8 +88,9 @@ try {
         } catch [TimeoutException] {
         }
     }
-    if ($received.Count -ne $BurstLines) {
-        throw "Received $($received.Count)/$BurstLines matching ACKs"
+    $ackCount = $received.Count + $pureOkCount
+    if ($ackCount -ne $BurstLines) {
+        throw "Received $ackCount/$BurstLines ACKs"
     }
     if ($null -eq $firstProtocolResponse -or
         (-not $firstProtocolResponse.StartsWith("<") -and -not $firstProtocolResponse.Contains("|Bf:"))) {
@@ -116,7 +120,7 @@ try {
         throw "Controller reported RX overflow or TX drop"
     }
 
-    Write-Host "PASS realtime status bypassed burst ACKs; burst ACKs=$($received.Count) rxov=0 txd=0"
+    Write-Host "PASS realtime status bypassed burst ACKs; burst ACKs=$ackCount rxov=0 txd=0"
     Write-Host "GCODE BURST NO-MOTION CHECK PASS"
     exit 0
 } catch {

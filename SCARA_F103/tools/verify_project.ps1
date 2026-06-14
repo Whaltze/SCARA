@@ -1,274 +1,154 @@
-param(
-    [string]$Preset = "Debug"
-)
-
-# 项目自检脚本：构建固件、检查产物、确认课程设计版保留的脚本和文档存在。
+param([string]$Preset = "Debug")
 
 $ErrorActionPreference = "Stop"
-
-$projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$buildDir = Join-Path $projectRoot "build\$Preset"
-$firmwareBase = Join-Path $buildDir "SCARA_F103"
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$repoRoot = (Resolve-Path (Join-Path $root "..")).Path
 $failures = 0
 
-function Pass {
-    param([string]$Message)
-    Write-Host "PASS $Message"
-}
-
-function Fail {
-    param([string]$Message)
-    Write-Host "FAIL $Message"
-    $script:failures++
-}
-
-function Require-File {
-    param([string]$Path)
-    if (Test-Path $Path -PathType Leaf) {
-        Pass "file exists: $Path"
-    } else {
-        Fail "missing file: $Path"
-    }
-}
-
-function Require-Text {
-    param(
-        [string]$Path,
-        [string]$Pattern,
-        [string]$Description
-    )
-
-    if (-not (Test-Path $Path -PathType Leaf)) {
-        Fail "cannot check missing file: $Path"
-        return
-    }
-
+function Pass([string]$Message) { Write-Host "PASS $Message" }
+function Fail([string]$Message) { Write-Host "FAIL $Message"; $script:failures++ }
+function Require-Text([string]$Path, [string]$Pattern, [string]$Message) {
     $text = Get-Content -Raw $Path
-    if ($text -match $Pattern) {
-        Pass $Description
-    } else {
-        Fail $Description
-    }
+    if ($text -match $Pattern) { Pass $Message } else { Fail $Message }
+}
+function Forbid-Text([string]$Path, [string]$Pattern, [string]$Message) {
+    $text = Get-Content -Raw $Path
+    if ($text -notmatch $Pattern) { Pass $Message } else { Fail $Message }
 }
 
-function Require-DocFile {
-    param(
-        [string]$RelativePath,
-        [string]$AbsoluteFallback
-    )
-
-    $relative = Join-Path $projectRoot $RelativePath
-    if (Test-Path $relative -PathType Leaf) {
-        Pass "file exists: $relative"
-        return
-    }
-
-    if (Test-Path $AbsoluteFallback -PathType Leaf) {
-        Pass "file exists: $AbsoluteFallback"
-        return
-    }
-
-    Fail "missing file: $relative"
-}
-
-Write-Host "== Build =="
-Push-Location $projectRoot
+Push-Location $root
 try {
     & cmake --build --preset $Preset
-    if ($LASTEXITCODE -ne 0) {
-        Fail "cmake build preset $Preset"
-    } else {
-        Pass "cmake build preset $Preset"
-    }
+    if ($LASTEXITCODE -eq 0) { Pass "firmware builds" } else { Fail "firmware build failed" }
 } finally {
     Pop-Location
 }
 
-Write-Host "== Firmware Artifacts =="
-Require-File "$firmwareBase.elf"
-Require-File "$firmwareBase.hex"
-Require-File "$firmwareBase.bin"
-Require-File "$firmwareBase.map"
-
-$binPath = "$firmwareBase.bin"
-if (Test-Path $binPath -PathType Leaf) {
-    $binSize = (Get-Item $binPath).Length
-    $limit = 63 * 1024
-    if ($binSize -le $limit) {
-        Pass "binary size $binSize <= $limit bytes"
-    } else {
-        Fail "binary size $binSize > $limit bytes"
-    }
+$build = Join-Path $root "build\$Preset"
+$bin = Join-Path $build "SCARA_F103.bin"
+if (Test-Path $bin) {
+    $size = (Get-Item $bin).Length
+    if ($size -le (61 * 1024)) { Pass "Flash leaves at least 2KB: $size bytes" } else { Fail "Flash reserve below 2KB: $size bytes" }
+} else {
+    Fail "firmware binary missing"
 }
 
-Write-Host "== Flash Layout =="
-$linker = Join-Path $projectRoot "STM32F103XX_FLASH.ld"
-$config = Join-Path $projectRoot "UserApp\app_config.h"
-Require-Text $linker "FLASH \(rx\)\s+:\s+ORIGIN = 0x8000000, LENGTH = 63K" "linker reserves final parameter page"
-Require-Text $config "APP_PARAM_FLASH_ADDR 0x0800F800u" "parameter page address is 0x0800F800"
-Require-Text $config "APP_FW_VERSION `"0\.26\.3`"" "firmware version is 0.26.3"
-Require-Text $config "APP_CONTROL_HZ 10000u" "control loop is 10 kHz"
-Require-Text $config "APP_STEPPER_PULSE_HIGH_US 3u" "step pulse high time is 3us"
-Require-Text $config "APP_STEPPER_PULSE_LOW_US 3u" "step pulse low recovery time is 3us"
-Require-Text $config "APP_STEPPER_DIR_SETUP_US 6u" "direction setup time is 6us"
-Require-Text $config "APP_STEPPER_WORST_BLOCKING_DELAY_US" "step timing has a compile-time worst-case ISR delay calculation"
-Require-Text $config "APP_STEPPER_ISR_DELAY_BUDGET_US" "step timing reserves at least half of the control tick for non-delay ISR work"
-Require-Text $config "APP_MOTOR1_ZERO_MRAD 2251L" "motor 1 zero offset matches symmetric UI home"
-Require-Text $config "APP_MOTOR2_ZERO_MRAD 890L" "motor 2 zero offset matches symmetric UI home"
-Require-Text $config "APP_SERIAL_BAUDRATE 115200u" "serial baudrate is 115200"
-Require-Text $config "APP_SERIAL_REALTIME_QUEUE_DEPTH 8u" "realtime serial characters have a separate queue"
-Require-Text $config "APP_COMM_WATCHDOG_DEFAULT_MS 0u" "comm watchdog is disabled by default"
-Require-Text $config "APP_HOST_OWNS_LIMIT_CHECKS 1u" "host owns trajectory limit checks"
-Require-Text $config "APP_SCARA_IK_LEFT_ELBOW_SIGN 1" "left IK branch is non-crossed"
-Require-Text $config "APP_SCARA_IK_RIGHT_ELBOW_SIGN \(-1\)" "right IK branch is non-crossed"
-Require-Text $config "APP_PARAM_FLASH_VERSION 5u" "parameter flash version invalidates old zero offsets and PPR defaults"
+$config = Join-Path $root "UserApp\app_config.h"
+$planner = Join-Path $root "UserApp\motion_planner.c"
+$gcode = Join-Path $root "UserApp\gcode_stream.c"
+$homeController = Join-Path $root "UserApp\home_controller.c"
+$protocol = Join-Path $root "UserApp\protocol.c"
+$serial = Join-Path $root "UserApp\serial_dma.c"
+$stepper = Join-Path $root "UserApp\stepper_driver.c"
+$timer = Join-Path $root "Core\Src\tim.c"
+$irq = Join-Path $root "Core\Src\stm32f1xx_it.c"
+$appMain = Join-Path $root "UserApp\app_main.c"
+$cmake = Join-Path $root "CMakeLists.txt"
+$uiMotion = Join-Path $repoRoot "SCARA_UI\motion\motion_mixin.py"
+$uiSerial = Join-Path $repoRoot "SCARA_UI\communication\serial_mixin.py"
+$uiSender = Join-Path $repoRoot "SCARA_UI\communication\motion_senders.py"
+$uiPlotting = Join-Path $repoRoot "SCARA_UI\ui\plotting.py"
+$uiMixin = Join-Path $repoRoot "SCARA_UI\ui\ui_mixin.py"
+$uiProtocol = Join-Path $repoRoot "SCARA_UI\communication\serial_protocol.py"
+$uiLookAhead = Join-Path $repoRoot "SCARA_UI\trajectory\look_ahead.py"
+$uiVision = Join-Path $repoRoot "SCARA_UI\vision\vision_mixin.py"
+$uiUtility = Join-Path $repoRoot "SCARA_UI\core\utility_mixin.py"
 
-$timer = Join-Path $projectRoot "Core\Src\tim.c"
-Require-Text $timer "htim2\.Init\.Period = 99;" "TIM2 period is 99 for 10 kHz control tick"
+Require-Text $config "APP_GCODE_PLANNER_BLOCKS 48u" "planner has 48 short-block look-ahead blocks"
+Require-Text $config "APP_GCODE_BLEND_MIN_BLOCKS 12u" "stream prefill collects useful look-ahead"
+Require-Text $config "APP_GCODE_TAIL_HOLDBACK_SEGMENTS 8u" "short streams retain a tail look-ahead window"
+Require-Text $config "APP_STEPPER_TIMED_SEGMENTS 16u" "step layer has 16 segments"
+Require-Text $config "APP_SERIAL_RX_RING_SIZE 256u" "RX byte ring is 256 bytes"
+Require-Text $config "APP_SERIAL_TX_SIZE 512u" "diagnostic status frames cannot truncate"
+Require-Text $config "APP_GRBL_SEGMENT_MS 5u" "segments target 5ms"
+Require-Text $planner "planner_recalculate" "planner has incremental look-ahead"
+Require-Text $planner "junction_speed_sqr" "planner uses junction-deviation speed"
+Require-Text $planner "joint_deviation_pulse" "SCARA junction speed is constrained in physical joint space"
+Require-Text $planner "final_segment_ticks" "short block tails use variable segment duration"
+Require-Text $planner "block->max_entry_speed_sqr = block->entry_speed_sqr" "replanning preserves prepared predecessor entry speed"
+Require-Text $planner "ScaraKinematics_InverseUmToPulse" "segment preparation performs SCARA IK"
+Require-Text $planner "validate_and_limit_path" "SCARA joint limits are applied before look-ahead"
+Require-Text $planner "rate_limited_segment_count" "dense step segments are shortened and diagnosed"
+Require-Text $planner "max_refill_gap_ms" "segment refill latency is diagnosed"
+Require-Text $planner "final unknown-successor" "segment prep preserves streamed junction context"
+Forbid-Text $planner "pps_quantum|dv1|dv2" "segment prep does not reject planned blocks by adjacent PPS delta"
+Require-Text $planner "dwell_p1 = s_last_segment_valid" "dwell barriers hold the last prepared endpoint"
+Require-Text $planner "MOTION_LASER_DYNAMIC" "planner supports dynamic laser mode"
+Require-Text $gcode "line\[1\].*'J'" "G-code parser supports GRBL jog"
+Require-Text $gcode "GcodeStream_PlannerFree" "parser exposes planner backpressure"
+Require-Text $gcode "MPos:" "status reports MPos"
+Require-Text $gcode "JPos:" "status reports JPos"
+Require-Text $gcode "Q:" "status reports planner occupancy"
+Require-Text $gcode "E:" "status reports stepper error bits"
+Require-Text $gcode "Seg:" "status reports segment diagnostics"
+Require-Text $gcode "Pf:" "status reports planner preparation faults"
+Require-Text $gcode "Rl:" "status reports adaptive segment rate limiting"
+Require-Text $gcode "Pg:" "status reports maximum segment refill gap"
+Require-Text $gcode "HS:" "status reports homing state"
+Require-Text $gcode "A1:" "status reports axis 1 diagnostics"
+Require-Text $gcode "A2:" "status reports axis 2 diagnostics"
+Require-Text $gcode "Lz:" "status reports laser diagnostics"
+Require-Text $gcode "is_home_sim_command" "G-code `$H supports simulated homing"
+Require-Text $gcode "s_home_pending_ack" "formal homing ACK waits for completion"
+Require-Text $gcode "if \(MotionPlanner_IsBusy\(\)\)" "formal homing rejects pending planner motion"
+Require-Text $appMain "homing_active" "normal G-code pauses while homing"
+Require-Text $appMain "GcodeStream_HomeAckPending" "normal G-code waits for final homing ACK"
+Require-Text $appMain "SerialDma_TxFreeCount\(\) == 0u" "normal G-code waits for an ACK TX slot"
+Require-Text $appMain "for \(;;\)" "main loop fills the planner before segment preparation"
+Require-Text $homeController "HOME_ERR_SWITCH_ACTIVE" "real homing rejects already-active HOME switches"
+Require-Text $protocol "ERR HOME_SWITCH_ACTIVE" "text HOME reports active switch precheck"
+Require-Text $serial "0x85u" "Jog Cancel bypasses normal parser"
+Require-Text $stepper "TIM1->CR1 \|= TIM_CR1_CEN" "TIM1 emits non-blocking one-pulse STEP"
+Require-Text $stepper "TIM4->CR1 \|= TIM_CR1_CEN" "TIM4 emits non-blocking one-pulse STEP"
+Require-Text $stepper "__HAL_TIM_SET_AUTORELOAD\(BOARD_TICK_TIM" "TIM2 uses variable step-event periods"
+Forbid-Text $stepper "delay_us\(APP_STEPPER_PULSE" "STEP pulse width does not block the ISR"
+Require-Text $timer "TIM_OCPOLARITY_LOW" "one-pulse polarity matches common-anode driver"
+Require-Text $irq "App_Tick1kHz\(\)" "millisecond safety/status work runs from SysTick"
+Require-Text $uiMotion 'load_gcode_job\(\["\$HS"\]\)' "UI simulated homing uses formal GRBL queue"
+Require-Text $uiMotion 'load_gcode_job\(\["\$H"\]\)' "UI real homing uses formal GRBL queue"
+Require-Text $uiSerial "_line_requires_homing" "UI distinguishes motion from setup and homing commands"
+Require-Text $uiSerial "_preflight_motion_path" "UI preflights every formal motion path"
+Require-Text $uiSerial "_line_is_long_running" "UI isolates long-running homing commands"
+Require-Text $uiSerial "_abort_stalled_stream" "UI can recover a stuck ACK stream"
+Require-Text $uiSerial "return 64, 224" "UI uses a fixed GRBL character-counting window"
+Require-Text $uiSerial "previous_fault_count is not None" "UI establishes a planner-fault baseline"
+Require-Text $uiUtility "Manual motion G-code is blocked" "manual text motion cannot bypass path preflight"
+Require-Text $uiSerial "hs=.*he=.*en=.*pps=.*h=" "UI STATUS parser exposes homing diagnostics"
+Require-Text $uiSerial '\$110=' "UI syncs selected speed cap"
+Require-Text $uiSerial '\$120=' "UI syncs selected acceleration"
+Require-Text $uiSerial '\$11=' "UI syncs junction deviation"
+Require-Text $uiMotion 'self\.ser\.write\(b"\\x18"\)' "UI stop uses GRBL Ctrl-X"
+Require-Text $uiMotion "generate_stroke_motion" "writing uses compact geometry motion"
+Require-Text $uiMotion 'yield "G4 P0\.001"' "writing stroke transitions use exact-stop barriers"
+Require-Text $uiMotion "HANDWRITING_CORNER_RADIUS_MM = 0\.0" "handwriting preserves sharp G1 corners"
+Require-Text $uiMotion "TEXT_CORNER_RADIUS_MM = 0\.0" "text outlines preserve sharp G1 corners"
+Require-Text $uiMotion "safe non-zero transition speed" "writing uses GRBL junction speed at sharp corners"
+Require-Text $uiMotion "Iterative RDP" "long writing simplification is non-recursive"
+Require-Text $uiMotion "CountedCommandStream" "writing commands remain lazy with known progress"
+Require-Text $uiMotion "_qt_path_contours" "text preserves semantic LineTo and CurveTo boundaries"
+Forbid-Text $uiMotion "toSubpathPolygons" "text no longer loses corner semantics in polygon flattening"
+Require-Text $uiSerial "mcu_planner_capacity" "UI uses the expanded controller planner capacity"
+Require-Text $uiSerial 'mcu_planner_free \+ int\(q_match\.group\(1\)\)' "UI derives planner capacity from live status"
+Forbid-Text $uiMotion "tuple\(self\._iter_stroke_geometry_gcode" "writing stream is not fully materialized"
+Require-Text $uiMotion "CAR_CORNER_RADIUS_MM = 0\.0" "car outline preserves sharp control points"
+Require-Text $uiMotion "PATH_SIMPLIFY_TOLERANCE_MM = 0\.0" "writing does not delete input control points"
+Forbid-Text $uiMotion "_should_linearize_geometry_arc|_sample_linearized_arc_points" "true arcs are not rewritten as short G1 blocks"
+Require-Text $uiMotion 'yield "G4 P0\.001"' "geometry connectors settle at their exact start point"
+Require-Text $planner "distance_mm >= block->length_mm" "planner final segments use exact Cartesian endpoints"
+Require-Text $uiPlotting "required\.update\(index for index, point in enumerate\(path\)" "preview decimation preserves geometry endpoints"
+Require-Text $uiMixin "self\._append_event_point\(event\)" "handwriting records the release endpoint"
+Require-Text $uiLookAhead '0\.5 \* \(1\.0 \+ dot\)' "UI junction half-angle matches GRBL"
+Require-Text $uiSender "motion_profile_sync_requested" "motion profile precedes geometry stream"
+Forbid-Text $uiProtocol "checksum|cs=" "UI ACK parser has no legacy checksum protocol"
+Forbid-Text $uiSerial "process_host_segment|last_sent_cs|expected_checksum|rx_checksum" "UI sender has no old host-timed ACK state"
+Forbid-Text $uiMotion '_segment_joint_feed_cap|_path_joint_accel_cap_mm_s2|yield "G61"|yield "G64"' "UI leaves writing transition speed to the MCU planner"
+Forbid-Text $uiVision "generate_binary" "vision path uses the GRBL stream"
+Forbid-Text $cmake "binary_traj\.c" "BinaryTraj is removed from firmware build"
 
-$binaryTraj = Join-Path $projectRoot "UserApp\binary_traj.c"
-Require-Text $binaryTraj "(?s)void BinaryTraj_Loop\(void\)\s*\{.*service_motion\(\);" "binary trajectory preparation and dispatch run in the main loop"
-Require-Text $binaryTraj "ScaraKinematics_InverseUmToPulse" "binary Cartesian targets use direct high-precision inverse kinematics"
-Require-Text $binaryTraj "ScaraKinematics_PulseToPose" "binary Cartesian feedback uses direct pulse-to-pose kinematics"
-Require-Text $binaryTraj "(?s)void BinaryTraj_Tick10kHz\(void\)\s*\{.*update_stream_underrun_10khz\(\);" "binary trajectory 10 kHz tick only updates runtime diagnostics"
-Require-Text $binaryTraj "(?s)void BinaryTraj_Tick10kHz\(void\)\s*\{(?!.*Stepper_MoveAbs)" "binary trajectory 10 kHz tick does not start stepper moves"
-Require-Text $binaryTraj "Stepper_IsBusy\(\) \|\| s_run_requested \|\| s_state == BINARY_TRAJ_STATE_RUNNING" "binary trajectory rejects BEGIN while running between segments"
-Require-Text $binaryTraj "uint8_t payload\[32\]" "binary status includes interpolation diagnostics"
-Require-Text $binaryTraj "exit1 = v1 < nv1 \? v1 : nv1" "binary trajectory blends exit speed against next segment"
-Require-Text $binaryTraj "s_stream_underrun_count" "binary trajectory counts distinct stream underruns"
-Require-Text $binaryTraj "s_stream_underrun_active_ticks" "binary trajectory separates consecutive underrun timeout from cumulative diagnostics"
-Require-Text $binaryTraj "s_accepted_count < s_total_expected && s_count < s_min_buffer_count" "binary low-water excludes expected final queue drain"
-Require-Text $binaryTraj "static volatile BinaryTrajState s_state" "binary ISR-shared state is volatile"
-Require-Text $binaryTraj "static volatile bool s_run_requested" "binary ISR-shared run request is volatile"
-Require-Text $binaryTraj "void BinaryTraj_GetSnapshot" "binary diagnostics provide an atomic snapshot"
-Require-Text $binaryTraj "s_count < required_prefill" "binary trajectory waits for minimum prefill before RUN"
-Require-Text $binaryTraj "APP_BINARY_TRAJ_MIN_PREFILL" "binary trajectory uses configured minimum prefill"
-Require-Text $binaryTraj "BT_POINT_FLAG_HOST_TIMED" "binary trajectory supports buffered host-timed segments"
-Require-Text $binaryTraj "Stepper_CanQueueTimedSegment\(\)" "binary host-timed segments prefill the step FIFO"
-Require-Text $binaryTraj "Stepper_MoveAbsTicks\(point->p1_abs, point->p2_abs, point->v_dom_pps\)" "binary host-timed segments execute through timed DDA"
-Require-Text $binaryTraj "s_max_dispatch_gap_ticks = 1u" "binary dispatch gap reports queue handoff ticks instead of segment duration"
-Require-Text $binaryTraj "(?s)s_frame_type == BT_TYPE_ABORT.*BinaryTraj_Stop\(\).*MotionPlanner_Stop\(\)" "binary abort stops active and prefetched step segments"
+if (Test-Path (Join-Path $root "UserApp\binary_traj.c")) { Fail "binary_traj.c still exists" } else { Pass "binary_traj.c deleted" }
+if (Test-Path (Join-Path $root "UserApp\binary_traj.h")) { Fail "binary_traj.h still exists" } else { Pass "binary_traj.h deleted" }
 
-$gcodeStream = Join-Path $projectRoot "UserApp\gcode_stream.c"
-Require-Text $gcodeStream "ScaraKinematics_InverseUmToPulse" "G-code targets use direct high-precision inverse kinematics"
-Require-Text $gcodeStream "ScaraKinematics_PulseToPose" "status feedback uses direct pulse-to-pose kinematics"
-Require-Text $gcodeStream "JU:%lu,%lu,%u,%lu" "ASCII status reports binary trajectory underrun diagnostics"
-Require-Text $gcodeStream "Sq:%u,%u" "ASCII status reports step segment queue occupancy"
-Require-Text $gcodeStream "IC:%lu" "ASCII status reports maximum control ISR cycles"
-Require-Text $gcodeStream "BinaryTraj_GetSnapshot\(&traj\)" "ASCII status uses one coherent binary trajectory snapshot"
-Require-Text $gcodeStream "SerialDma_RxFreeBytes\(\)" "ASCII status reports RX byte capacity"
-
-$appMain = Join-Path $projectRoot "UserApp\app_main.c"
-Require-Text $appMain "DWT->CYCCNT - tick_start" "control tick measures execution cycles with DWT"
-Require-Text $appMain "s_max_tick_cycles" "control tick retains worst observed execution time"
-Require-Text $appMain "(?s)while \(SerialDma_ReadRealtime\(&realtime\)\).*if \(SerialDma_ReadLine\(line, sizeof\(line\)\)\)" "main loop prioritizes realtime commands and bounds normal line processing"
-
-$serialDma = Join-Path $projectRoot "UserApp\serial_dma.c"
-Require-Text $serialDma "static bool enqueue_realtime\(char ch\)" "serial parser has a realtime bypass queue"
-Require-Text $serialDma "bool SerialDma_ReadRealtime\(char \*out\)" "main loop can drain realtime characters separately"
-
-$stepper = Join-Path $projectRoot "UserApp\stepper_driver.c"
-Require-Text $stepper "(?s)bool Stepper_MoveAbsBlend.*s_move\.counter\[0\] = events >> 1;.*s_move\.event_accum = 0;" "ordinary DDA resets old segment phase before a new move"
-Require-Text $stepper "DWT->CTRL \|= DWT_CTRL_CYCCNTENA_Msk" "step timing enables the Cortex-M3 DWT cycle counter"
-Require-Text $stepper "DWT->CYCCNT - start" "step timing uses cycle-counted microsecond delays"
-Require-Text $stepper "delay_us\(APP_STEPPER_PULSE_LOW_US\)" "step pulse includes bounded low-level recovery"
-Require-Text $stepper "emit_step_mask\(step_mask\)" "multi-axis DDA emits one grouped pulse event"
-Require-Text $stepper "step_mask \|= \(uint8_t\)\(1u << i\)" "DDA accumulates simultaneous axis step bits before output"
-Require-Text $stepper "s_timed_segments\[APP_STEPPER_TIMED_SEGMENTS\]" "stepper has a timed segment FIFO"
-Require-Text $stepper "timed_queue_pop\(&next\)" "stepper performs ISR-side queue-to-queue handoff"
-Require-Text $stepper "timed_move_start_locked\(next\.pos1, next\.pos2, next\.duration_ticks\)" "ISR handoff starts timed segment without public API interrupt restore"
-Require-Text $stepper "s_move\.host_timed && s_timed_count < APP_STEPPER_TIMED_SEGMENTS" "stepper accepts timed prefetch while running"
-Require-Text $gcodeStream "block->timed \? Stepper_CanQueueTimedSegment\(\) : Stepper_CanAcceptMove\(\)" "G-code dispatch only prefetches timed segments"
-Require-Text $gcodeStream "(?s)if \(line\[0\] == '!'\).*BinaryTraj_Stop\(\).*MotionPlanner_Stop\(\)" "real-time hold stops buffered binary motion"
-Require-Text $gcodeStream "(?s)line\[0\] == 0x18u\).*BinaryTraj_Stop\(\).*MotionPlanner_Stop\(\)" "soft reset stops buffered binary motion"
-
-Write-Host "== Build Rules and VS Code =="
-$cmake = Join-Path $projectRoot "CMakeLists.txt"
-Require-Text $cmake "-O ihex" "CMake generates hex"
-Require-Text $cmake "-O binary" "CMake generates bin"
-Require-Text $cmake "UserApp/gcode_stream\.c" "CMake builds gcode stream"
-Require-Text $cmake "UserApp/binary_traj\.c" "CMake builds binary joint trajectory"
-Require-Text $cmake "UserApp/home_controller\.c" "CMake builds home controller"
-Require-Text $cmake "UserApp/home_sensor\.c" "CMake builds home sensor"
-Require-Text $cmake "(?s)^(?!.*UserApp/pulse_protocol\.c)" "CMake does not build old pulse protocol"
-Require-Text $cmake "(?s)^(?!.*UserApp/trajectory\.c)" "CMake does not build old trajectory queue"
-Require-Text $cmake "(?s)^(?!.*UserApp/teach\.c)" "CMake does not build old teach module"
-Require-File (Join-Path $projectRoot ".vscode\tasks.json")
-Require-File (Join-Path $projectRoot ".vscode\launch.json")
-Require-File (Join-Path $projectRoot ".vscode\settings.json")
-Require-File (Join-Path $projectRoot "Run_Serial_Test.bat")
-Require-File (Join-Path $projectRoot "Run_COM13_HostPlanned_3000.bat")
-Require-File (Join-Path $projectRoot "tools\serial_link_check.ps1")
-Require-File (Join-Path $projectRoot "tools\home_sensor_check.ps1")
-Require-File (Join-Path $projectRoot "tools\gcode_stream_check.ps1")
-Require-File (Join-Path $projectRoot "tools\buffered_stream_capability_check.ps1")
-Require-File (Join-Path $projectRoot "tools\gcode_burst_no_motion_check.ps1")
-Require-Text (Join-Path $projectRoot "tools\gcode_burst_no_motion_check.ps1") "Realtime status did not bypass normal burst ACKs" "no-motion burst check verifies realtime priority"
-Require-File (Join-Path $projectRoot "tools\flash_and_verify_buffered.ps1")
-Require-File (Join-Path $projectRoot "tools\binary_joint_traj_stress.ps1")
-Require-File (Join-Path $projectRoot "tools\ui_binary_line_stress.ps1")
-Require-File (Join-Path $projectRoot "tools\ui_binary_car_stress.ps1")
-Require-File (Join-Path $projectRoot "tools\feedback_error_stress.ps1")
-Require-File (Join-Path $projectRoot "tools\analyze_feedback_error_csv.ps1")
-Require-File (Join-Path $projectRoot "tools\sweep_binary_feedback_error.ps1")
-Require-File (Join-Path $projectRoot "tools\simulate_binary_interpolator.ps1")
-Require-File (Join-Path $projectRoot "tools\final_validation.ps1")
-Require-File (Join-Path $projectRoot "tools\host_planned_stream_stress.ps1")
-Require-File (Join-Path $projectRoot "tools\ui_control_matrix_check.ps1")
-Require-File (Join-Path $projectRoot "tools\ui_trajectory_stress.ps1")
-$autoPortTools = @(
-    "buffered_stream_capability_check.ps1",
-    "gcode_burst_no_motion_check.ps1",
-    "final_validation.ps1",
-    "binary_joint_traj_stress.ps1",
-    "serial_link_check.ps1",
-    "ui_trajectory_stress.ps1",
-    "ui_control_matrix_check.ps1"
-)
-foreach ($tool in $autoPortTools) {
-    Require-Text (Join-Path $projectRoot "tools\$tool") "ports = @\(" "AUTO port selection preserves a one-port result as an array: $tool"
+if ($failures -gt 0) {
+    throw "VERIFY_PROJECT failed: $failures checks"
 }
-$capabilityCheck = Join-Path $projectRoot "tools\buffered_stream_capability_check.ps1"
-Require-Text $capabilityCheck "Status is missing maximum control ISR cycle telemetry IC" "buffered capability check requires ISR cycle telemetry"
-Require-Text $capabilityCheck "maxTickCycles -ge 7200" "buffered capability check enforces the 10 kHz ISR cycle budget"
-Require-DocFile "..\SCARA_UI\V_monitor.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\V_monitor.py"
-Require-DocFile "..\SCARA_UI\tests\trajectory_planner_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\trajectory_planner_check.py"
-Require-DocFile "..\SCARA_UI\tests\sender_strategy_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\sender_strategy_check.py"
-Require-DocFile "..\SCARA_UI\tests\sender_benchmark_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\sender_benchmark_check.py"
-Require-DocFile "..\SCARA_UI\tests\feedback_error_check.py" "C:\Users\22602\Desktop\SCARA\SCARA_UI\tests\feedback_error_check.py"
-
-$senders = Join-Path $projectRoot "..\SCARA_UI\communication\motion_senders.py"
-Require-Text $senders "class AsciiLegacyG1Sender" "UI defines legacy G-code sender strategy"
-Require-Text $senders "class BufferedBinarySender" "UI defines buffered binary sender strategy"
-Require-Text $senders "class HostTimedSegmentSender" "UI defines host timed sender strategy"
-$uiMixin = Join-Path $projectRoot "..\SCARA_UI\ui\ui_mixin.py"
-Require-Text $uiMixin "lbl_sender_mode" "UI displays active sender mode and statistics"
-$senderStrategy = Join-Path $projectRoot "..\SCARA_UI\tests\sender_strategy_check.py"
-Require-Text $senderStrategy "check_cartesian_jog_roundtrip" "UI regression suite verifies Cartesian jog pulse closure"
-Require-Text $senderStrategy "check_feedback_mode_does_not_change_motion_state" "UI regression suite verifies plot mode cannot change motion state"
-
-$binaryStress = Join-Path $projectRoot "tools\binary_joint_traj_stress.ps1"
-Require-Text $binaryStress "BINARY_JOINT_DIAG" "binary trajectory stress reports underrun diagnostics"
-Require-Text $binaryStress "ppr1=\(\\d\+\) ppr2=\(\\d\+\)" "binary trajectory stress reads both controller PPR values"
-Require-Text $binaryStress "Build-ExpectedTrajectory" "binary trajectory stress builds expectations after reading controller capabilities"
-Require-Text $binaryStress "flags = 0x0004" "binary trajectory stress can exercise host-timed segments"
-Require-Text $binaryStress "AUTO requires exactly one serial port" "binary trajectory stress supports AUTO serial selection"
-Require-Text $binaryStress "state -eq 4\) \{ break" "binary trajectory stress waits for controller Done before disabling"
-Require-Text $binaryStress "underrunTicks -ne 0" "binary trajectory stress fails on stream underrun"
-Require-Text $binaryStress "maxTickCycles -ge 7200" "binary trajectory stress enforces the active-motion ISR cycle budget"
-Require-Text $binaryStress "Final pulse mismatch" "binary trajectory stress enforces the final pulse endpoint"
-$flashVerify = Join-Path $projectRoot "tools\flash_and_verify_buffered.ps1"
-Require-Text $flashVerify "interface/stlink\.cfg.*interface/cmsis-dap\.cfg" "flash verification auto-tries ST-Link and CMSIS-DAP"
-
-Write-Host "== Documentation =="
-Require-DocFile "..\Version.md" "C:\Users\22602\Desktop\SCARA\Version.md"
-Require-DocFile "..\Control.md" "C:\Users\22602\Desktop\SCARA\Control.md"
-Require-DocFile "..\Work.md" "C:\Users\22602\Desktop\SCARA\Work.md"
-
-if ($failures -eq 0) {
-    Write-Host "VERIFY PASS"
-    exit 0
-}
-
-Write-Host "VERIFY FAIL failures=$failures"
-exit 1
+Write-Host "VERIFY_PROJECT PASS"

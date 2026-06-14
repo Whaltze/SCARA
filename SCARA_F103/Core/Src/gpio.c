@@ -52,6 +52,16 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, M1_DIR_Pin|M1_ENA_Pin|M2_DIR_Pin|M2_ENA_Pin, GPIO_PIN_SET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LASER_RELAY_GPIO_Port, LASER_RELAY_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : LASER_RELAY_Pin */
+  GPIO_InitStruct.Pin = LASER_RELAY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LASER_RELAY_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pins : M1_DIR_Pin M2_DIR_Pin */
   GPIO_InitStruct.Pin = M1_DIR_Pin|M2_DIR_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
