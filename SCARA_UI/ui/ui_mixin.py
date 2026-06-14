@@ -1,4 +1,4 @@
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+﻿from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from PySide6.QtWidgets import (
@@ -517,6 +517,14 @@ class ScaraUiMixin:
         self.btn_vision_trace = QPushButton("🎨 启动视觉循迹轨迹")
         self.btn_vision_trace.setStyleSheet("background-color: #9b59b6; color: white; font-weight: bold;")
         v_grid.addWidget(self.btn_vision_trace, 8, 0, 1, 6)
+        self.btn_capture_click = QPushButton("🎯 画面点击捕获")
+        self.btn_capture_click.setCheckable(True)
+        self.btn_capture_click.setStyleSheet(
+            "QPushButton { background-color: #555; color: #ccc; font-weight: bold; padding: 4px; border-radius: 3px; }"
+            "QPushButton:checked { background-color: #4CAF50; color: white; }"
+        )
+        self.btn_capture_click.setToolTip("开启后在摄像头画面上点击来设定目标点")
+        v_grid.addWidget(self.btn_capture_click, 9, 0, 1, 6)
         vision_group.setLayout(v_grid)
         mid_panel.addWidget(vision_group)
         
@@ -527,6 +535,7 @@ class ScaraUiMixin:
         self.color_sel.currentTextChanged.connect(self.update_v_params)
         self.thresh_sel.currentTextChanged.connect(self.update_v_params)
         self.btn_vision_trace.clicked.connect(self.plan_vision_trajectory)
+        self.btn_capture_click.toggled.connect(self.on_capture_mode_toggled)
 
         laser_group = QGroupBox("激光加工")
         laser_grid = QGridLayout()
