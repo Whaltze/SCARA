@@ -41,5 +41,7 @@ grbl-1.1h.20190825/
 # ========================
 .DS_Store
 Thumbs.db
-
+.codex
+.claude
 SOURCE/
+CLAUDE.md
