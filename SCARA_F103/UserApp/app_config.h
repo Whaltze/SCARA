@@ -10,7 +10,7 @@
 
 /* Firmware identity shown by VERSION. */
 #define APP_FW_NAME "SCARA_F103"
-#define APP_FW_VERSION "0.29.10-grbl-scara"
+#define APP_FW_VERSION "0.29.9-grbl-scara"
 
 /* Current controller drives two stepper axes. */
 #define APP_AXIS_COUNT 2u

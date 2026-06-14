@@ -416,7 +416,6 @@ void MotionPlanner_Clear(void)
     s_prefill_wait_ms = 0u;
     s_last_segment_valid = false;
     s_preparation_fault_latched = false;
-    s_preparation_fault_count = 0u;  /* 软复位一并清零故障计数，避免上位机据残留 Pf 反复中止/重连。 */
 }
 
 void MotionPlanner_Stop(void)
@@ -684,10 +683,10 @@ void MotionPlanner_Loop(void)
              */
             int64_t dwell_p1 = s_last_segment_valid
                                    ? s_last_segment_p1
-                                   : state.axis[0].position_pulse;
+                                   : state.axis[0].target_position_pulse;
             int64_t dwell_p2 = s_last_segment_valid
                                    ? s_last_segment_p2
-                                   : state.axis[1].position_pulse;
+                                   : state.axis[1].target_position_pulse;
             uint32_t slice_ms = s_prep.dwell_remaining_ms > APP_GRBL_SEGMENT_MS
                                     ? APP_GRBL_SEGMENT_MS
                                     : s_prep.dwell_remaining_ms;
@@ -754,10 +753,8 @@ void MotionPlanner_Loop(void)
         Stepper_GetStateSnapshot(&state);
         uint32_t max_ticks = APP_GRBL_SEGMENT_MS * APP_CONTROL_HZ / 1000u;
         uint32_t ticks = max_ticks;
-        /* 中断/急停后 target_position_pulse 仍停在被打断的旧目标，position_pulse 才是电机真实停点。
-         * 新流首段必须以真实停点为脉冲基准，否则首段脉冲增量=未走完的整段距离，会误触发 preparation_fault。 */
-        int64_t base1 = s_last_segment_valid ? s_last_segment_p1 : state.axis[0].position_pulse;
-        int64_t base2 = s_last_segment_valid ? s_last_segment_p2 : state.axis[1].position_pulse;
+        int64_t base1 = s_last_segment_valid ? s_last_segment_p1 : state.axis[0].target_position_pulse;
+        int64_t base2 = s_last_segment_valid ? s_last_segment_p2 : state.axis[1].target_position_pulse;
         if (final_segment) {
             next_speed = exit_speed;
         }

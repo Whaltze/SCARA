@@ -1,24 +1,5 @@
 # SCARA_F103 Version Log
 
-## 2026-06-14 v0.29.10 Fault-stop recovery and position re-anchor
-
-- Fix a lockup: after a boundary/edge move (or a Stop during streaming), every subsequent
-  motion — even a simple jog — was rejected with `error:15` until homing or a power cycle.
-- Root cause: segment preparation used `target_position_pulse` as the first-segment pulse
-  base, but an interrupted/decelerated stop leaves that at the old (unreached) target while
-  `position_pulse` holds the true stop point. The first segment's pulse delta then equals the
-  unfinished span and never shrinks, repeatedly forcing `preparation_fault` (latched →
-  `error:15` on every following block).
-- `MotionPlanner_Loop` now bases the first segment of a new stream (line and dwell) on
-  `position_pulse` (true machine position) instead of `target_position_pulse`.
-- The Ctrl-X (`0x18`) soft-reset path now re-anchors the parser via
-  `resync_parser_to_stepper_if_diverged()` (matching the `0x85` / coordinate-set paths), so the
-  parser position no longer lags the real stop point after an interrupted move.
-- `MotionPlanner_Clear()` now also clears `s_preparation_fault_count`, so the host no longer
-  re-aborts on a stale `Pf` after a soft reset.
-- Net effect: the “停止(清除队列)” button (Ctrl-X) is a reliable one-press recovery, and normal
-  streaming no longer deadlocks on a stale base. UI unchanged.
-
 ## 2026-06-14 Custom-pattern dropdown: SVG line art + image halftone (UI only)
 
 - "固定轨迹 → 自定义轨迹" dropdown now auto-scans `SCARA_UI/trajectory/patterns/`:

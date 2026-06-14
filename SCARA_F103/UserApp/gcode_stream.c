@@ -744,9 +744,6 @@ bool GcodeStream_TryProcessLine(const char *line)
         HomeController_ClearError();
         Stepper_StopAll();
         Stepper_ClearError();
-        /* 软复位后把解析器位置重锚到电机真实停点（与 0x85/坐标设定路径一致）；
-         * 否则中断停车后 s_gc 仍停在旧目标，下一条运动准备阶段会立即 preparation_fault。 */
-        resync_parser_to_stepper_if_diverged();
         s_hold = 0u;
         return true;
     }
