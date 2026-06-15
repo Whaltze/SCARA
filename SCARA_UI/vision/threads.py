@@ -16,8 +16,8 @@ class CameraThread(QThread):
     def run(self):
         self.running = True
         self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_DSHOW)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         while self.running:
             ret, frame = self.cap.read()
             if ret:
@@ -35,9 +35,10 @@ class CameraThread(QThread):
 class ImageProcessingThread(QThread):
     processed_frame_ready = Signal(object)
     
-    def __init__(self, cam_proc):
+    def __init__(self, cam_proc, coord_proc=None):
         super().__init__()
         self.cam_proc = cam_proc
+        self.coord_proc = coord_proc
         self.current_frame = None
         self.running = True
         self.color_detection = True
@@ -93,9 +94,16 @@ class ImageProcessingThread(QThread):
                         cy = int(M["m01"] / M["m00"])
                         cv2.drawMarker(frame_rgb, (cx, cy), (0, 0, 255),
                                        cv2.MARKER_CROSS, 10, 2)
-                        cv2.putText(frame_rgb, f"({cx},{cy})", (cx + 10, cy - 8),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                                    (255, 255, 255), 1, cv2.LINE_AA)
+                        # --- 用标定矩阵转换坐标显示 ---
+                        if self.coord_proc and self.coord_proc.is_calibrated:
+                            rx, ry = self.coord_proc.pixel_to_robot(cx, cy)
+                            cv2.putText(frame_rgb, f"({rx:.1f},{ry:.1f})", (cx + 10, cy - 8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                                        (0, 255, 255), 1, cv2.LINE_AA)
+                        else:
+                            cv2.putText(frame_rgb, f"({cx},{cy})", (cx + 10, cy - 8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
         if self.edge_detection:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray, 100, 200)
