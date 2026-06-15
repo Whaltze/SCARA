@@ -19,6 +19,8 @@ typedef struct {
     int32_t ik_left_elbow_sign;
     int32_t ik_right_elbow_sign;
     int32_t movl_segment_um;
+    /* 每电机反向间隙补偿脉冲（换向时多发脉冲吃旷量；0=不补偿）。 */
+    int32_t backlash_pulses[2];
 } AppParams;
 
 void AppParams_Init(void);

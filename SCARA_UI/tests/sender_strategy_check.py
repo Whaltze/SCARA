@@ -114,6 +114,7 @@ def check_appended_motion_keeps_formal_preamble():
     owner.motion_preamble_needed = True
     owner.laser_preamble_needed = True
     owner.laser_task_active = True
+    owner.laser_trajectory_mode = True
     GRBL_GCODE_SENDER.send(owner, ["G1 X1 Y2 F1200"], append=True)
     lines = []
     while owner.point_queue:
@@ -124,7 +125,7 @@ def check_appended_motion_keeps_formal_preamble():
         "$100=6400 $101=6400",
         "$X",
         "M17",
-        "M4 S250",
+        "M3 S250",
         "G1 X1 Y2 F1200",
         "M5",
     ]
@@ -138,6 +139,7 @@ def check_motion_profile_precedes_laser_and_geometry():
         motion_profile_sync_requested = True
         laser_preamble_needed = True
         laser_task_active = True
+        laser_trajectory_mode = True
         active_preview_path = []
 
         def _sender_now(self):
@@ -169,7 +171,7 @@ def check_motion_profile_precedes_laser_and_geometry():
         "$110=1200",
         "$120=80",
         "$11=20",
-        "M4 S250",
+        "M3 S250",
         "G1 X1 Y2 F1200",
         "M5",
     ]

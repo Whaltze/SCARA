@@ -205,8 +205,8 @@ class ScaraVisionMixin:
         if not path:
             self.log_error("单点轨迹生成失败")
             return
-        send_path = self.generate_binary_send_from_path(path, spd)
-        self.load_motion_queue(path, send_path=send_path)
+        # 走正式 GRBL 流式链路（与全局一致）；BinaryTraj 已退役。
+        self.load_motion_queue(path)
 
     def plan_click_trajectory(self):
         """根据已捕获的点击点规划运动轨迹。
@@ -246,8 +246,8 @@ class ScaraVisionMixin:
         # 自动装载轨迹到运动队列
         route_points = [(self.cur_x, self.cur_y)] + robot_pts
         path = self.generate_polyline_path(route_points, spd, silent_first=True)
-        send_path = self.generate_binary_send_from_path(path, spd)
-        self.load_motion_queue(path, send_path=send_path)
+        # 走正式 GRBL 流式链路（与全局一致）；BinaryTraj 已退役。
+        self.load_motion_queue(path)
 
         return trajectory
 

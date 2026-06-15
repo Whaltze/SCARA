@@ -88,9 +88,11 @@ def _job_commands(owner, source, include_preamble):
     if include_preamble and getattr(owner, "motion_profile_sync_requested", False):
         preamble.extend(getattr(owner, "_motion_profile_preamble", lambda: ())())
         owner.motion_profile_sync_requested = False
-    if include_preamble and getattr(owner, "laser_task_active", False):
+    if include_preamble and getattr(owner, "laser_trajectory_mode", False):
         power = int(getattr(owner, "_laser_s_word", lambda: 200)())
-        preamble.append(f"M4 S{power}")
+        # 恒功率(M3)而非动态(M4)：激光按继电器硬开关做抬笔落笔，PWM 只设功率。
+        # 动态功率在 exact-stop 拐角/驻点速度→0 时功率为 0 会掉光，且本机 PWM 最小仍出光。
+        preamble.append(f"M3 S{power}")
         epilogue.append("M5")
         owner.laser_preamble_needed = False
     return chain(preamble, source, epilogue)

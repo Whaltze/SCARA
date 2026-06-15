@@ -108,6 +108,7 @@ class FiveBarSerialGUI(
         self.motion_preamble_needed = True
         self.motion_profile_sync_requested = False
         self.laser_task_active = False
+        self.laser_trajectory_mode = False
         self.laser_preamble_needed = False
         self.laser_power_permille = 10
         self.laser_arm_sent_at = 0.0

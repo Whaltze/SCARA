@@ -47,16 +47,11 @@ class ScaraSerialMixin:
         return max(0, min(1000, int(round(float(getattr(self, "laser_power_permille", 10)) * 20.0))))
 
     def _begin_laser_task_from_ui(self):
-        if getattr(self, "laser_task_active", False):
-            return True
-        if not self._laser_requested():
-            return False
-        if not (self.ser and self.ser.is_open):
-            self.log_error("激光加工使能已取消：串口未连接。")
-            self._reset_laser_task_ui()
+        """运行任务前：若开启了"激光轨迹模式"，标记需要下发激光描刻 preamble(M3/M5)。
+        是否真正出光由独立的"激光开启"(LASER ARM)决定；此处不 ARM、不强制串口。"""
+        if not getattr(self, "laser_trajectory_mode", False):
             return False
         self.laser_power_permille = self._laser_power_from_ui()
-        self.laser_task_active = True
         self.laser_preamble_needed = True
         self.motion_preamble_needed = True
         return True
@@ -83,6 +78,26 @@ class ScaraSerialMixin:
         if hasattr(button, "blockSignals"):
             button.blockSignals(blocked)
         self._set_laser_button_visual(bool(checked))
+
+    def _set_laser_traj_button_visual(self, enabled):
+        button = getattr(self, "laser_traj_toggle", None)
+        if button is None:
+            return
+        if hasattr(button, "setText"):
+            button.setText("激光轨迹模式: 开" if enabled else "激光轨迹模式: 关")
+        if hasattr(button, "setStyleSheet"):
+            color = "#e67e22" if enabled else "#34495e"
+            button.setStyleSheet(f"background-color: {color}; color: white; font-weight: bold;")
+
+    def on_laser_trajectory_mode_toggled(self, checked):
+        """激光轨迹模式开关：仅决定"运行轨迹是否按激光规则抬笔落笔"(发 M3/M6/M5)。
+        不直接 ARM 激光——是否真正出光由独立的"激光开启"(LASER ARM)硬件控制器决定。"""
+        self.laser_trajectory_mode = bool(checked)
+        self.laser_preamble_needed = bool(checked)
+        self.motion_preamble_needed = True
+        if checked:
+            self.laser_power_permille = self._laser_power_from_ui()
+        self._set_laser_traj_button_visual(bool(checked))
 
     def _write_laser_command(self, cmd):
         if not (self.ser and self.ser.is_open):
@@ -230,7 +245,24 @@ class ScaraSerialMixin:
                 f"$11={max(1, int(round(junction_deviation * 1000.0)))}",
             )
         )
+        # 反向间隙补偿(每电机脉冲)随运动任务下发，实现"设一次、每个任务自动生效"。
+        backlash = self._read_backlash_pulses()
+        if backlash is not None:
+            commands.extend((f"$160={backlash[0]}", f"$161={backlash[1]}"))
         self._pending_motion_profile = tuple(commands)
+
+    def _read_backlash_pulses(self):
+        """读取 UI 的每电机反向间隙补偿脉冲；非法/缺失则返回 None(不下发)。"""
+        try:
+            m1_widget = getattr(self, "backlash_m1_input", None)
+            m2_widget = getattr(self, "backlash_m2_input", None)
+            if m1_widget is None or m2_widget is None:
+                return None
+            m1 = max(0, int(round(float(m1_widget.text()))))
+            m2 = max(0, int(round(float(m2_widget.text()))))
+            return (m1, m2)
+        except (ValueError, TypeError):
+            return None
 
     def load_motion_gcode_job(self, commands, preview_path=None, append=False):
         """Queue geometry G-code with one GRBL motion profile per new task."""
@@ -368,7 +400,7 @@ class ScaraSerialMixin:
             path, send_path = prepared
             laser_enabled = None
         else:
-            laser_enabled = bool(getattr(self, "laser_task_active", False))
+            laser_enabled = bool(getattr(self, "laser_trajectory_mode", False))
         self.log_display.append(
             f"<font color='#bbbbbb'>mode=grbl_stream selected append={int(bool(append))} "
             f"preview_points={len(path)}</font>"
@@ -381,8 +413,10 @@ class ScaraSerialMixin:
 
     def _iter_path_gcode(self, path, laser_enabled=None):
         if laser_enabled is None:
-            laser_enabled = bool(getattr(self, "laser_task_active", False))
-        marking = bool(laser_enabled)
+            laser_enabled = bool(getattr(self, "laser_trajectory_mode", False))
+        # 落笔前继电器预合时长(秒)：吃掉继电器机械合闸延时，让标记起点不缺光。
+        prep_s = float(getattr(self, "LASER_RELAY_PREP_S", 0.12))
+        marking = False
         for point in path:
             x, y = self.ui_to_mcu_xy(float(point[0]), float(point[1]))
             feed = max(1, int(round(float(point[2])))) if len(point) > 2 else 300
@@ -390,8 +424,11 @@ class ScaraSerialMixin:
             wants_mark = bool(laser_enabled and not silent)
             if wants_mark != marking:
                 if wants_mark:
-                    yield f"M4 S{self._laser_s_word()}"
+                    # 落笔：恒功率 M3(拐角不掉光) + M6 预合继电器并 settle，再标记移动。
+                    yield f"M3 S{self._laser_s_word()}"
+                    yield f"M6 P{prep_s:.3f}"
                 else:
+                    # 抬笔：M5 让继电器真正断开(本机 PWM 最小仍出光，不能只靠 PWM)。
                     yield "M5"
                 marking = wants_mark
             if silent:

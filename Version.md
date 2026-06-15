@@ -1,5 +1,75 @@
 # SCARA_F103 Version Log
 
+## 2026-06-15 激光按钮拆分 + 描边落笔预合（仅 UI，固件维持 0.29.12）
+
+- 激光面板拆成两个独立按钮：
+  - **激光轨迹模式**(新增,上方)：总开关 `laser_trajectory_mode`，决定运行轨迹是否按激光规则抬笔落笔(发 M3/M6/M5)；关=普通轨迹。
+  - **激光开启**(原按钮,下方)：纯激光硬件控制器(LASER ARM/DISARM)，决定是否真正出光。
+- 标记门由 `laser_task_active`(=ARM) 改为 `laser_trajectory_mode`：`_iter_path_gcode`、`load_motion_queue`、
+  `motion_senders._job_commands` 的 M3/M6/M5 下发改看轨迹模式；`_begin_laser_task_from_ui` 重定为按轨迹模式
+  准备 preamble、不再 ARM。两者解耦：轨迹模式开+未 ARM = 完整抬笔落笔但不出光(安全干跑)。
+- SVG/文字描边路径(`_iter_stroke_geometry_gcode`)在轨迹模式开启时，每笔连接段后补发 `M6` 继电器预合，
+  消除该路径落笔起点缺光(此前只有采样点路径与点阵有预合)。命令计数同步更新。
+- `sender_strategy_check` 桩同步设 `laser_trajectory_mode`。固件无改动，`APP_FW_VERSION` 维持 0.29.12。
+
+## 2026-06-15 v0.29.12 激光继电器安全审查修复（继电器极性可配 + M3 恒功率 + 落笔预合）
+
+- 安全：继电器极性写死"高=吸合"。新增 `APP_LASER_RELAY_ACTIVE_LEVEL`(默认 1=高有效，与现硬件一致)，
+  `laser_control.c` 全部继电器写入改走 `relay_write()` 极性助手，`EarlySafeOutput` 按极性把继电器驱动到
+  "释放=激光断电"。fail-safe 前提：激光头接 COM/NO(常开)、勿用 NC；换低有效继电器板须改为 0 并按 Control.md 复测。
+- 抬笔落笔靠继电器硬开关（不靠 PWM）：实测 PWM 最小仍出光，故抬笔(travel)必须真正断开继电器。
+  保留"继电器随 mark/travel 通断"的设计；抬笔=M5/继电器断、落笔=继电器合。
+- 修复拐角/驻点掉光：描线与点阵由动态功率 `M4` 改为恒功率 `M3`。`M4` 动态功率 = 设定×(速度/额定)，
+  exact-stop 拐角与驻点速度→0 时功率算到 0 → `mark=false` → 拐角掉光、点阵驻点根本不出光；`M3` 不受速度影响。
+- 修复落笔起点滞后：新增 `M6 [P<秒>]` 落笔继电器预合 dwell，接通固件已有的 `MOTION_LASER_PREP`
+  （先合继电器、不出 PWM、settle 后再标记）。UI 在每次落笔前发 `M3 S` + `M6 P<settle>`；
+  点阵每点 `G0 → M3 S → M6 → G4(驻点出光) → M5`。预合时长 UI `LASER_RELAY_PREP_S`(默认 0.12s)/固件
+  `APP_LASER_RELAY_PREP_MS`(默认复用 `APP_LASER_RELAY_READY_MS`=100ms)。
+- 任务级 preamble 由 `M4 S` 改 `M3 S`；`sender_strategy_check` 期望同步更新。
+- 安全层不变且仍生效：1s 开机锁定、250ms 空闲解除、错误/Stop 强制 Disarm、双层(继电器+PWM)。
+
+## 2026-06-15 v0.29.11 反向间隙补偿（open-loop backlash compensation）
+
+- 现象：点动/描边换向时，开环关节先吃机械旷量（齿隙/联轴器/轴承）才带动末端，被长臂
+  放大为反向起步拐弧、往返本应重合的两条线偏移几毫米、走直角带弧度。
+- 审查结论：软件下发的往返路径在指令坐标里逐脉冲重合（点动是单行 exact-stop 直线、反向
+  锚点精确、换向有 6µs DIR 建立时间不丢步），残差是未补偿的电机侧机械反向间隙。
+- 方案：步进底层为每个电机加"换向补偿脉冲"。每轴维护"上次实际啮合方向"，当某段该轴行进
+  方向与之相反时，先以 `APP_BACKLASH_COMP_PPS` 定速多发 `backlash_pulses[i]` 个补偿脉冲吃旷量，
+  再走正常轨迹。补偿脉冲只多发给驱动器（`emit_step_mask`），**不改运动学位置 `position_pulse`、
+  不消耗段 events**，因此状态帧/规划/重锚不受影响。开机首段（啮合方向未知）不补偿。
+- 仅改一条实时路径：`Stepper_MoveAbsTicksLaserPower → timed_move_start_locked + dda_tick`
+  （分段 DDA，点动与全部 G-code 都走它）。`dda_tick` 顶部新增补偿相位（独立时基，发完恢复段
+  节拍）。回零的 `Stepper_MoveAbsBlend*` 只同步啮合方向、不注入补偿（单向、建立基准）。
+- 在线标定：`$160=<pulses>`（电机1）、`$161=<pulses>`（电机2），运动中拒绝（`error:8`）、越界
+  `error:4`；`$$` 已包含两值。换算 `pulses ≈ 旷量角(°) × PPR / 360`（PPR=6400 → 每脉冲≈0.056°）。
+- 参数：`AppParams.backlash_pulses[2]`（默认 0＝不补偿，行为不变）；`app_config.h` 新增
+  `APP_BACKLASH_PULSES_M1/_M2`、`APP_BACKLASH_COMP_PPS`(2000)、`APP_BACKLASH_MAX_PULSES`(400)；
+  `APP_PARAM_FLASH_VERSION` 6→7。沿用现有"UI 重连/每任务下发"持久化模式，未引入 flash 写。
+- UI：硬件控制面板新增「反向间隙 电机1/2(脉冲)」输入，随运动任务在 `$110/$120/$11` 后追加
+  `$160/$161` 下发。
+- 边界：只能补电机侧旷量，被动臂远端旷量需机械处理；换向处插入 `≈B/comp_pps` 秒补偿停顿
+  （B=30@2000pps≈15ms，exact-stop 拐角本就停车，符合策略）；`comp_pps` 过高可能空载丢步则调低。
+
+## 2026-06-14 v0.29.10 Fault-stop recovery and position re-anchor
+
+- Fix a lockup: after a boundary/edge move (or a Stop during streaming), every subsequent
+  motion — even a simple jog — was rejected with `error:15` until homing or a power cycle.
+- Root cause: segment preparation used `target_position_pulse` as the first-segment pulse
+  base, but an interrupted/decelerated stop leaves that at the old (unreached) target while
+  `position_pulse` holds the true stop point. The first segment's pulse delta then equals the
+  unfinished span and never shrinks, repeatedly forcing `preparation_fault` (latched →
+  `error:15` on every following block).
+- `MotionPlanner_Loop` now bases the first segment of a new stream (line and dwell) on
+  `position_pulse` (true machine position) instead of `target_position_pulse`.
+- The Ctrl-X (`0x18`) soft-reset path now re-anchors the parser via
+  `resync_parser_to_stepper_if_diverged()` (matching the `0x85` / coordinate-set paths), so the
+  parser position no longer lags the real stop point after an interrupted move.
+- `MotionPlanner_Clear()` now also clears `s_preparation_fault_count`, so the host no longer
+  re-aborts on a stale `Pf` after a soft reset.
+- Net effect: the “停止(清除队列)” button (Ctrl-X) is a reliable one-press recovery, and normal
+  streaming no longer deadlocks on a stale base. UI unchanged.
+
 ## 2026-06-14 Custom-pattern dropdown: SVG line art + image halftone (UI only)
 
 - "固定轨迹 → 自定义轨迹" dropdown now auto-scans `SCARA_UI/trajectory/patterns/`:

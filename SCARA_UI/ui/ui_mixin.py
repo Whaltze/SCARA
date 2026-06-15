@@ -181,6 +181,16 @@ class ScaraUiMixin:
         hw_layout.addWidget(self.jog_pps_label, 3, 0, 1, 2)
         self.hw_speed_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
         self.hw_accel_input.textChanged.connect(lambda *_: self.update_jog_pps_preview())
+        # 反向间隙补偿(每电机脉冲)：换向时固件先多发这么多脉冲吃机械旷量，消除反向拐弧/偏移。
+        # 0=不补偿。换算：pulses ≈ 旷量角(°) × PPR / 360。随运动任务自动下发 $160/$161。
+        hw_layout.addWidget(QLabel("反向间隙 电机1(脉冲):"), 4, 0)
+        self.backlash_m1_input = QLineEdit("0")
+        self.backlash_m1_input.setFixedSize(box_w, box_h)
+        hw_layout.addWidget(self.backlash_m1_input, 4, 1, Qt.AlignLeft)
+        hw_layout.addWidget(QLabel("反向间隙 电机2(脉冲):"), 5, 0)
+        self.backlash_m2_input = QLineEdit("0")
+        self.backlash_m2_input.setFixedSize(box_w, box_h)
+        hw_layout.addWidget(self.backlash_m2_input, 5, 1, Qt.AlignLeft)
         hw_group.setLayout(hw_layout)
         left_panel.addWidget(hw_group)
 
@@ -539,14 +549,26 @@ class ScaraUiMixin:
 
         laser_group = QGroupBox("激光加工")
         laser_grid = QGridLayout()
+        # 激光轨迹模式：总开关，决定"运行轨迹是否按激光规则抬笔落笔(发 M3/M6/M5)"。
+        # 关=普通轨迹。是否真正出光仍由下方"激光开启"(LASER ARM)硬件控制器决定。
+        self.laser_traj_toggle = QPushButton("激光轨迹模式: 关")
+        self.laser_traj_toggle.setCheckable(True)
+        self.laser_traj_toggle.setChecked(False)
+        self.laser_traj_toggle.setToolTip(
+            "开启后：运行轨迹按激光规则抬笔落笔(发 M3 恒功率 / M6 继电器预合 / M5 抬笔)。\n"
+            "关闭则为普通轨迹，不发激光码。是否真正出光由下方「激光开启」单独控制。"
+        )
+        self.laser_traj_toggle.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
+        self.laser_traj_toggle.toggled.connect(self.on_laser_trajectory_mode_toggled)
+        laser_grid.addWidget(self.laser_traj_toggle, 0, 0, 1, 2)
         self.laser_enable_toggle = QPushButton("激光开启")
         self.laser_enable_toggle.setCheckable(True)
         self.laser_enable_toggle.setChecked(False)
-        self.laser_enable_toggle.setToolTip("开启后下一次轨迹或点动允许落笔出光；完成、停止、急停、回零或断连后自动关闭")
+        self.laser_enable_toggle.setToolTip("激光硬件控制器：开启即 LASER ARM 授权出光；完成、停止、急停、回零或断连后自动关闭")
         self.laser_enable_toggle.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
         self.laser_enable_toggle.toggled.connect(self.on_laser_enable_toggled)
-        laser_grid.addWidget(self.laser_enable_toggle, 0, 0, 1, 2)
-        laser_grid.addWidget(QLabel("功率:"), 1, 0)
+        laser_grid.addWidget(self.laser_enable_toggle, 1, 0, 1, 2)
+        laser_grid.addWidget(QLabel("功率:"), 2, 0)
         self.laser_power_input = QDoubleSpinBox()
         self.laser_power_input.setRange(0.1, 5.0)
         self.laser_power_input.setSingleStep(0.1)
@@ -554,10 +576,10 @@ class ScaraUiMixin:
         self.laser_power_input.setValue(1.0)
         self.laser_power_input.setSuffix("%")
         self.laser_power_input.valueChanged.connect(self.on_laser_power_changed)
-        laser_grid.addWidget(self.laser_power_input, 1, 1)
+        laser_grid.addWidget(self.laser_power_input, 2, 1)
         self.laser_status_label = QLabel("下位机状态: 断开")
         self.laser_status_label.setStyleSheet("color: #aaaaaa; font-weight: bold;")
-        laser_grid.addWidget(self.laser_status_label, 2, 0, 1, 2)
+        laser_grid.addWidget(self.laser_status_label, 3, 0, 1, 2)
         laser_group.setLayout(laser_grid)
         mid_panel.addWidget(laser_group)
 

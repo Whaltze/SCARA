@@ -10,7 +10,7 @@
 
 /* Firmware identity shown by VERSION. */
 #define APP_FW_NAME "SCARA_F103"
-#define APP_FW_VERSION "0.29.9-grbl-scara"
+#define APP_FW_VERSION "0.29.12-grbl-scara"
 
 /* Current controller drives two stepper axes. */
 #define APP_AXIS_COUNT 2u
@@ -67,6 +67,17 @@
 #define APP_LASER_IDLE_DISARM_MS 250u
 #define APP_LASER_ARM_TIMEOUT_MS 5000u
 
+/* 继电器逻辑电平：1=高电平有效(IN 高=吸合/激光通电)，0=低电平有效(IN 低=吸合)。
+ * 默认 1，与当前硬件(高电平有效模块)一致。
+ * 【安全】fail-safe 要求"释放电平=激光断电"：固件在上电/复位/故障/空闲一律把继电器驱动到
+ * 释放电平，且激光头务必接在继电器的 COM/NO(常开)——释放时 NO 断开=断电。切勿用 NC(常闭)。
+ * 若更换为低电平有效的继电器板，必须把本值改为 0，并在"激光断电"下用万用表确认上电/复位
+ * 瞬间 NO 为断开；同时注意 CubeMX 生成的 gpio.c 初始电平也需对应(见 Control.md 激光清单)。 */
+#define APP_LASER_RELAY_ACTIVE_LEVEL 1u
+/* 落笔前继电器预合(吃掉机械合闸延时)的默认时长 ms；M6 不带 P 参数时用此值。
+ * 需 >= 继电器实际机械动作时间，默认复用 APP_LASER_RELAY_READY_MS。 */
+#define APP_LASER_RELAY_PREP_MS APP_LASER_RELAY_READY_MS
+
 /* 最低有效 PPS，低于该值按停止处理，防止很慢的抖动脉冲。 */
 #define APP_MIN_EFFECTIVE_PPS 16
 #define APP_INTERPOLATOR_MIN_PPS 1
@@ -104,6 +115,21 @@
 /* Joint zero offsets in mrad after homing / mechanical calibration. */
 #define APP_MOTOR1_ZERO_MRAD 2251L
 #define APP_MOTOR2_ZERO_MRAD 890L
+
+/* 反向间隙补偿（open-loop backlash compensation），单位：电机脉冲。
+ * 每次电机换向时先多发这么多脉冲吃掉关节/联轴器旷量，再走正常轨迹；
+ * 补偿不改动运动学位置(position_pulse)，只多发脉冲给驱动器。
+ * 默认 0 = 未标定不补偿（行为与改动前一致）。现场用 $160/$161 在线标定，
+ * 也可改这里的默认值。换算：pulses ≈ 旷量角(deg) × PPR / 360（PPR=6400 → 每脉冲≈0.056°）。
+ * 只能补偿电机侧旷量；被动臂远端关节旷量需机械处理。
+ */
+#define APP_BACKLASH_PULSES_M1 0L
+#define APP_BACKLASH_PULSES_M2 0L
+/* 补偿脉冲发送速率（吃旷量为空载，定速无斜坡即可）。建议整除 APP_CONTROL_HZ。
+ * 若标定时补偿段异响/丢步，调低此值。 */
+#define APP_BACKLASH_COMP_PPS 2000
+/* 补偿量上限保护，防止误设过大导致换向长时间空走。 */
+#define APP_BACKLASH_MAX_PULSES 400L
 
 /* SCARA geometry in micrometers.
  * Must match the upper computer kinematic model.
@@ -225,6 +251,6 @@ mrad = deg × π / 180 × 1000
 /* Magic tag used to validate saved parameter blocks. */
 #define APP_PARAM_FLASH_MAGIC 0x53434152u
 /* Increment when default parameter layout/meaning changes. */
-#define APP_PARAM_FLASH_VERSION 6u
+#define APP_PARAM_FLASH_VERSION 7u
 
 #endif

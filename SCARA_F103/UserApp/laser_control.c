@@ -14,6 +14,22 @@ static uint32_t pwm_compare(uint16_t power_permille)
                : APP_LASER_PWM_PERIOD_COUNTS - (uint32_t)power_permille;
 }
 
+/* 继电器电平助手：energize=true 表示吸合(激光通电)，false 表示释放(激光断电)。
+ * 释放电平由 APP_LASER_RELAY_ACTIVE_LEVEL 决定，保证 fail-safe 朝"断电"。 */
+static GPIO_PinState relay_level(bool energize)
+{
+#if APP_LASER_RELAY_ACTIVE_LEVEL
+    return energize ? GPIO_PIN_SET : GPIO_PIN_RESET;
+#else
+    return energize ? GPIO_PIN_RESET : GPIO_PIN_SET;
+#endif
+}
+
+static void relay_write(bool energize)
+{
+    HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, relay_level(energize));
+}
+
 static void force_safe_gpio_output(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -61,7 +77,11 @@ static bool pwm_start_marking(uint16_t power_permille)
 void LaserControl_EarlySafeOutput(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    BOARD_LASER_RELAY_PORT->BRR = BOARD_LASER_RELAY_PIN;
+#if APP_LASER_RELAY_ACTIVE_LEVEL
+    BOARD_LASER_RELAY_PORT->BRR = BOARD_LASER_RELAY_PIN;   /* release = low (active-high module) */
+#else
+    BOARD_LASER_RELAY_PORT->BSRR = BOARD_LASER_RELAY_PIN;  /* release = high (active-low module) */
+#endif
     force_safe_gpio_output();
     /* STM32F103 PA2 CRL nibble: 2 MHz general-purpose push-pull output. */
     BOARD_LASER_RELAY_PORT->CRL =
@@ -79,7 +99,7 @@ void LaserControl_Init(void)
     s_state.power_permille = APP_LASER_POWER_DEFAULT_PERMILLE;
     s_idle_elapsed_ms = 0u;
     s_boot_elapsed_ms = 0u;
-    HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_RESET);
+    relay_write(false);
     pwm_off();
     if (APP_LASER_COMMISSIONED != 0u) {
         s_state.pwm_ready = true;
@@ -103,7 +123,7 @@ bool LaserControl_Arm(void)
 {
     pwm_off();
     if (!s_state.pwm_ready || !s_state.boot_ready) {
-        HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_RESET);
+        relay_write(false);
         s_state.armed = false;
         s_state.relay_ready = false;
         s_state.task_started = false;
@@ -113,14 +133,14 @@ bool LaserControl_Arm(void)
     s_state.relay_ready = false;
     s_state.task_started = false;
     s_idle_elapsed_ms = 0u;
-    HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_RESET);
+    relay_write(false);
     return true;
 }
 
 void LaserControl_Disarm(void)
 {
     pwm_off();
-    HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_RESET);
+    relay_write(false);
     s_state.armed = false;
     s_state.relay_ready = false;
     s_state.task_started = false;
@@ -136,14 +156,14 @@ void LaserControl_BeginSegment(bool marking, bool prep)
 {
     if (!s_state.armed) {
         pwm_off();
-        HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_RESET);
+        relay_write(false);
         s_state.relay_ready = false;
         return;
     }
     s_state.task_started = true;
     s_idle_elapsed_ms = 0u;
     if (marking) {
-        HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_SET);
+        relay_write(true);
         s_state.relay_ready = true;
         if (pwm_start_marking(s_state.power_permille)) {
             s_state.marking = true;
@@ -153,11 +173,11 @@ void LaserControl_BeginSegment(bool marking, bool prep)
         }
     } else if (prep) {
         pwm_off();
-        HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_SET);
+        relay_write(true);
         s_state.relay_ready = true;
     } else {
         pwm_off();
-        HAL_GPIO_WritePin(BOARD_LASER_RELAY_PORT, BOARD_LASER_RELAY_PIN, GPIO_PIN_RESET);
+        relay_write(false);
         s_state.relay_ready = false;
     }
 }

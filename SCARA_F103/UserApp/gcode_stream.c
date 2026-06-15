@@ -400,6 +400,14 @@ static bool process_block(const char *line)
                 return true;
             }
             s_gc.laser_mode = 0u;
+        } else if (m_code == 6) {
+            /* M6 [P<秒>]：落笔前继电器预合，吃掉继电器机械合闸延时(不出 PWM)，
+             * 之后的标记移动起点不再缺光。接通固件已有的 MOTION_LASER_PREP。 */
+            uint32_t prep_ms = p_ms > 0 ? (uint32_t)p_ms : (uint32_t)APP_LASER_RELAY_PREP_MS;
+            if (!MotionPlanner_PlanDwell(prep_ms, MOTION_LASER_PREP)) {
+                send_error(8);
+                return true;
+            }
         } else if (m_code == 0 || m_code == 2 || m_code == 30) {
             if (!MotionPlanner_PlanDwell(1u, MOTION_LASER_OFF)) {
                 send_error(8);
@@ -699,9 +707,24 @@ static bool process_setting(const char *line)
         send_ok();
         return true;
     }
+    if (sscanf(line, "$160=%ld", &value) == 1 || sscanf(line, "$161=%ld", &value) == 1) {
+        /* 每电机反向间隙补偿脉冲。允许 0(不补偿)；越界或运动中拒绝。 */
+        if (value < 0 || value > APP_BACKLASH_MAX_PULSES || MotionPlanner_IsBusy()) {
+            send_error((value < 0 || value > APP_BACKLASH_MAX_PULSES) ? 4u : 8u);
+            return true;
+        }
+        AppParams *params = AppParams_Mutable();
+        if (line[3] == '0') {
+            params->backlash_pulses[0] = (int32_t)value;
+        } else {
+            params->backlash_pulses[1] = (int32_t)value;
+        }
+        send_ok();
+        return true;
+    }
     if (strcmp(line, "$$") == 0) {
         const AppParams *params = AppParams_Get();
-        SerialDma_SendFormat("$11=%ld\n$12=%ld\n$100=%ld\n$101=%ld\n$110=%ld\n$111=%ld\n$120=%ld\n$121=%ld\nok\n",
+        SerialDma_SendFormat("$11=%ld\n$12=%ld\n$100=%ld\n$101=%ld\n$110=%ld\n$111=%ld\n$120=%ld\n$121=%ld\n$160=%ld\n$161=%ld\nok\n",
                              (long)lroundf(MotionPlanner_GetJunctionDeviation() * 1000.0f),
                              (long)lroundf(MotionPlanner_GetArcTolerance() * 1000.0f),
                              (long)params->pulses_per_rev[0],
@@ -709,7 +732,9 @@ static bool process_setting(const char *line)
                              (long)lroundf(MotionPlanner_GetMaxFeed()),
                              (long)lroundf(MotionPlanner_GetMaxFeed()),
                              (long)lroundf(MotionPlanner_GetAcceleration()),
-                             (long)lroundf(MotionPlanner_GetAcceleration()));
+                             (long)lroundf(MotionPlanner_GetAcceleration()),
+                             (long)params->backlash_pulses[0],
+                             (long)params->backlash_pulses[1]);
         return true;
     }
     return false;
@@ -744,6 +769,9 @@ bool GcodeStream_TryProcessLine(const char *line)
         HomeController_ClearError();
         Stepper_StopAll();
         Stepper_ClearError();
+        /* 软复位后把解析器位置重锚到电机真实停点（与 0x85/坐标设定路径一致）；
+         * 否则中断停车后 s_gc 仍停在旧目标，下一条运动准备阶段会立即 preparation_fault。 */
+        resync_parser_to_stepper_if_diverged();
         s_hold = 0u;
         return true;
     }

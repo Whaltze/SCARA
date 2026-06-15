@@ -58,6 +58,8 @@ void AppParams_Defaults(void)
     s_params.ik_left_elbow_sign = AppParams_NormalizeSign(APP_SCARA_IK_LEFT_ELBOW_SIGN);
     s_params.ik_right_elbow_sign = AppParams_NormalizeSign(APP_SCARA_IK_RIGHT_ELBOW_SIGN);
     s_params.movl_segment_um = APP_MOVL_SEGMENT_UM;
+    s_params.backlash_pulses[0] = APP_BACKLASH_PULSES_M1;
+    s_params.backlash_pulses[1] = APP_BACKLASH_PULSES_M2;
 }
 
 void AppParams_Init(void)

@@ -41,6 +41,10 @@ typedef struct {
     uint32_t duration_ticks;
     uint32_t elapsed_ticks;
     uint32_t scheduled_ticks;
+    /* 反向间隙补偿相位：换向时先以固定速率多发补偿脉冲吃旷量，不计入运动学位置。 */
+    bool backlash_active;
+    uint16_t backlash_remaining[2];
+    uint16_t backlash_interval_ticks;
 } StepperDdaMove;
 
 typedef struct {
@@ -62,6 +66,8 @@ static StepperTimedSegment s_timed_segments[APP_STEPPER_TIMED_SEGMENTS];
 static uint8_t s_timed_head;
 static uint8_t s_timed_tail;
 static uint8_t s_timed_count;
+/* 每电机"上次实际啮合方向"(+1/-1，0=开机未知)。仅当本段方向与之相反才注入反向间隙补偿。 */
+static int8_t s_engaged_dir[2];
 
 static bool target_in_range(int64_t target);
 static int64_t initial_pulse(uint32_t index);
@@ -231,6 +237,47 @@ static void set_dir_index(uint32_t index, int8_t dir)
     }
 }
 
+static uint16_t axis_backlash_pulses(uint32_t index)
+{
+    int32_t b = AppParams_Get()->backlash_pulses[index];
+    if (b < 0) {
+        b = 0;
+    }
+    if (b > APP_BACKLASH_MAX_PULSES) {
+        b = APP_BACKLASH_MAX_PULSES;
+    }
+    return (uint16_t)b;
+}
+
+/*
+ * 仅供分段 DDA 路径(timed_move_start_locked)调用。对每个本段有步数的轴：若行进方向相对
+ * 上次实际啮合方向反转，则安排注入 backlash_pulses 个补偿脉冲先吃掉机械旷量。补偿脉冲在
+ * dda_tick 顶部的独立相位发出，方向与本段一致(DIR 已置好)，不改 position_pulse、不消耗段
+ * events/remaining_pulse。开机首段(engaged_dir=0)不补偿。返回是否需要补偿相位。
+ */
+static bool backlash_prepare_for_move(void)
+{
+    s_move.backlash_active = false;
+    s_move.backlash_remaining[0] = 0u;
+    s_move.backlash_remaining[1] = 0u;
+    s_move.backlash_interval_ticks = (uint16_t)(APP_CONTROL_HZ / APP_BACKLASH_COMP_PPS);
+    if (s_move.backlash_interval_ticks == 0u) {
+        s_move.backlash_interval_ticks = 1u;
+    }
+    for (uint32_t i = 0; i < 2u; ++i) {
+        if (s_move.steps[i] == 0u) {
+            continue;
+        }
+        uint16_t b = axis_backlash_pulses(i);
+        if (b > 0u && s_engaged_dir[i] != 0 && s_move.dir[i] != s_engaged_dir[i]) {
+            s_move.backlash_remaining[i] = b;
+            s_move.backlash_active = true;
+        }
+        s_engaged_dir[i] = s_move.dir[i];
+    }
+    return s_move.backlash_active;
+}
+
 static void axis_set_target_pps(uint32_t index, int32_t pps)
 {
     StepperAxisState *axis = &s_state.axis[index];
@@ -315,6 +362,8 @@ void Stepper_Init(void)
         HAL_GPIO_Init(s_hw[i].ena_port, &gpio);
     }
     memset(&s_move, 0, sizeof(s_move));
+    s_engaged_dir[0] = 0;
+    s_engaged_dir[1] = 0;
 }
 
 void Stepper_Enable(StepperAxis axis, bool enable)
@@ -566,6 +615,8 @@ bool Stepper_MoveAbsBlendLaser(int64_t pos1,
         axis->mode = axis->remaining_pulse > 0 ? STEPPER_MODE_MOVE : STEPPER_MODE_IDLE;
         if (axis->remaining_pulse > 0) {
             set_dir_index(i, s_move.dir[i]);
+            /* 回零等连续点位移动只同步啮合方向、不注入补偿(单向、用于建立基准)。 */
+            s_engaged_dir[i] = s_move.dir[i];
         }
         pwm_apply(i, axis->target_pps);
     }
@@ -666,7 +717,12 @@ static bool __attribute__((optimize("Os"))) timed_move_start_locked(int64_t pos1
         }
         pwm_apply(i, axis->current_pps);
     }
-    step_event_timer_set_ticks(s_move.scheduled_ticks);
+    /* DIR 已按本段方向置好；若某轴换向则先进入补偿相位(独立时基)，否则直接按段节拍走。 */
+    if (backlash_prepare_for_move()) {
+        step_event_timer_set_ticks(s_move.backlash_interval_ticks);
+    } else {
+        step_event_timer_set_ticks(s_move.scheduled_ticks);
+    }
     return true;
 }
 
@@ -748,6 +804,9 @@ void Stepper_StopAll(void)
     timed_queue_clear();
     s_move.active = false;
     s_move.segmented = false;
+    s_move.backlash_active = false;
+    s_move.backlash_remaining[0] = 0u;
+    s_move.backlash_remaining[1] = 0u;
     step_event_timer_set_ticks(1u);
     irq_restore(primask);
     Stepper_Stop(STEPPER_AXIS_1);
@@ -759,6 +818,9 @@ void Stepper_EStopAll(void)
     LaserControl_Disarm();
     uint32_t primask = irq_save();
     timed_queue_clear();
+    s_move.backlash_active = false;
+    s_move.backlash_remaining[0] = 0u;
+    s_move.backlash_remaining[1] = 0u;
     for (uint32_t i = 0; i < 2u; ++i) {
         axis_stop_now(i);
         s_state.axis[i].mode = STEPPER_MODE_ESTOP;
@@ -921,6 +983,26 @@ static void __attribute__((optimize("Os"))) dda_tick(void)
     if (!s_state.axis[1].enabled && s_move.steps[1] > 0u) {
         axis_stop_now(1);
         s_move.active = false;
+        return;
+    }
+
+    /*
+     * 反向间隙补偿相位：本 tick 只为换向轴多发一个补偿脉冲吃机械旷量，DIR 已置为本段方向。
+     * 不改 position_pulse、不消耗段 events；两轴补偿发完即恢复段节拍开始正常步进。
+     */
+    if (s_move.backlash_active) {
+        uint8_t comp_mask = 0u;
+        for (uint32_t i = 0; i < 2u; ++i) {
+            if (s_move.backlash_remaining[i] > 0u) {
+                comp_mask |= (uint8_t)(1u << i);
+                s_move.backlash_remaining[i]--;
+            }
+        }
+        emit_step_mask(comp_mask);
+        if (s_move.backlash_remaining[0] == 0u && s_move.backlash_remaining[1] == 0u) {
+            s_move.backlash_active = false;
+            step_event_timer_set_ticks(s_move.scheduled_ticks);
+        }
         return;
     }
 

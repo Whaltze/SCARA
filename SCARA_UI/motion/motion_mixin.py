@@ -43,6 +43,9 @@ class ScaraMotionMixin:
     HALFTONE_THRESHOLD = 128
     HALFTONE_MAX_WIDTH_MM = 120.0
     HALFTONE_MAX_HEIGHT_MM = 80.0
+    # 落笔前继电器预合时长(秒)：吃掉继电器机械合闸延时，让落笔起点/驻点不缺光。
+    # 需 >= 继电器实际动作时间；现场可据继电器规格调整。
+    LASER_RELAY_PREP_S = 0.12
 
     def _read_jog_step_mm(self):
         widget = getattr(self, "jog_step_input", None)
@@ -869,6 +872,8 @@ class ScaraMotionMixin:
     def _iter_stroke_geometry_gcode(self, groups, speed_max, start=None):
         """Yield sharp-corner writing geometry for GRBL junction planning."""
         cursor = tuple(start or (self.cur_x, self.cur_y))
+        laser_mark = bool(getattr(self, "laser_trajectory_mode", False))
+        prep_s = float(getattr(self, "LASER_RELAY_PREP_S", 0.12))
         for index, segments in enumerate(groups):
             first = tuple(segments[0].start)
             connector_needed = math.hypot(first[0] - cursor[0], first[1] - cursor[1]) > 0.01
@@ -878,11 +883,16 @@ class ScaraMotionMixin:
                 x, y = self.ui_to_mcu_xy(float(first[0]), float(first[1]))
                 yield f"G0 X{x:.3f} Y{y:.3f}"
                 yield "G4 P0.001"
+            if laser_mark:
+                # 落笔前继电器预合：连接段(G0,rapid)会断开继电器，标记前先合闸并 settle，
+                # 让每笔描刻起点不缺光(任务级 M3 恒功率 preamble 已设好出光模式)。
+                yield f"M6 P{prep_s:.3f}"
             yield from self._iter_geometry_gcode(segments, speed_max, start=first)
             cursor = tuple(segments[-1].end)
 
     def _stroke_geometry_command_count(self, groups, start=None):
         cursor = tuple(start or (self.cur_x, self.cur_y))
+        laser_mark = bool(getattr(self, "laser_trajectory_mode", False))
         count = 0
         for index, segments in enumerate(groups):
             first = tuple(segments[0].start)
@@ -890,6 +900,8 @@ class ScaraMotionMixin:
                 count += 1
             if math.hypot(first[0] - cursor[0], first[1] - cursor[1]) > 0.01:
                 count += 2
+            if laser_mark:
+                count += 1
             count += len(segments)
             cursor = tuple(segments[-1].end)
         return count
@@ -1405,16 +1417,20 @@ class ScaraMotionMixin:
     def _halftone_commands(self, dots):
         """逐点激光点阵 G-code：移到点(不出光)→出光→驻点停留→关光。
 
-        首条 ``M5`` 抵消任务级 preamble 自动加的 ``M4``，确保移到首点时不出光。
+        首条 ``M5`` 抵消任务级 preamble 自动加的 ``M3``，确保移到首点时不出光。
         真正出光需用户先开“激光开启”(LASER ARM)；未 ARM 时固件不出光，等同安全空走。
         """
         power = int(self._laser_s_word())
         dwell_s = self.HALFTONE_DWELL_MS / 1000.0
+        prep_s = float(getattr(self, "LASER_RELAY_PREP_S", 0.12))
         yield "M5"
         for x, y in dots:
             mx, my = self.ui_to_mcu_xy(float(x), float(y))
             yield f"G0 X{mx:.3f} Y{my:.3f}"
-            yield f"M4 S{power}"
+            # 恒功率 M3：驻点(速度=0)用 M4 动态功率会算到 0 而不出光；M3 不受速度影响。
+            yield f"M3 S{power}"
+            # 继电器预合 settle，吃掉机械合闸延时，保证驻点真正出光。
+            yield f"M6 P{prep_s:.3f}"
             yield f"G4 P{dwell_s:.3f}"
             yield "M5"
 
@@ -1431,7 +1447,7 @@ class ScaraMotionMixin:
             if not self.validate_trajectory_points(dots, f"点阵“{name}”"):
                 return
             preview = [(x, y, 0.0, False, True) for x, y in dots]
-            commands = CountedCommandStream(self._halftone_commands(dots), len(dots) * 4 + 1)
+            commands = CountedCommandStream(self._halftone_commands(dots), len(dots) * 5 + 1)
             self.preview_planned_path(preview, f"点阵:{name}")
             self.load_motion_gcode_job(commands, preview_path=preview)
             self.log_display.append(
