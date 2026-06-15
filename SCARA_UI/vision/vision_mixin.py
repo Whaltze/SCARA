@@ -78,13 +78,19 @@ class ScaraVisionMixin:
         if self.coord_proc and self.coord_proc.is_calibrated:
             return self.coord_proc.pixel_to_robot(u, v)
         scale = 0.5
-        return (u - 320) * scale + 75.0, (240 - v) * scale + 200.0
+        return (u - 640) * scale + 75.0, (360 - v) * scale + 200.0
 
     def plan_vision_trajectory(self):
+        """视觉循迹轨迹：捕获当前帧 → 识别色块 → 转机械臂坐标 → 存入示教点 → 执行示教"""
         if self.latest_raw_frame is None:
             self.log_error("无画面")
             return
-        mask = self.img_proc_thread.get_color_mask(self.latest_raw_frame)
+
+        # 1. 捕获当前帧（拷贝，避免被后续帧覆盖）
+        frame = self.latest_raw_frame.copy()
+
+        # 2. 颜色识别
+        mask = self.img_proc_thread.get_color_mask(frame)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 20), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         objs = []
@@ -93,22 +99,38 @@ class ScaraVisionMixin:
                 continue
             (u, v), r = cv2.minEnclosingCircle(cnt)
             objs.append({'centroid': (u, v), 'radius': r})
-        
+
         if not objs:
             self.log_error("未发现目标")
             return
-        
-        objs.sort(key=lambda o: np.hypot(o['centroid'][0]-320, o['centroid'][1]-480))
-        
-        route_points = [(self.cur_x, self.cur_y)]
-        spd = float(self.hw_speed_input.text())
-        
-        for obj in objs:
-            rx, ry = self.pixel_to_robot(*obj['centroid'])
-            route_points.append((rx, ry))
 
-        path = self.generate_polyline_path(route_points, spd, silent_first=True)
-        self.load_motion_queue(path)
+        # 3. 按距离图像中心由近到远排序
+        objs.sort(key=lambda o: np.hypot(o['centroid'][0]-640, o['centroid'][1]-360))
+
+        # 4. 转为机械臂坐标，过滤工作空间外的点，存入示教目标点
+        self.clear_teach_points()
+        valid_count = 0
+        for i, obj in enumerate(objs, 1):
+            rx, ry = self.pixel_to_robot(*obj['centroid'])
+            if not self.check_workspace_safety(rx, ry):
+                self.log_display.append(
+                    f"<font color='orange'>⚠ 视觉循迹·目标{i}: ({rx:.1f},{ry:.1f}) 超出工作空间，已跳过</font>"
+                )
+                continue
+            self._append_teach_point((rx, ry), f"视觉循迹·目标{i}")
+            valid_count += 1
+
+        if valid_count == 0:
+            self.log_error("视觉循迹: 所有目标均超出工作空间")
+            return
+
+        self.log_display.append(
+            f"<font color='#9b59b6'>🎨 视觉循迹: 识别到 {len(objs)} 个目标，"
+            f"有效 {valid_count} 个，已存入示教点</font>"
+        )
+
+        # 5. 执行示教轨迹
+        self.start_playback()
 
 
     # -------------------------------------------------------

@@ -1,5 +1,7 @@
 """九点标定工具"""
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cv2
 from PySide6.QtWidgets import (QApplication, QMainWindow, QLabel, QVBoxLayout, 
                                QWidget, QPushButton, QHBoxLayout, QLineEdit, 
@@ -8,8 +10,8 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
 
 # 路径修复：确保能引用到同目录下的 core 文件
-from .camera_core import CameraProcessor
-from .coordinate_core import CoordinateProcessor
+from vision.camera_core import CameraProcessor
+from vision.coordinate_core import CoordinateProcessor
 
 class HandEyeCalibrationApp(QMainWindow):
     def __init__(self):
