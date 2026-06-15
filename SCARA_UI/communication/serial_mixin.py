@@ -245,10 +245,16 @@ class ScaraSerialMixin:
                 f"$11={max(1, int(round(junction_deviation * 1000.0)))}",
             )
         )
-        # 反向间隙补偿(每电机脉冲)随运动任务下发，实现"设一次、每个任务自动生效"。
+        # 反向间隙补偿(每电机脉冲)随运动任务下发。仅在数值相对上次变化时才发：
+        # 默认 (0,0) 与固件上电默认一致，故零间隙时根本不发 $160/$161——
+        # 这样既兼容尚未支持 $160/$161 的旧固件(否则它会回 error:3 直接中止整条流，
+        # 表现为点动/轨迹"基本不动"且反复重连)，又能在从非零改回 0 时补发一次清零。
         backlash = self._read_backlash_pulses()
         if backlash is not None:
-            commands.extend((f"$160={backlash[0]}", f"$161={backlash[1]}"))
+            last = tuple(getattr(self, "_last_backlash_sent", (0, 0)))
+            if tuple(backlash) != last:
+                commands.extend((f"$160={backlash[0]}", f"$161={backlash[1]}"))
+                self._last_backlash_sent = tuple(backlash)
         self._pending_motion_profile = tuple(commands)
 
     def _read_backlash_pulses(self):
@@ -468,31 +474,8 @@ class ScaraSerialMixin:
         current = dict(getattr(self, "sender_stats", {}) or {})
         current.update(stats)
         self.sender_stats = current
-        queued = current.get("queued", current.get("queued_lines", "--"))
-        inflight = current.get("inflight", current.get("inflight_lines", "--"))
-        free = current.get("planner_free", current.get("free", "--"))
-        rx_free = current.get("rx_free", getattr(self, "rx_free_hint", "--"))
-        step_count = current.get("step_segment_count", "--")
-        step_free = current.get("step_segment_free", "--")
-        low = current.get("segment_low_water", current.get("low_water", "--"))
-        underrun = current.get("underrun", current.get("underrun_ticks", "--"))
-        underrun_count = current.get("segment_underrun_count", "--")
-        rate_limited = current.get("rate_limited_segments", "--")
-        refill_gap = current.get("max_refill_gap_ms", "--")
-        free_min = current.get("planner_free_min", getattr(self, "planner_free_min", "--"))
-        if free_min is None:
-            free_min = "--"
-        ack_ms = current.get("avg_ack_ms", "--")
-        status_text = (
-            f"Sender: {self.sender_mode}  queued={queued} inflight={inflight} "
-            f"free={free}/{rx_free} min={free_min} sq={step_count}/{step_free} "
-            f"low={low} underrun={underrun}/{underrun_count} rl={rate_limited} gap={refill_gap}ms avg_ack={ack_ms}"
-        )
-        label = getattr(self, "lbl_sender_mode", None)
-        if label is not None:
-            label.setText(status_text)
-        elif getattr(self, "ser", None) is not None and self.ser.is_open and hasattr(self, "serial_status"):
-            self.serial_status.setText(status_text)
+        # 发送器状态以前显示在"下位机健康监控"面板里；该面板已删除。
+        # 仅保留 sender_stats 供内部读取，不再写任何标签(避免把长串塞进串口状态行把左侧面板撑宽)。
 
     def _clear_text_sender_state(self):
         self.inflight_lines = []
@@ -745,18 +728,8 @@ class ScaraSerialMixin:
                 if self.ser.in_waiting > 0:
                     QTimer.singleShot(0, self.check_serial_feedback)
 
-                # 1. 独立处理下位机健康监控反馈 (心跳 OK)
-                if raw.startswith("OK HEARTBEAT"):
-                    tick_match = re.search(r'tick=(\d+)', raw)
-                    err_match = re.search(r'err=(\d+)', raw)
-                    gbuf_match = re.search(r'gbuf=\d+,(\d+)', raw)
-                    if tick_match: self.lbl_mcu_tick.setText(f"MCU时间: {tick_match.group(1)} ms")
-                    if err_match: self.lbl_mcu_err.setText(f"错误码: {err_match.group(1)}")
-                    if gbuf_match:
-                        capacity = int(getattr(self, "mcu_planner_capacity", 48))
-                        self.lbl_mcu_gbuf.setText(f"缓冲区占用: {gbuf_match.group(1)} / {capacity}")
-                    # 心跳响应在此处终结，绝对不执行后续运动队列逻辑
-                    return
+                # 1. 心跳轮询用的是实时 '?' 状态请求(见 send_heartbeat)，
+                #    下位机的显式 "HEARTBEAT" 命令上位机并不发送，故其响应无需处理。
 
                 if raw.startswith("OK HOME_SENSOR"):
                     h1_match = re.search(r'h1=(\d+)', raw)
@@ -765,8 +738,6 @@ class ScaraSerialMixin:
                     h2 = int(h2_match.group(1)) if h2_match else 0
                     if not self.board_only_debug:
                         self.home_sensor_triggered = (h1 == 1 or h2 == 1)
-                    if hasattr(self, "lbl_mcu_interp"):
-                        self.lbl_mcu_interp.setText(f"HOME_SENSOR h={h1},{h2}")
                     self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} {raw}</font>")
                     return
 
@@ -855,8 +826,6 @@ class ScaraSerialMixin:
                         self.mcu_planner_free = int(bf_match.group(1))
                         self.rx_free_hint = int(bf_match.group(2))
                         self._update_planner_free_hint(self.mcu_planner_free)
-                        capacity = int(getattr(self, "mcu_planner_capacity", 48))
-                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / {capacity}")
                         if self.stream_waiting_buffer and self.mcu_planner_free > 0 and not self.waiting_for_ack:
                             self.stream_waiting_buffer = False
                             QTimer.singleShot(50, self.process_queue)
@@ -909,11 +878,6 @@ class ScaraSerialMixin:
                             getattr(self, "sender_mode", "gcode_stream"),
                             max_refill_gap_ms=int(pg_match.group(1)),
                         )
-                    if q_match: self.lbl_mcu_queue.setText(f"队列负载(Q): {q_match.group(1)}")
-
-                    hz_match = re.search(r'Hz:(\d+)', raw)
-                    if hz_match and hasattr(self, "lbl_mcu_hz"):
-                        self.lbl_mcu_hz.setText(f"控制频率: {hz_match.group(1)} Hz")
 
                     pulse_match = re.search(r'JPos:(-?\d+),(-?\d+)', raw)
                     a1_match = re.search(r'A1:(\d+),(\d+),([-?\d]+),([-?\d]+)', raw)
@@ -991,31 +955,19 @@ class ScaraSerialMixin:
                     if getattr(self, "velocity_monitor", None) is not None:
                         self.velocity_monitor.process_mcu_status(raw, getattr(self, "current_ppr", 6400))
 
-                    tick_match = re.search(r't=(\d+)', raw)
-                    err_match = re.search(r'\be=(\d+)', raw)
                     bf_match = re.search(r'\bbf=(\d+),(\d+)', raw)
                     q_match = re.search(r'\bq=(\d+)', raw)
                     mode_match = re.search(r'\bm=([A-Za-z]+)', raw)
                     if mode_match:
                         self.last_controller_state = mode_match.group(1).strip().lower()
-                    pps_match = re.search(r'\bpps=(-?\d+),(-?\d+)', raw)
-                    tgt_match = re.search(r'\btgt=(-?\d+),(-?\d+)', raw)
-                    en_match = re.search(r'\ben=(\d+),(\d+)', raw)
                     home_match = re.search(r'\bh=(\d+),(\d+)', raw)
                     hs_match = re.search(r'\bhs=([A-Za-z0-9_]+)', raw)
-                    he_match = re.search(r'\bhe=(\d+)', raw)
-                    if tick_match:
-                        self.lbl_mcu_tick.setText(f"MCU时间: {tick_match.group(1)} ms")
-                    if err_match:
-                        self.lbl_mcu_err.setText(f"错误码: {err_match.group(1)}")
                     if bf_match:
                         self.mcu_planner_free = int(bf_match.group(1))
                         self.rx_free_hint = int(bf_match.group(2))
                         if q_match:
                             self.mcu_planner_capacity = self.mcu_planner_free + int(q_match.group(1))
                         self._update_planner_free_hint(self.mcu_planner_free)
-                        capacity = int(getattr(self, "mcu_planner_capacity", 48))
-                        self.lbl_mcu_gbuf.setText(f"Planner free: {self.mcu_planner_free} / {capacity}")
                     sq_match = re.search(r'\bsq=(\d+),(\d+)', raw)
                     if sq_match:
                         self.last_segment_count = int(sq_match.group(1))
@@ -1023,17 +975,6 @@ class ScaraSerialMixin:
                         self.home_sensor_triggered = (home_match.group(1) == "1" or home_match.group(2) == "1")
                     if hs_match:
                         self._apply_home_state(hs_match.group(1))
-                    if hasattr(self, "lbl_mcu_interp") and (hs_match or pps_match or home_match):
-                        mode = mode_match.group(1) if mode_match else "--"
-                        hs = hs_match.group(1) if hs_match else "--"
-                        he = he_match.group(1) if he_match else "--"
-                        en = f"{en_match.group(1)},{en_match.group(2)}" if en_match else "--,--"
-                        pps = f"{pps_match.group(1)},{pps_match.group(2)}" if pps_match else "--,--"
-                        tgt = f"{tgt_match.group(1)},{tgt_match.group(2)}" if tgt_match else "--,--"
-                        h = f"{home_match.group(1)},{home_match.group(2)}" if home_match else "--,--"
-                        self.lbl_mcu_interp.setText(
-                            f"运动:{mode} hs={hs} he={he} en={en} pps={pps} tgt={tgt} h={h}"
-                        )
                     self.log_display.append(f"<font color='#98c379'>RX {self.get_timestamp()} {raw}</font>")
                     return
 

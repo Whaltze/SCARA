@@ -1866,10 +1866,13 @@ class ScaraMotionMixin:
                 return
             
             q1, q2 = current_angles
-            
-            half_turn = 3.0
+
+            # 单轴点动：把"步长"字段直接当作该关节的转角(°)，方便上电初期单轴试旷量/间隙。
+            # (方向点动 add_jog 仍把同一字段当末端位移 mm；同一个数字两种含义，按点的是哪个按钮区分。)
+            half_turn = self._read_jog_step_mm()
+
             new_q1, new_q2 = q1, q2
-            
+
             if motor_id == 1:
                 new_q1 = q1 + direction * half_turn
             elif motor_id == 2:
@@ -1888,9 +1891,13 @@ class ScaraMotionMixin:
                 return
 
             v_max = self._read_run_speed_mm_s()
-            num_steps = 20
-
             # 按关节角度均匀采样，保证电机点动本质上是一根轴在动，而不是 XY 直线点动。
+            # 关键：分段不能太细。每段在 exact-stop 策略下都要完整加减速并停一次，
+            # 若把 3° 拆成 20 段(每段 ~0.15°≈2.7 个脉冲)，电机只会在低速起停区反复单步，
+            # 产生异响且无法正常加速。这里按"每段至少 SEG_DEG 关节角度"自适应取段数，
+            # 让每段携带足够脉冲完成一次正常的梯形加减速。
+            seg_deg = 1.5
+            num_steps = max(1, int(round(abs(half_turn) / seg_deg)))
             joint_points = []
             for i in range(num_steps + 1):
                 t = i / num_steps
@@ -1906,12 +1913,17 @@ class ScaraMotionMixin:
                     return
                 joint_points.append((px, py))
 
-            # send_path 直接使用这组采样点；下位机会在相邻 G-code 段之间做 planner/segment 衔接。
-            path = []
-            for i in range(1, len(joint_points)):
-                x0, y0 = joint_points[i - 1]
-                x1, y1 = joint_points[i]
-                path.append((x1, y1, v_max, False))
+            # 关节采样点直接作为 G1 点流下发。两个要点：
+            # 1) 进给速度按 mm/min 存——整条管线里 path[2] 都是 mm/min(_iter_path_gcode 直接拿去当 F)。
+            #    此前误把 mm/s 的 v_max 塞进来，被当成 mm/min，点动速度只有 1/60，电机像"抱死"一样爬行。
+            #    方向点动(add_jog)用的是 F{v_max*60}，所以一直正常。
+            # 2) 路径首点放当前实际位置，使 _motion_path_with_current_connector 判定"已在起点"而早返回，
+            #    不再为首段重新规划出上百个细密连接点(那会变成上百次微小 exact-stop：卡顿且长时间停在 run，
+            #    导致下一次点动被 "still active (run)" 挡掉)。
+            feed_mm_min = max(1.0, float(v_max) * 60.0)
+            path = [(float(sx), float(sy), feed_mm_min, False)]
+            for px, py in joint_points[1:]:
+                path.append((float(px), float(py), feed_mm_min, False))
 
             if not path:
                 self.log_error("电机点动未生成有效轨迹")
