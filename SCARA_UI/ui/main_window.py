@@ -146,7 +146,7 @@ class FiveBarSerialGUI(
 
         self.latest_raw_frame = None
         self.cam_thread = None
-        self.img_proc_thread = ImageProcessingThread(self.cam_proc)
+        self.img_proc_thread = ImageProcessingThread(self.cam_proc, self.coord_proc)
         self.img_proc_thread.processed_frame_ready.connect(self.display_camera_frame)
         self.img_proc_thread.start()
 
